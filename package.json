@@ -1,0 +1,18 @@
+{
+  "name": "pi-fleet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Run a fleet of pi coding agents in isolated git worktrees, orchestrated from one supervisor session. No dependencies beyond pi itself.",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "multi-agent",
+    "worktree"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./fleet/index.ts"
+    ]
+  }
+}
