@@ -1,6 +1,15 @@
 {
-  // Dev-only typecheck config. Adjust the paths below to your pi installation
-  // (the node_modules dir containing @earendil-works/pi-coding-agent).
+  // Dev-only typecheck config.
+  //
+  // This resolves @earendil-works/pi-coding-agent and typebox from a local
+  // node_modules/ (e.g. after `npm install` with pi's package linked/installed
+  // as a dependency). If your pi installation lives elsewhere, either:
+  //   1. `npm link @earendil-works/pi-coding-agent` (or symlink it) into
+  //      node_modules/ here, or
+  //   2. Copy this file to tsconfig.local.json, point "paths" at your pi
+  //      install, and run `tsc -p tsconfig.local.json --noEmit`.
+  //      tsconfig.local.json is gitignored so machine-specific paths never
+  //      get committed.
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
@@ -10,18 +19,7 @@
     "noEmit": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
-    "resolveJsonModule": true,
-    "typeRoots": [
-      "C:/Users/David/AppData/Local/pi-node/current/node_modules/@earendil-works/pi-coding-agent/node_modules/@types"
-    ],
-    "paths": {
-      "@earendil-works/pi-coding-agent": [
-        "C:/Users/David/AppData/Local/pi-node/current/node_modules/@earendil-works/pi-coding-agent"
-      ],
-      "typebox": [
-        "C:/Users/David/AppData/Local/pi-node/current/node_modules/@earendil-works/pi-coding-agent/node_modules/typebox"
-      ]
-    }
+    "resolveJsonModule": true
   },
   "include": ["fleet/**/*.ts"]
 }

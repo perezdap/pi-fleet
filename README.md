@@ -99,13 +99,25 @@ Per-spawn override: `/fleet spawn --role reviewer --model openai/gpt-5 r1 "Revie
 
 Requires pi ≥ 0.84 with `--mode rpc`.
 
-```powershell
-# quick test in any git repo:
-pi -e C:\Users\David\Documents\github\pi-fleet\fleet\index.ts
-
-# or install as a package (once published), or copy/symlink into
-# ~/.pi/agent/extensions/pi-fleet/
+```bash
+# quick test in any git repo (macOS/Linux/WSL):
+pi -e /path/to/pi-fleet/fleet/index.ts
 ```
+
+```powershell
+# quick test in any git repo (Windows):
+pi -e C:\path\to\pi-fleet\fleet\index.ts
+```
+
+Or install as a package (once published), or copy/symlink this repo's `fleet/`
+directory into `~/.pi/agent/extensions/pi-fleet/`.
+
+### Typechecking locally
+
+`tsconfig.json` resolves `@earendil-works/pi-coding-agent` and `typebox` from
+a local `node_modules/`. If your pi installation lives elsewhere, copy
+`tsconfig.json` to `tsconfig.local.json` (gitignored), point its `paths` at
+your pi install, and run `tsc -p tsconfig.local.json --noEmit`.
 
 ## Files
 
