@@ -185,9 +185,7 @@ export default function (pi: ExtensionAPI) {
           }
 
           case "clean": {
-            const force = tokens.includes("--force");
-            const positional = tokens.slice(1).filter((t) => !t.startsWith("--"));
-            const which = positional[0];
+            const { which, force } = parseClean(tokens.slice(1));
             if (!which) throw new Error("usage: /fleet clean <name|--done|--all> [--force]");
             const man = await fleet.manifest();
             const names =
@@ -324,6 +322,12 @@ export default function (pi: ExtensionAPI) {
 }
 
 // ── argument parsing ─────────────────────────────────────────────────────────
+
+export function parseClean(tokens: string[]): { which?: string; force: boolean } {
+  const force = tokens.includes("--force");
+  const which = tokens.find((t) => t !== "--force");
+  return { which, force };
+}
 
 function parseSpawn(tokens: string[]): {
   name?: string;
