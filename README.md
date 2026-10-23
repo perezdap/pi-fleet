@@ -19,9 +19,9 @@ Node built-ins.
 ```
 /fleet status
 fleet: 3 members (2 active)
- ⚙ api          coder      running
- ○ ui           coder      idle
- ✓ review-api   reviewer   done
+ ⚙ api [coder] status=running branch=fleet/api
+ ○ ui [coder] status=idle branch=fleet/ui
+ ✓ review-api [reviewer] status=done branch=fleet/review-api
 ```
 
 ## Commands
@@ -114,10 +114,10 @@ directory into `~/.pi/agent/extensions/pi-fleet/`.
 
 ### Typechecking locally
 
-`tsconfig.json` resolves `@earendil-works/pi-coding-agent` and `typebox` from
-a local `node_modules/`. If your pi installation lives elsewhere, copy
-`tsconfig.json` to `tsconfig.local.json` (gitignored), point its `paths` at
-your pi install, and run `tsc -p tsconfig.local.json --noEmit`.
+`tsconfig.json` resolves `@earendil-works/pi-coding-agent` from a local
+`node_modules/`. If your pi installation lives elsewhere, copy `tsconfig.json`
+to `tsconfig.local.json` (gitignored), point its `paths` at your pi install,
+and run `tsc -p tsconfig.local.json --noEmit`.
 
 ## Files
 

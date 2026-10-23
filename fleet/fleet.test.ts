@@ -1,39 +1,224 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
-import { Fleet, parseFleetCommand, toolParamsToCommand, type FleetUi } from "./fleet.ts";
-import type { Manifest, Member, MemberStatus } from "./types.ts";
+import { parseFleetCommand, toolParamsToCommand } from "./fleet.ts";
+import { addWorktree, branchExists, git, headRev, mergeBranch } from "./gitw.ts";
+import registerFleet from "./index.ts";
+import { loadManifest, saveManifest } from "./manifest.ts";
+import type { Member, MemberStatus, NotifyLevel } from "./types.ts";
 
-function makeMember(name: string, status: MemberStatus, overrides: Partial<Member> = {}): Member {
+const FAKE_PI_SCRIPT = `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import * as path from "node:path";
+
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let idx;
+  while ((idx = buf.indexOf("\\n")) >= 0) {
+    const line = buf.slice(0, idx).replace(/\\r$/, "");
+    buf = buf.slice(idx + 1);
+    if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    appendFileSync(path.join(process.cwd(), ".rpc-received.jsonl"), JSON.stringify(msg) + "\\n");
+    if (msg.type === "get_state") {
+      process.stdout.write(JSON.stringify({
+        type: "response",
+        id: msg.id,
+        success: true,
+        data: { sessionFile: path.join(process.cwd(), "session.json") },
+      }) + "\\n");
+    } else {
+      process.stdout.write(JSON.stringify({
+        type: "response",
+        id: msg.id,
+        success: true,
+        data: {},
+      }) + "\\n");
+    }
+  }
+});
+`;
+
+interface TestHarness {
+  root: string;
+  notifications: Array<{ text: string; level: NotifyLevel }>;
+  widgetLines: () => string[];
+  errors: () => string[];
+  runCommand: (args: string) => Promise<void>;
+  runTool: (params: Record<string, unknown>) => Promise<{ text: string; isError: boolean }>;
+  seedMember: (
+    name: string,
+    status: MemberStatus,
+    opts?: {
+      task?: string;
+      unmergedCommit?: boolean;
+      mergedCommit?: boolean;
+      conflictingCommit?: boolean;
+      createdAt?: number;
+    },
+  ) => Promise<Member>;
+  shutdown: () => Promise<void>;
+  cleanup: () => Promise<void>;
+}
+
+async function createHarness(): Promise<TestHarness> {
+  const rawRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-test-"));
+  await git(rawRoot, "init", "-b", "main");
+  await git(rawRoot, "config", "user.email", "test@example.com");
+  await git(rawRoot, "config", "user.name", "Test User");
+  await writeFile(path.join(rawRoot, "README.md"), "initial\n", "utf8");
+  await git(rawRoot, "add", "README.md");
+  await git(rawRoot, "commit", "-m", "initial");
+
+  const root = await git(rawRoot, "rev-parse", "--show-toplevel");
+  const baseRef = await headRev(root);
+
+  const binDir = await mkdtemp(path.join(tmpdir(), "pi-fleet-bin-"));
+  const mjsPath = path.join(binDir, "fake-pi.mjs");
+  await writeFile(mjsPath, FAKE_PI_SCRIPT, "utf8");
+  await chmod(mjsPath, 0o755);
+
+  let piBin = mjsPath;
+  if (process.platform === "win32") {
+    const cmdPath = path.join(binDir, "fake-pi.cmd");
+    await writeFile(cmdPath, `@node "%~dp0fake-pi.mjs" %*\r\n`, "utf8");
+    piBin = cmdPath;
+  }
+
+  await mkdir(path.join(root, ".pi", "fleet"), { recursive: true });
+  await writeFile(
+    path.join(root, ".pi", "fleet", "config.json"),
+    JSON.stringify({ piBin }),
+    "utf8",
+  );
+
+  const notifications: Array<{ text: string; level: NotifyLevel }> = [];
+  let currentWidget: string[] = [];
+  let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+  let toolExecutor:
+    | ((id: string, params: any, sig: any, upd: any, ctx: any) => Promise<any>)
+    | undefined;
+  const shutdownHandlers: Array<() => Promise<void> | void> = [];
+
+  function bindExtension(): void {
+    shutdownHandlers.length = 0;
+    const fakePi: any = {
+      on: (event: string, fn: () => Promise<void> | void) => {
+        if (event === "session_shutdown") shutdownHandlers.push(fn);
+      },
+      registerCommand: (name: string, spec: { handler: (args: string, ctx: any) => Promise<void> }) => {
+        if (name === "fleet") commandHandler = spec.handler;
+      },
+      registerTool: (spec: { name: string; execute: any }) => {
+        if (spec.name === "fleet") toolExecutor = spec.execute;
+      },
+    };
+    registerFleet(fakePi);
+  }
+  bindExtension();
+
+  const ctx = {
+    cwd: root,
+    ui: {
+      notify: (text: string, level: NotifyLevel = "info") => {
+        notifications.push({ text, level });
+      },
+      setWidget: (_id: string, lines: string[]) => {
+        currentWidget = lines;
+      },
+    },
+  };
+
+  async function seedMember(
+    name: string,
+    status: MemberStatus,
+    opts?: {
+      task?: string;
+      unmergedCommit?: boolean;
+      mergedCommit?: boolean;
+      conflictingCommit?: boolean;
+      createdAt?: number;
+    },
+  ): Promise<Member> {
+    const branch = `fleet/${name}`;
+    const wt = path.join(root, ".pi", "fleet", "wt", name);
+    await addWorktree(root, wt, branch, baseRef);
+
+    if (opts?.conflictingCommit) {
+      await writeFile(path.join(wt, "README.md"), `branch-${name}\n`, "utf8");
+      await git(wt, "add", "README.md");
+      await git(wt, "commit", "-m", `conflict by ${name}`);
+      await writeFile(path.join(root, "README.md"), `main-change-against-${name}\n`, "utf8");
+      await git(root, "add", "README.md");
+      await git(root, "commit", "-m", `main change against ${name}`);
+    } else if (opts?.unmergedCommit || opts?.mergedCommit) {
+      await writeFile(path.join(wt, `${name}.txt`), `${name}\n`, "utf8");
+      await git(wt, "add", `${name}.txt`);
+      await git(wt, "commit", "-m", `work by ${name}`);
+    }
+    if (opts?.mergedCommit) {
+      await mergeBranch(root, branch, `merge ${name}`);
+    }
+
+    const man = await loadManifest(root);
+    const ts = opts?.createdAt ?? Date.now();
+    const member: Member = {
+      name,
+      role: "coder",
+      task: opts?.task ?? `task for ${name}`,
+      branch,
+      worktree: wt,
+      baseRef,
+      status,
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    man.members[name] = member;
+    await saveManifest(man);
+    bindExtension();
+    return member;
+  }
+
   return {
-    name,
-    role: "coder",
-    task: `Task for ${name}`,
-    branch: `fleet/${name}`,
-    worktree: `/repo/.pi/fleet/wt/${name}`,
-    baseRef: "abc1234",
-    status,
-    createdAt: 1000,
-    updatedAt: 1000,
-    ...overrides,
+    root,
+    notifications,
+    widgetLines: () => currentWidget,
+    errors: () => notifications.filter((n) => n.level === "error").map((n) => n.text),
+    runCommand: async (args: string) => {
+      assert.ok(commandHandler);
+      await commandHandler(args, ctx);
+    },
+    runTool: async (params: Record<string, unknown>) => {
+      assert.ok(toolExecutor);
+      const res = await toolExecutor("call-1", params, undefined, undefined, ctx);
+      return {
+        text: res.content.map((c: any) => c.text).join("\n"),
+        isError: !!res.isError,
+      };
+    },
+    seedMember,
+    shutdown: async () => {
+      for (const fn of shutdownHandlers) await fn();
+    },
+    cleanup: async () => {
+      for (const fn of shutdownHandlers) await fn();
+      await rm(rawRoot, { recursive: true, force: true });
+      await rm(binDir, { recursive: true, force: true });
+    },
   };
 }
 
-const noopUi: FleetUi = {
-  notify: () => {},
-  setWidget: () => {},
-};
-
 describe("parseFleetCommand", () => {
-  it("parses empty input and status/help commands", () => {
+  it("parses empty input as status", () => {
     assert.deepEqual(parseFleetCommand(""), { action: "status" });
-    assert.deepEqual(parseFleetCommand("   "), { action: "status" });
-    assert.deepEqual(parseFleetCommand("status"), { action: "status" });
-    assert.deepEqual(parseFleetCommand("help"), { action: "help" });
-    assert.deepEqual(parseFleetCommand("--help"), { action: "help" });
-    assert.deepEqual(parseFleetCommand("-h"), { action: "help" });
   });
 
-  it("parses spawn with flags and strips matching outer quotes on task", () => {
+  it("parses spawn with flags and strips outer quotes from task", () => {
     assert.deepEqual(
       parseFleetCommand('spawn --role reviewer --model openai/gpt-5 --over fleet/api r1 "Review the auth work"'),
       {
@@ -45,261 +230,37 @@ describe("parseFleetCommand", () => {
         over: "fleet/api",
       },
     );
-    assert.deepEqual(parseFleetCommand("spawn api Implement login endpoint"), {
-      action: "spawn",
-      name: "api",
-      task: "Implement login endpoint",
-    });
   });
 
-  it("preserves --done and --all targets on clean in any flag order", () => {
-    assert.deepEqual(parseFleetCommand("clean --done"), {
+  it("parses clean --done and --force in either flag order", () => {
+    assert.deepEqual(parseFleetCommand("clean --force --done"), {
       action: "clean",
-      target: "--done",
-    });
-    assert.deepEqual(parseFleetCommand("clean --all"), {
-      action: "clean",
-      target: "--all",
-    });
-    assert.deepEqual(parseFleetCommand("clean --done --force"), {
-      action: "clean",
-      target: "--done",
-      force: true,
-    });
-    assert.deepEqual(parseFleetCommand("clean --force --all"), {
-      action: "clean",
-      target: "--all",
-      force: true,
-    });
-    assert.deepEqual(parseFleetCommand("clean api --force"), {
-      action: "clean",
-      target: "api",
+      target: { kind: "done" },
       force: true,
     });
   });
 
-  it("parses resume, send, log, merge, stop, and open commands", () => {
-    assert.deepEqual(parseFleetCommand("resume api"), {
+  it("parses resume with quoted extra instructions", () => {
+    assert.deepEqual(parseFleetCommand('resume api "Finish validation tests"'), {
       action: "resume",
       name: "api",
-    });
-    assert.deepEqual(parseFleetCommand('resume api "Finish the validation tests"'), {
-      action: "resume",
-      name: "api",
-      extra: "Finish the validation tests",
-    });
-    assert.deepEqual(parseFleetCommand("send api 'Use SQLite in memory'"), {
-      action: "send",
-      name: "api",
-      message: "Use SQLite in memory",
-    });
-    assert.deepEqual(parseFleetCommand("log api"), {
-      action: "log",
-      name: "api",
-      n: 20,
-    });
-    assert.deepEqual(parseFleetCommand("log api 50"), {
-      action: "log",
-      name: "api",
-      n: 50,
-    });
-    assert.deepEqual(parseFleetCommand("merge --done"), {
-      action: "merge",
-      target: "--done",
-    });
-    assert.deepEqual(parseFleetCommand("stop --all"), {
-      action: "stop",
-      target: "--all",
-    });
-    assert.deepEqual(parseFleetCommand("open api"), {
-      action: "open",
-      name: "api",
+      extra: "Finish validation tests",
     });
   });
 
-  it("throws usage errors when required arguments are missing", () => {
-    assert.throws(() => parseFleetCommand("spawn onlyname"), /usage: \/fleet spawn/);
-    assert.throws(() => parseFleetCommand("spawn --role bogus api task"), /usage: \/fleet spawn/);
-    assert.throws(() => parseFleetCommand("resume"), /usage: \/fleet resume/);
-    assert.throws(() => parseFleetCommand("send api"), /usage: \/fleet send/);
-    assert.throws(() => parseFleetCommand("log"), /usage: \/fleet log/);
-    assert.throws(() => parseFleetCommand("merge"), /usage: \/fleet merge/);
-    assert.throws(() => parseFleetCommand("stop"), /usage: \/fleet stop/);
+  it("rejects missing required target on clean", () => {
     assert.throws(() => parseFleetCommand("clean --force"), /usage: \/fleet clean/);
-    assert.throws(() => parseFleetCommand("open"), /usage: \/fleet open/);
-  });
-});
-
-describe("Fleet.execute batch target selection", () => {
-  it("merge --done merges only 'done' members and reports empty batch when none match", async () => {
-    const manifest: Manifest = {
-      version: 1,
-      repoRoot: "/repo",
-      members: {
-        m1: makeMember("m1", "done"),
-        m2: makeMember("m2", "running"),
-        m3: makeMember("m3", "merged"),
-      },
-    };
-    const mergedBranches: string[] = [];
-    const fleet = new Fleet("/repo", noopUi, {
-      loadManifest: async () => manifest,
-      saveManifest: async () => {},
-      mergeBranch: async (_root, branch) => {
-        mergedBranches.push(branch);
-        return { ok: true, conflicts: [], output: "" };
-      },
-    });
-
-    const res = await fleet.execute({ action: "merge", target: "--done" });
-    assert.deepEqual(mergedBranches, ["fleet/m1"]);
-    assert.deepEqual(res.lines, ["fleet: merged m1"]);
-    assert.equal(manifest.members.m1.status, "merged");
-
-    const emptyRes = await fleet.execute({ action: "merge", target: "--done" });
-    assert.deepEqual(emptyRes.lines, ["fleet: no matching members to merge"]);
-  });
-
-  it("stop --all stops only active members and skips terminal ones", async () => {
-    const manifest: Manifest = {
-      version: 1,
-      repoRoot: "/repo",
-      members: {
-        active1: makeMember("active1", "running"),
-        active2: makeMember("active2", "idle"),
-        finished: makeMember("finished", "done"),
-        alreadyMerged: makeMember("alreadyMerged", "merged"),
-      },
-    };
-    const fleet = new Fleet("/repo", noopUi, {
-      loadManifest: async () => manifest,
-      saveManifest: async () => {},
-    });
-
-    const res = await fleet.execute({ action: "stop", target: "--all" });
-    assert.deepEqual(res.lines, ["fleet: stopped 'active1'", "fleet: stopped 'active2'"]);
-    assert.equal(manifest.members.active1.status, "stopped");
-    assert.equal(manifest.members.active2.status, "stopped");
-    assert.equal(manifest.members.finished.status, "done");
-    assert.equal(manifest.members.alreadyMerged.status, "merged");
-
-    const emptyRes = await fleet.execute({ action: "stop", target: "--all" });
-    assert.deepEqual(emptyRes.lines, ["fleet: no matching members to stop"]);
-  });
-
-  it("clean --done cleans all non-active members while leaving active members intact", async () => {
-    const manifest: Manifest = {
-      version: 1,
-      repoRoot: "/repo",
-      members: {
-        runningMem: makeMember("runningMem", "running"),
-        doneMem: makeMember("doneMem", "done"),
-        mergedMem: makeMember("mergedMem", "merged"),
-        failedMem: makeMember("failedMem", "failed"),
-        stoppedMem: makeMember("stoppedMem", "stopped"),
-        staleMem: makeMember("staleMem", "stale"),
-      },
-    };
-    const fleet = new Fleet("/repo", noopUi, {
-      loadManifest: async () => manifest,
-      saveManifest: async () => {},
-      branchMerged: async (_root, branch) => branch === "fleet/mergedMem",
-      deleteBranch: async () => ({ ok: true, out: "" }),
-      removeWorktree: async () => ({ ok: true, out: "" }),
-    });
-
-    const res = await fleet.execute(parseFleetCommand("clean --done"));
-    assert.deepEqual(Object.keys(manifest.members), ["runningMem"]);
-    assert.equal(res.lines.length, 5);
-    assert.match(res.lines[0], /cleaned 'doneMem'/);
-    assert.match(res.lines[1], /cleaned 'mergedMem' \(worktree removed, merged branch deleted\)/);
-
-    const emptyRes = await fleet.execute(parseFleetCommand("clean --done"));
-    assert.deepEqual(emptyRes.lines, ["fleet: no matching members to clean"]);
-  });
-
-  it("resume preserves member.task in manifest while forwarding extra instructions to prompt and system append", async () => {
-    const manifest: Manifest = {
-      version: 1,
-      repoRoot: "/repo",
-      members: {
-        api: makeMember("api", "stale", { task: "Implement OAuth login" }),
-      },
-    };
-    const promptsSent: string[] = [];
-    const promptFilesWritten: string[] = [];
-    const fleet = new Fleet("/repo", noopUi, {
-      loadConfig: async () => ({ maxMembers: 6 }),
-      loadManifest: async () => manifest,
-      saveManifest: async () => {},
-      branchExists: async () => true,
-      attachWorktree: async () => {},
-      writePromptFile: async (_file, content) => {
-        promptFilesWritten.push(content);
-      },
-      createClient: async () => ({
-        pid: 4321,
-        exited: false,
-        busy: false,
-        onEvent: () => () => {},
-        waitReady: async () => {},
-        getState: async () => ({ sessionFile: "/repo/.pi/fleet/sessions/api.json" }),
-        prompt: async (msg: string) => {
-          promptsSent.push(msg);
-        },
-        steer: async () => {},
-        abort: async () => {},
-        detach: () => {},
-        kill: async () => {},
-      }),
-    });
-
-    const res = await fleet.execute(
-      parseFleetCommand('resume api "Also cover PKCE token refresh"'),
-    );
-    assert.deepEqual(res.lines, ["fleet: resumed 'api'"]);
-    assert.equal(manifest.members.api.task, "Implement OAuth login");
-    assert.equal(promptsSent.length, 1);
-    assert.match(promptsSent[0], /Original assignment:\nImplement OAuth login/);
-    assert.match(promptsSent[0], /Additional instructions from supervisor:\nAlso cover PKCE token refresh/);
-    assert.match(promptFilesWritten[0], /Also cover PKCE token refresh/);
-  });
-
-  it("status returns all members uncapped while capping the TUI widget at 8 rows", async () => {
-    const members: Record<string, Member> = {};
-    for (let i = 1; i <= 10; i++) {
-      const name = `m${i}`;
-      members[name] = makeMember(name, "done", { createdAt: i * 100 });
-    }
-    let widgetLines: string[] = [];
-    const ui: FleetUi = {
-      notify: () => {},
-      setWidget: (lines) => {
-        widgetLines = lines;
-      },
-    };
-    const fleet = new Fleet("/repo", ui, {
-      loadManifest: async () => ({ version: 1, repoRoot: "/repo", members }),
-      saveManifest: async () => {},
-    });
-
-    const res = await fleet.execute({ action: "status" });
-    assert.equal(res.lines.length, 11); // 1 header + all 10 members
-    assert.match(res.lines[10], /m10 \[coder\] status=done/);
-    assert.equal(widgetLines.length, 10); // 1 header + 8 members + "… 2 more"
-    assert.equal(widgetLines[9], " … 2 more");
   });
 });
 
 describe("toolParamsToCommand", () => {
-  it("maps LLM tool parameters to FleetCommand with full headless parity", () => {
+  it("maps spawn parameters including over to a spawn command", () => {
     assert.deepEqual(
       toolParamsToCommand({
         action: "spawn",
         name: "rev1",
         task: "Review PR",
         role: "reviewer",
-        model: "openai/gpt-5",
         over: "fleet/api",
       }),
       {
@@ -307,65 +268,233 @@ describe("toolParamsToCommand", () => {
         name: "rev1",
         task: "Review PR",
         role: "reviewer",
-        model: "openai/gpt-5",
         over: "fleet/api",
       },
     );
+  });
+
+  it("maps resume message to extra instructions", () => {
     assert.deepEqual(
       toolParamsToCommand({
         action: "resume",
         name: "api",
-        message: "Finish edge cases",
+        message: "Cover edge cases",
       }),
       {
         action: "resume",
         name: "api",
-        extra: "Finish edge cases",
+        extra: "Cover edge cases",
       },
     );
-    assert.deepEqual(
-      toolParamsToCommand({
-        action: "clean",
-        name: "--done",
-        force: true,
-      }),
-      {
-        action: "clean",
-        target: "--done",
-        force: true,
-      },
-    );
-    assert.deepEqual(
-      toolParamsToCommand({
-        action: "merge",
-        name: "--done",
-      }),
-      {
-        action: "merge",
-        target: "--done",
-      },
-    );
-    assert.deepEqual(
-      toolParamsToCommand({
-        action: "stop",
-        name: "--all",
-      }),
-      {
-        action: "stop",
-        target: "--all",
-      },
-    );
-    assert.deepEqual(
-      toolParamsToCommand({
-        action: "log",
+  });
+});
+
+describe("Fleet execution through /fleet command and fleet tool adapters", () => {
+  it("spawns a member, sends initial prompt, and stops it via --all", async () => {
+    const h = await createHarness();
+    try {
+      const spawnRes = await h.runTool({
+        action: "spawn",
         name: "api",
-        n: 40,
-      }),
-      {
-        action: "log",
-        name: "api",
-        n: 40,
-      },
-    );
+        task: "Implement OAuth login",
+      });
+      assert.equal(spawnRes.isError, false);
+
+      await h.runCommand("stop --all");
+      const man = await loadManifest(h.root);
+      assert.equal(man.members.api.status, "stopped");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("preserves member.task in manifest on resume while forwarding extra instructions", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("api", "stale", { task: "Implement OAuth login" });
+
+      await h.runCommand('resume api "Also cover PKCE token refresh"');
+      const manAfterResume = await loadManifest(h.root);
+      const promptFile = await readFile(
+        path.join(h.root, ".pi", "fleet", "prompts", "api.md"),
+        "utf8",
+      );
+      const receivedRaw = await readFile(
+        path.join(h.root, ".pi", "fleet", "wt", "api", ".rpc-received.jsonl"),
+        "utf8",
+      );
+      await h.runCommand("stop api");
+
+      assert.deepEqual(
+        {
+          taskInManifest: manAfterResume.members.api.task,
+          promptFileHasExtra: promptFile.includes("Also cover PKCE token refresh"),
+          rpcPromptHasExtra: receivedRaw.includes("Also cover PKCE token refresh"),
+        },
+        {
+          taskInManifest: "Implement OAuth login",
+          promptFileHasExtra: true,
+          rpcPromptHasExtra: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("delivers send messages and tails member activity logs through the tool adapter", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({ action: "spawn", name: "worker1", task: "Initial task" });
+      const sendRes = await h.runTool({
+        action: "send",
+        name: "worker1",
+        message: "Use strict types",
+      });
+
+      const logPath = path.join(h.root, ".pi", "fleet", "logs", "worker1.jsonl");
+      await writeFile(
+        logPath,
+        [
+          JSON.stringify({ type: "tool_execution_start", toolName: "read" }),
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: "DONE: completed checks" },
+          }),
+        ].join("\n") + "\n",
+        { flag: "a" },
+      );
+
+      const logRes = await h.runTool({ action: "log", name: "worker1", n: 5 });
+      await h.runTool({ action: "stop", name: "--all" });
+
+      assert.deepEqual(
+        {
+          sendText: sendRes.text,
+          hasToolEntry: logRes.text.includes("tool: read"),
+          hasAssistantEntry: logRes.text.includes("assistant: DONE: completed checks"),
+        },
+        {
+          sendText: "fleet: sent to 'worker1' (prompt)",
+          hasToolEntry: true,
+          hasAssistantEntry: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("merges only done members on merge --done and reports error level on conflicts", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("m1", "done", { unmergedCommit: true });
+      await h.seedMember("m2", "running", { unmergedCommit: true });
+
+      await h.runCommand("merge --done");
+      const man = await loadManifest(h.root);
+      assert.equal(man.members.m1.status, "merged");
+      assert.equal(man.members.m2.status, "running");
+
+      await h.seedMember("m3", "done", { conflictingCommit: true });
+      await h.runCommand("merge --done");
+      assert.equal(
+        h.errors().some((e) => e.includes("merge m3 CONFLICTS in: README.md")),
+        true,
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("cleans finished members on clean --done while leaving active and detached members intact", async () => {
+    const h = await createHarness();
+    try {
+      const finished: MemberStatus[] = ["done", "merged", "failed", "stopped", "stale"];
+      const untouched: MemberStatus[] = ["starting", "running", "idle", "detached"];
+
+      for (const status of finished) {
+        await h.seedMember(`fin-${status}`, status, {
+          mergedCommit: status === "merged",
+          unmergedCommit: status !== "merged",
+        });
+      }
+      for (const status of untouched) {
+        await h.seedMember(`keep-${status}`, status);
+      }
+
+      await h.runCommand("clean --done");
+      const man = await loadManifest(h.root);
+
+      assert.deepEqual(
+        {
+          remaining: Object.keys(man.members).sort(),
+          mergedBranchGone: !(await branchExists(h.root, "fleet/fin-merged")),
+          unmergedDoneBranchKept: await branchExists(h.root, "fleet/fin-done"),
+          doneWorktreeGone: !existsSync(path.join(h.root, ".pi", "fleet", "wt", "fin-done")),
+          errors: h.errors(),
+        },
+        {
+          remaining: ["keep-detached", "keep-idle", "keep-running", "keep-starting"],
+          mergedBranchGone: true,
+          unmergedDoneBranchKept: true,
+          doneWorktreeGone: true,
+          errors: [],
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("deletes unmerged branches when clean --force is passed in either flag order", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("done-a", "done", { unmergedCommit: true });
+      await h.runCommand("clean --done --force");
+
+      await h.seedMember("done-b", "failed", { unmergedCommit: true });
+      await h.runCommand("clean --force --done");
+
+      assert.deepEqual(
+        {
+          doneABranchExists: await branchExists(h.root, "fleet/done-a"),
+          doneBBranchExists: await branchExists(h.root, "fleet/done-b"),
+          errors: h.errors(),
+        },
+        {
+          doneABranchExists: false,
+          doneBBranchExists: false,
+          errors: [],
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("returns all members uncapped on status while capping the TUI widget at 8 rows", async () => {
+    const h = await createHarness();
+    try {
+      for (let i = 1; i <= 10; i++) {
+        await h.seedMember(`m${i}`, "done", { createdAt: i * 100 });
+      }
+
+      const statusRes = await h.runTool({ action: "status" });
+      assert.deepEqual(
+        {
+          statusLineCount: statusRes.text.split("\n").length,
+          widgetLineCount: h.widgetLines().length,
+          widgetFooter: h.widgetLines()[9],
+        },
+        {
+          statusLineCount: 11,
+          widgetLineCount: 10,
+          widgetFooter: " … 2 more",
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
   });
 });

@@ -16,6 +16,8 @@ import {
 import { repoRoot } from "./gitw.ts";
 import { ROLE_NAMES } from "./types.ts";
 
+const OPTIONAL = Symbol("optional");
+
 const Type = {
   Literal: (value: string) => ({ type: "string", const: value }),
   Union: (anyOf: unknown[], opts?: Record<string, unknown>) => ({ anyOf, ...opts }),
@@ -35,7 +37,6 @@ const Type = {
     return { type: "object", required, properties } as any;
   },
 };
-const OPTIONAL = Symbol("optional");
 
 export default function (pi: ExtensionAPI) {
   const fleets = new Map<string, Fleet>();
@@ -102,9 +103,9 @@ export default function (pi: ExtensionAPI) {
       try {
         const cmd = parseFleetCommand(args);
         const fleet = await getFleet(ctx);
-        const { lines } = await fleet.execute(cmd);
-        for (const line of lines) {
-          ctx.ui.notify(line, line.includes("CONFLICTS in:") ? "error" : "info");
+        const { messages } = await fleet.execute(cmd);
+        for (const m of messages) {
+          ctx.ui.notify(m.text, m.level);
         }
       } catch (err) {
         fail(ctx, err);
@@ -182,8 +183,11 @@ export default function (pi: ExtensionAPI) {
       try {
         const cmd = toolParamsToCommand(params);
         const fleet = await getFleet(ctx);
-        const { lines } = await fleet.execute(cmd);
-        return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
+        const { messages } = await fleet.execute(cmd);
+        return {
+          content: [{ type: "text", text: messages.map((m) => m.text).join("\n") }],
+          details: {},
+        };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text", text: `fleet error: ${msg}` }], details: {}, isError: true };

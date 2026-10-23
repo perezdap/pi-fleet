@@ -5,8 +5,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { watch, type FSWatcher } from "node:fs";
+import { existsSync, watch, type FSWatcher } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { loadFleetConfig, piBinary, resolveRoleSpec } from "./config.ts";
@@ -25,85 +24,47 @@ import {
 } from "./gitw.ts";
 import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import { buildSystemAppend, resumePreamble } from "./roles.ts";
-import { RpcMember, type RpcEventHandler, type RpcSpawnOptions } from "./rpc.ts";
+import { RpcMember } from "./rpc.ts";
 import {
   ROLE_NAMES,
+  type CleanTarget,
   type FleetCommand,
   type FleetConfig,
+  type FleetMessage,
   type FleetResult,
   type Manifest,
   type Member,
   type MemberStatus,
+  type MergeTarget,
+  type NotifyLevel,
   type RoleName,
+  type StopTarget,
 } from "./types.ts";
 
-export type NotifyLevel = "info" | "warn" | "error";
+export type { NotifyLevel } from "./types.ts";
 
 export interface FleetUi {
   notify(text: string, level?: NotifyLevel): void;
   setWidget(lines: string[]): void;
 }
 
-export interface RpcClientLike {
-  readonly pid: number;
-  exited: boolean;
+interface SpawnOptions {
+  name: string;
+  task: string;
+  role?: RoleName;
+  model?: string;
+  over?: string;
+  extra?: string;
+  preserveTask?: boolean;
+}
+
+interface StatusRow {
+  member: Member;
+  live: boolean;
   busy: boolean;
-  onEvent(handler: RpcEventHandler): () => void;
-  waitReady(timeoutMs?: number): Promise<void>;
-  getState(): Promise<any>;
-  prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<any>;
-  steer(message: string): Promise<any>;
-  abort(): Promise<any>;
-  detach(): void;
-  kill(): Promise<void>;
 }
 
-export interface FleetDeps {
-  loadConfig: (root: string) => Promise<FleetConfig>;
-  loadManifest: (root: string) => Promise<Manifest>;
-  saveManifest: (man: Manifest) => Promise<void>;
-  headRev: (root: string, ref?: string) => Promise<string>;
-  addWorktree: (root: string, wt: string, branch: string, baseRef: string) => Promise<void>;
-  attachWorktree: (root: string, wt: string, branch: string) => Promise<void>;
-  removeWorktree: (root: string, wt: string, force?: boolean) => Promise<{ ok: boolean; out: string }>;
-  deleteBranch: (root: string, branch: string, force?: boolean) => Promise<{ ok: boolean; out: string }>;
-  branchExists: (root: string, branch: string) => Promise<boolean>;
-  branchMerged: (root: string, branch: string) => Promise<boolean>;
-  commitsSince: (root: string, baseRef: string, branch: string) => Promise<string[]>;
-  diffForReview: (root: string, baseRef: string, branch: string) => Promise<string>;
-  mergeBranch: (root: string, branch: string, message: string) => Promise<MergeResult>;
-  createClient: (opts: RpcSpawnOptions) => Promise<RpcClientLike>;
-  writePromptFile: (promptFile: string, content: string) => Promise<void>;
-}
-
-const DEFAULT_DEPS: FleetDeps = {
-  loadConfig: loadFleetConfig,
-  loadManifest,
-  saveManifest,
-  headRev,
-  addWorktree,
-  attachWorktree,
-  removeWorktree,
-  deleteBranch,
-  branchExists,
-  branchMerged,
-  commitsSince,
-  diffForReview,
-  mergeBranch,
-  createClient: async (opts) => {
-    const idx = opts.args.indexOf("--session-dir");
-    if (idx >= 0 && opts.args[idx + 1]) {
-      await mkdir(opts.args[idx + 1], { recursive: true });
-    }
-    return RpcMember.create(opts);
-  },
-  writePromptFile: async (promptFile, content) => {
-    await mkdir(path.dirname(promptFile), { recursive: true });
-    await writeFile(promptFile, content, "utf8");
-  },
-};
-
-export const USAGE = [
+const USAGE = [
   "/fleet — run parallel pi agents in isolated git worktrees",
   "  status                          Show all members",
   "  spawn [--role r] [--model m] [--over ref] <name> <task…>",
@@ -116,24 +77,6 @@ export const USAGE = [
   "  open <name>                     Resume member session in a new pi window",
   "Roles: coder, tester, reviewer (read-only), integrator — see README.",
 ].join("\n");
-
-export interface SpawnOptions {
-  name: string;
-  task: string;
-  role?: RoleName;
-  /** Model override, e.g. "anthropic/claude-opus-4-5:high". */
-  model?: string;
-  /** Branch/ref the worktree starts from (default: config baseRef). */
-  over?: string;
-  /** Extra supervisor instructions on resume (does not overwrite member.task). */
-  extra?: string;
-}
-
-export interface StatusRow {
-  member: Member;
-  live: boolean;
-  busy: boolean;
-}
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const RESUMABLE = new Set<MemberStatus>(["stale", "stopped", "failed", "done"]);
@@ -151,36 +94,38 @@ const GLYPH: Record<Member["status"], string> = {
   merged: "✔",
 };
 
+function info(lines: string[]): FleetResult {
+  return { messages: lines.map((text) => ({ text, level: "info" })) };
+}
+
 export class Fleet {
   readonly root: string;
   public ui: FleetUi;
 
-  private clients = new Map<string, RpcClientLike>();
+  private clients = new Map<string, RpcMember>();
   private askWatchers = new Map<string, FSWatcher>();
-  private deps: FleetDeps;
   private cfg?: FleetConfig;
   private man?: Manifest;
 
-  constructor(root: string, ui: FleetUi, deps?: Partial<FleetDeps>) {
+  constructor(root: string, ui: FleetUi) {
     this.root = root;
     this.ui = ui;
-    this.deps = { ...DEFAULT_DEPS, ...deps };
   }
 
   // ── state ────────────────────────────────────────────────────────────────
 
   private async config(): Promise<FleetConfig> {
-    return (this.cfg ??= await this.deps.loadConfig(this.root));
+    return (this.cfg ??= await loadFleetConfig(this.root));
   }
 
   private async manifest(): Promise<Manifest> {
-    this.man ??= await this.deps.loadManifest(this.root);
+    this.man ??= await loadManifest(this.root);
     return this.man;
   }
 
   private async save(): Promise<void> {
     if (this.man) {
-      await this.deps.saveManifest(this.man);
+      await saveManifest(this.man);
       await this.refreshWidget();
     }
   }
@@ -190,15 +135,15 @@ export class Fleet {
   async execute(cmd: FleetCommand): Promise<FleetResult> {
     switch (cmd.action) {
       case "help":
-        return { lines: [USAGE] };
+        return info([USAGE]);
 
       case "status": {
         const rows = await this.statusRows();
         await this.refreshWidget();
         if (rows.length === 0) {
-          return { lines: ["fleet: no members; try /fleet spawn <name> <task>"] };
+          return info(["fleet: no members; try /fleet spawn <name> <task>"]);
         }
-        return { lines: this.statusLines(rows) };
+        return info(this.statusLines(rows));
       }
 
       case "spawn": {
@@ -209,100 +154,101 @@ export class Fleet {
           model: cmd.model,
           over: cmd.over,
         });
-        return { lines: [`fleet: spawned '${member.name}' (${member.role}) on ${member.branch}`] };
+        return info([`fleet: spawned '${member.name}' (${member.role}) on ${member.branch}`]);
       }
 
       case "resume": {
         const resumed = await this.resume(cmd.name, cmd.extra);
-        return { lines: [`fleet: resumed '${resumed.name}'`] };
+        return info([`fleet: resumed '${resumed.name}'`]);
       }
 
       case "send": {
         const mode = await this.send(cmd.name, cmd.message);
-        return { lines: [`fleet: sent to '${cmd.name}' (${mode})`] };
+        return info([`fleet: sent to '${cmd.name}' (${mode})`]);
       }
 
       case "log": {
         const text = await this.logTail(cmd.name, cmd.n ?? 20);
-        return { lines: text.split("\n") };
+        return info(text.split("\n"));
       }
 
       case "merge": {
         const man = await this.manifest();
         const names =
-          cmd.target === "--done"
+          cmd.target.kind === "done"
             ? Object.values(man.members)
                 .filter((m) => m.status === "done")
                 .map((m) => m.name)
-            : [cmd.target];
-        if (cmd.target === "--done" && names.length === 0) {
-          return { lines: ["fleet: no matching members to merge"] };
+            : [cmd.target.name];
+        if (cmd.target.kind === "done" && names.length === 0) {
+          return info(["fleet: no matching members to merge"]);
         }
-        const lines: string[] = [];
+        const messages: FleetMessage[] = [];
         for (const name of names) {
           const result = await this.merge(name);
           if (result.ok) {
-            lines.push(`fleet: merged ${name}`);
+            messages.push({ text: `fleet: merged ${name}`, level: "info" });
           } else {
-            lines.push(
-              `fleet: merge ${name} CONFLICTS in: ${result.conflicts.join(", ") || "(unknown)"}`,
-            );
+            messages.push({
+              text: `fleet: merge ${name} CONFLICTS in: ${result.conflicts.join(", ") || "(unknown)"}`,
+              level: "error",
+            });
           }
         }
-        return { lines };
+        return { messages };
       }
 
       case "stop": {
         const man = await this.manifest();
         const names =
-          cmd.target === "--all"
+          cmd.target.kind === "all"
             ? Object.values(man.members)
                 .filter((m) => isActiveStatus(m.status) || this.clients.has(m.name))
                 .map((m) => m.name)
-            : [cmd.target];
-        if (cmd.target === "--all" && names.length === 0) {
-          return { lines: ["fleet: no matching members to stop"] };
+            : [cmd.target.name];
+        if (cmd.target.kind === "all" && names.length === 0) {
+          return info(["fleet: no matching members to stop"]);
         }
         const lines: string[] = [];
         for (const name of names) {
           await this.stop(name);
           lines.push(`fleet: stopped '${name}'`);
         }
-        return { lines };
+        return info(lines);
       }
 
       case "clean": {
         const force = !!cmd.force;
         const man = await this.manifest();
         const names =
-          cmd.target === "--all"
+          cmd.target.kind === "all"
             ? Object.keys(man.members)
-            : cmd.target === "--done"
+            : cmd.target.kind === "done"
               ? Object.values(man.members)
                   .filter((m) => CLEANABLE_DONE.has(m.status))
                   .map((m) => m.name)
-              : [cmd.target];
-        if ((cmd.target === "--all" || cmd.target === "--done") && names.length === 0) {
-          return { lines: ["fleet: no matching members to clean"] };
+              : [cmd.target.name];
+        if (cmd.target.kind !== "member" && names.length === 0) {
+          return info(["fleet: no matching members to clean"]);
         }
         const lines: string[] = [];
         for (const name of names) {
           const outcome = await this.clean(name, force);
           lines.push(`fleet: cleaned '${name}' (${outcome})`);
         }
-        return { lines };
+        return info(lines);
       }
 
       case "open": {
         const outcome = await this.open(cmd.name);
-        return { lines: [`fleet: ${outcome}`] };
+        return info([`fleet: ${outcome}`]);
       }
     }
   }
 
   // ── lifecycle ────────────────────────────────────────────────────────────
 
-  async spawn(o: SpawnOptions): Promise<Member> {
+  private async spawn(o: SpawnOptions): Promise<Member> {
     const cfg = await this.config();
     const man = await this.manifest();
 
@@ -330,15 +276,14 @@ export class Fleet {
     let baseRef: string;
 
     if (resume) {
-      // Reuse worktree if present; re-attach branch if the worktree was removed.
       if (!existsSync(wt)) {
-        if (await this.deps.branchExists(this.root, branch)) await this.deps.attachWorktree(this.root, wt, branch);
+        if (await branchExists(this.root, branch)) await attachWorktree(this.root, wt, branch);
         else throw new Error(`cannot resume '${o.name}': worktree and branch are gone; run /fleet clean ${o.name} first`);
       }
       baseRef = existing!.baseRef;
     } else {
-      baseRef = await this.deps.headRev(this.root, baseInput);
-      await this.deps.addWorktree(this.root, wt, branch, baseRef);
+      baseRef = await headRev(this.root, baseInput);
+      await addWorktree(this.root, wt, branch, baseRef);
     }
 
     const now = Date.now();
@@ -354,7 +299,7 @@ export class Fleet {
       updatedAt: now,
     };
     if (resume) {
-      member.task = o.task || member.task;
+      if (!o.preserveTask && o.task) member.task = o.task;
       member.model = model ?? member.model;
     } else {
       member.model = model;
@@ -366,27 +311,28 @@ export class Fleet {
     await this.save();
 
     try {
-      // System prompt append lives in a file; pi reads file contents for --append-system-prompt.
-      const promptFile = path.join(fleetDir(this.root), "prompts", `${o.name}.md`);
+      const promptsDir = path.join(fleetDir(this.root), "prompts");
+      await mkdir(promptsDir, { recursive: true });
+      const promptFile = path.join(promptsDir, `${o.name}.md`);
       const extraAppend = [spec.systemAppend, o.extra].filter(Boolean).join("\n\n");
-      await this.deps.writePromptFile(
+      await writeFile(
         promptFile,
         buildSystemAppend(
           { name: o.name, role, branch, repoRoot: this.root, task: member.task },
           extraAppend || undefined,
         ),
+        "utf8",
       );
 
-      // Reviewers get the diff under review dropped into their worktree.
       if (role === "reviewer" && o.over) {
         await this.writeReviewContext(member, o.over);
       }
 
       const sessionDir = path.join(this.root, cfg.sessionDir ?? ".pi/fleet/sessions");
+      await mkdir(sessionDir, { recursive: true });
       const logFile = path.join(this.root, cfg.logDir ?? ".pi/fleet/logs", `${o.name}.jsonl`);
 
       const args = [
-        // Worktrees are fresh directories: trust project-local files without prompting.
         "--approve",
         "--name", `fleet:${o.name}`,
         "--session-dir", sessionDir,
@@ -396,7 +342,7 @@ export class Fleet {
       else if (spec.thinking) args.push("--thinking", spec.thinking);
       if (spec.tools) args.push("--tools", spec.tools);
 
-      const client = await this.deps.createClient({
+      const client = await RpcMember.create({
         piBin: piBinary(cfg),
         cwd: wt,
         args,
@@ -426,13 +372,27 @@ export class Fleet {
     }
   }
 
+  private async resume(name: string, extra?: string): Promise<Member> {
+    const man = await this.manifest();
+    const member = man.members[name];
+    if (!member) throw new Error(`no such member '${name}'`);
+    return this.spawn({
+      name,
+      task: member.task,
+      role: member.role,
+      model: member.model,
+      extra,
+      preserveTask: true,
+    });
+  }
+
   private async writeReviewContext(member: Member, target: string): Promise<void> {
     const man = await this.manifest();
     const targetName = target.replace(/^fleet\//, "");
     const targetMember = man.members[targetName];
     const diffBase = targetMember?.baseRef ?? (await this.config()).baseRef ?? "HEAD";
-    const commits = await this.deps.commitsSince(this.root, diffBase, target).catch(() => [] as string[]);
-    const diff = await this.deps.diffForReview(this.root, diffBase, target);
+    const commits = await commitsSince(this.root, diffBase, target).catch(() => [] as string[]);
+    const diff = await diffForReview(this.root, diffBase, target);
     const dir = path.join(member.worktree, ".pi", "fleet");
     await mkdir(dir, { recursive: true });
     const commitList = commits.length ? commits.map((c) => `- ${c}`).join("\n") : "(no commits)";
@@ -443,7 +403,7 @@ export class Fleet {
     );
   }
 
-  async send(name: string, message: string): Promise<"steer" | "prompt"> {
+  private async send(name: string, message: string): Promise<"steer" | "prompt"> {
     const client = this.mustClient(name);
     if (client.busy) {
       await client.steer(message);
@@ -453,7 +413,7 @@ export class Fleet {
     return "prompt";
   }
 
-  async stop(name: string): Promise<void> {
+  private async stop(name: string): Promise<void> {
     const client = this.clients.get(name);
     const man = await this.manifest();
     const member = man.members[name];
@@ -463,14 +423,14 @@ export class Fleet {
       this.clients.delete(name);
       this.unwatchAsk(name);
     }
-    if (member && isActiveStatus(member.status)) {
+    if (member && (isActiveStatus(member.status) || member.status === "detached" || !!client)) {
       member.status = "stopped";
       member.updatedAt = Date.now();
       await this.save();
     }
   }
 
-  async clean(name: string, force = false): Promise<string> {
+  private async clean(name: string, force = false): Promise<string> {
     const man = await this.manifest();
     const member = man.members[name];
     if (!member) throw new Error(`no such member '${name}'`);
@@ -479,12 +439,12 @@ export class Fleet {
       await this.stop(name);
     }
     if (existsSync(member.worktree)) {
-      const r = await this.deps.removeWorktree(this.root, member.worktree, force);
+      const r = await removeWorktree(this.root, member.worktree, force);
       if (!r.ok) throw new Error(`worktree remove failed: ${r.out}`);
     }
-    const merged = await this.deps.branchMerged(this.root, member.branch).catch(() => false);
+    const merged = await branchMerged(this.root, member.branch).catch(() => false);
     if (merged || force) {
-      const r = await this.deps.deleteBranch(this.root, member.branch, force);
+      const r = await deleteBranch(this.root, member.branch, force);
       if (!r.ok && force) throw new Error(`branch delete failed: ${r.out}`);
     }
     delete man.members[name];
@@ -492,11 +452,11 @@ export class Fleet {
     return merged ? "worktree removed, merged branch deleted" : "worktree removed, branch kept (unmerged)";
   }
 
-  async merge(name: string): Promise<MergeResult> {
+  private async merge(name: string): Promise<MergeResult> {
     const man = await this.manifest();
     const member = man.members[name];
     if (!member) throw new Error(`no such member '${name}'`);
-    const result = await this.deps.mergeBranch(this.root, member.branch, `fleet(${name}): ${member.task.split("\n")[0]}`);
+    const result = await mergeBranch(this.root, member.branch, `fleet(${name}): ${member.task.split("\n")[0]}`);
     if (result.ok) {
       member.status = "merged";
       member.updatedAt = Date.now();
@@ -505,8 +465,7 @@ export class Fleet {
     return result;
   }
 
-  /** Open a member's session in a new interactive pi window. */
-  async open(name: string): Promise<string> {
+  private async open(name: string): Promise<string> {
     const man = await this.manifest();
     const member = man.members[name];
     if (!member?.sessionFile || !existsSync(member.sessionFile)) {
@@ -542,11 +501,19 @@ export class Fleet {
     return rows;
   }
 
-  private statusLines(rows: StatusRow[]): string[] {
+  private formatHeader(rows: StatusRow[]): string {
     const active = rows.filter((r) => isActiveStatus(r.member.status)).length;
-    const lines = [`fleet: ${rows.length} member${rows.length === 1 ? "" : "s"} (${active} active)`];
+    return `fleet: ${rows.length} member${rows.length === 1 ? "" : "s"} (${active} active)`;
+  }
+
+  private memberGlyph(member: Member, live: boolean): string {
+    return live ? GLYPH[member.status] : (member.status === "merged" ? "✔" : "·");
+  }
+
+  private statusLines(rows: StatusRow[]): string[] {
+    const lines = [this.formatHeader(rows)];
     for (const { member, live, busy } of rows) {
-      const glyph = live ? GLYPH[member.status] : (member.status === "merged" ? "✔" : "·");
+      const glyph = this.memberGlyph(member, live);
       const flags = `${busy ? " (busy)" : ""}${live ? "" : " (not attached)"}`;
       const ask = member.needsAttention ? ` ASK: ${member.needsAttention}` : "";
       lines.push(
@@ -558,10 +525,9 @@ export class Fleet {
 
   private widgetLines(rows: StatusRow[]): string[] {
     if (rows.length === 0) return [];
-    const active = rows.filter((r) => isActiveStatus(r.member.status)).length;
-    const lines = [`fleet: ${rows.length} member${rows.length === 1 ? "" : "s"} (${active} active)`];
+    const lines = [this.formatHeader(rows)];
     for (const { member, live } of rows.slice(0, 8)) {
-      const glyph = live ? GLYPH[member.status] : (member.status === "merged" ? "✔" : "·");
+      const glyph = this.memberGlyph(member, live);
       const ask = member.needsAttention ? `  ASK: ${truncate(member.needsAttention, 48)}` : "";
       lines.push(` ${glyph} ${member.name.padEnd(12)} ${member.role.padEnd(10)} ${member.status}${ask}`);
     }
@@ -579,20 +545,7 @@ export class Fleet {
     }
   }
 
-  async resume(name: string, extra?: string): Promise<Member> {
-    const man = await this.manifest();
-    const member = man.members[name];
-    if (!member) throw new Error(`no such member '${name}'`);
-    return this.spawn({
-      name,
-      task: member.task,
-      role: member.role,
-      model: member.model,
-      extra,
-    });
-  }
-
-  async logTail(name: string, n = 20): Promise<string> {
+  private async logTail(name: string, n = 20): Promise<string> {
     const cfg = await this.config();
     const logFile = path.join(this.root, cfg.logDir ?? ".pi/fleet/logs", `${name}.jsonl`);
     let raw: string;
@@ -719,7 +672,6 @@ export class Fleet {
         this.ui.notify(`fleet member '${name}' asks: ${truncate(question, 120)}`, "warn");
       }
     } catch {
-      // File removed: clear the flag.
       if (member.needsAttention) {
         member.needsAttention = undefined;
         await this.save();
@@ -728,7 +680,7 @@ export class Fleet {
   }
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── helpers & command parsers ────────────────────────────────────────────────
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -762,6 +714,25 @@ function shiftToken(input: string): { token: string; rest: string } {
   const match = /^(\S+)([\s\S]*)$/.exec(trimmed);
   if (!match) return { token: "", rest: "" };
   return { token: match[1], rest: match[2] ?? "" };
+}
+
+function parseMergeTarget(raw: string): MergeTarget {
+  if (raw === "--done") return { kind: "done" };
+  if (!raw || raw.startsWith("--")) throw new Error("usage: /fleet merge <name|--done>");
+  return { kind: "member", name: raw };
+}
+
+function parseStopTarget(raw: string): StopTarget {
+  if (raw === "--all") return { kind: "all" };
+  if (!raw || raw.startsWith("--")) throw new Error("usage: /fleet stop <name|--all>");
+  return { kind: "member", name: raw };
+}
+
+function parseCleanTarget(raw: string): CleanTarget {
+  if (raw === "--done") return { kind: "done" };
+  if (raw === "--all") return { kind: "all" };
+  if (!raw || raw.startsWith("--")) throw new Error("usage: /fleet clean <name|--done|--all> [--force]");
+  return { kind: "member", name: raw };
 }
 
 export function parseFleetCommand(raw: string): FleetCommand {
@@ -812,26 +783,6 @@ export function parseFleetCommand(raw: string): FleetCommand {
       return { action: "spawn", name, task, ...opts };
     }
 
-    case "clean": {
-      const tokens = rest.trim().split(/\s+/).filter(Boolean);
-      let force = false;
-      const targets: string[] = [];
-      for (const t of tokens) {
-        if (t === "--force") {
-          force = true;
-        } else if (t === "--done" || t === "--all" || !t.startsWith("--")) {
-          targets.push(t);
-        } else {
-          throw new Error("usage: /fleet clean <name|--done|--all> [--force]");
-        }
-      }
-      const target = targets[0];
-      if (!target || targets.length > 1) {
-        throw new Error("usage: /fleet clean <name|--done|--all> [--force]");
-      }
-      return { action: "clean", target, ...(force ? { force: true } : {}) };
-    }
-
     case "resume": {
       const { token: name, rest: tail } = shiftToken(rest);
       if (!name) throw new Error("usage: /fleet resume <name> [extra instructions…]");
@@ -856,19 +807,36 @@ export function parseFleetCommand(raw: string): FleetCommand {
     }
 
     case "merge": {
-      const { token: target, rest: tail } = shiftToken(rest);
-      if (!target || shiftToken(tail).token || (target.startsWith("--") && target !== "--done")) {
-        throw new Error("usage: /fleet merge <name|--done>");
-      }
-      return { action: "merge", target };
+      const { token: rawTarget, rest: tail } = shiftToken(rest);
+      if (shiftToken(tail).token) throw new Error("usage: /fleet merge <name|--done>");
+      return { action: "merge", target: parseMergeTarget(rawTarget) };
     }
 
     case "stop": {
-      const { token: target, rest: tail } = shiftToken(rest);
-      if (!target || shiftToken(tail).token || (target.startsWith("--") && target !== "--all")) {
-        throw new Error("usage: /fleet stop <name|--all>");
+      const { token: rawTarget, rest: tail } = shiftToken(rest);
+      if (shiftToken(tail).token) throw new Error("usage: /fleet stop <name|--all>");
+      return { action: "stop", target: parseStopTarget(rawTarget) };
+    }
+
+    case "clean": {
+      const tokens = rest.trim().split(/\s+/).filter(Boolean);
+      let force = false;
+      const rawTargets: string[] = [];
+      for (const t of tokens) {
+        if (t === "--force") {
+          force = true;
+        } else {
+          rawTargets.push(t);
+        }
       }
-      return { action: "stop", target };
+      if (rawTargets.length !== 1) {
+        throw new Error("usage: /fleet clean <name|--done|--all> [--force]");
+      }
+      return {
+        action: "clean",
+        target: parseCleanTarget(rawTargets[0]),
+        ...(force ? { force: true } : {}),
+      };
     }
 
     case "open": {
@@ -911,7 +879,7 @@ export function toolParamsToCommand(params: {
     }
     case "resume": {
       if (!params.name) throw new Error("resume requires name");
-      const extra = (params.message ?? params.task)?.trim();
+      const extra = params.message?.trim();
       return {
         action: "resume",
         name: params.name,
@@ -929,17 +897,17 @@ export function toolParamsToCommand(params: {
     }
     case "merge": {
       if (!params.name) throw new Error("merge requires name (or '--done')");
-      return { action: "merge", target: params.name };
+      return { action: "merge", target: parseMergeTarget(params.name) };
     }
     case "stop": {
       if (!params.name) throw new Error("stop requires name (or '--all')");
-      return { action: "stop", target: params.name };
+      return { action: "stop", target: parseStopTarget(params.name) };
     }
     case "clean": {
       if (!params.name) throw new Error("clean requires name (or '--done' / '--all')");
       return {
         action: "clean",
-        target: params.name,
+        target: parseCleanTarget(params.name),
         ...(params.force ? { force: true } : {}),
       };
     }

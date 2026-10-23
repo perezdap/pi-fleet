@@ -71,6 +71,21 @@ export interface Manifest {
   members: Record<string, Member>;
 }
 
+export type NotifyLevel = "info" | "warn" | "error";
+
+export type MergeTarget =
+  | { kind: "member"; name: string }
+  | { kind: "done" };
+
+export type StopTarget =
+  | { kind: "member"; name: string }
+  | { kind: "all" };
+
+export type CleanTarget =
+  | { kind: "member"; name: string }
+  | { kind: "done" }
+  | { kind: "all" };
+
 export type FleetCommand =
   | { action: "help" }
   | { action: "status" }
@@ -99,15 +114,15 @@ export type FleetCommand =
     }
   | {
       action: "merge";
-      target: string;
+      target: MergeTarget;
     }
   | {
       action: "stop";
-      target: string;
+      target: StopTarget;
     }
   | {
       action: "clean";
-      target: string;
+      target: CleanTarget;
       force?: boolean;
     }
   | {
@@ -115,6 +130,11 @@ export type FleetCommand =
       name: string;
     };
 
+export interface FleetMessage {
+  text: string;
+  level: NotifyLevel;
+}
+
 export interface FleetResult {
-  lines: string[];
+  messages: FleetMessage[];
 }

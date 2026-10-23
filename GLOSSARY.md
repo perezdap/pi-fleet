@@ -5,7 +5,7 @@ A supervisor session runs member agents, each in its own git worktree, and integ
 ## Language
 
 **Supervisor**:
-The primary session that spawns, steers, merges, and cleans members across the fleet.
+The primary session that owns the fleet and integrates member branches into the repository.
 _Avoid_: Orchestrator, parent, master, controller
 
 **Member**:
@@ -17,5 +17,5 @@ A member whose worktree and manifest entry are removed after it finishes cleanly
 _Avoid_: Ephemeral member, temporary agent
 
 **Clean**:
-Removing a member's worktree and manifest entry, and deleting its branch only when that branch is already merged.
+The removal of a member's worktree and manifest entry, plus its branch when already merged.
 _Avoid_: Delete, wipe, purge
