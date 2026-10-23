@@ -45,6 +45,7 @@ export type { NotifyLevel } from "./types.ts";
 
 export interface FleetUi {
   notify(text: string, level?: NotifyLevel): void;
+  /** Pass an empty array to clear the widget. */
   setWidget(lines: string[]): void;
 }
 
@@ -543,8 +544,7 @@ export class Fleet {
   private async refreshWidget(): Promise<void> {
     try {
       const rows = await this.statusRows();
-      const lines = this.widgetLines(rows);
-      if (lines.length > 0) this.ui.setWidget(lines);
+      this.ui.setWidget(this.widgetLines(rows));
     } catch {
       // Widget is best-effort.
     }

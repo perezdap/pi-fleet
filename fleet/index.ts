@@ -52,7 +52,7 @@ export default function (pi: ExtensionAPI) {
       },
       setWidget: (lines: string[]) => {
         try {
-          ctx.ui.setWidget("fleet", lines);
+          ctx.ui.setWidget("fleet", lines.length > 0 ? lines : undefined);
         } catch {
           // best-effort
         }

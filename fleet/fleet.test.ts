@@ -54,8 +54,9 @@ process.stdin.on("data", (chunk) => {
 interface TestHarness {
   root: string;
   notifications: Array<{ text: string; level: NotifyLevel }>;
-  widgetLines: () => string[];
+  widgetLines: () => string[] | undefined;
   errors: () => string[];
+  reconcileSession: () => Promise<void>;
   runCommand: (args: string) => Promise<void>;
   runTool: (params: Record<string, unknown>) => Promise<{ text: string; isError: boolean }>;
   seedMember: (
@@ -105,8 +106,9 @@ async function createHarness(): Promise<TestHarness> {
   );
 
   const notifications: Array<{ text: string; level: NotifyLevel }> = [];
-  let currentWidget: string[] = [];
+  let currentWidget: string[] | undefined;
   let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+  let sessionStartHandler: ((event: any, ctx: any) => Promise<void>) | undefined;
   let toolExecutor:
     | ((id: string, params: any, sig: any, upd: any, ctx: any) => Promise<any>)
     | undefined;
@@ -115,7 +117,8 @@ async function createHarness(): Promise<TestHarness> {
   function bindExtension(): void {
     shutdownHandlers.length = 0;
     const fakePi: any = {
-      on: (event: string, fn: () => Promise<void> | void) => {
+      on: (event: string, fn: (event: any, ctx: any) => Promise<void> | void) => {
+        if (event === "session_start") sessionStartHandler = fn;
         if (event === "session_shutdown") shutdownHandlers.push(fn);
       },
       registerCommand: (name: string, spec: { handler: (args: string, ctx: any) => Promise<void> }) => {
@@ -135,7 +138,7 @@ async function createHarness(): Promise<TestHarness> {
       notify: (text: string, level: NotifyLevel = "info") => {
         notifications.push({ text, level });
       },
-      setWidget: (_id: string, lines: string[]) => {
+      setWidget: (_id: string, lines: string[] | undefined) => {
         currentWidget = lines;
       },
     },
@@ -196,6 +199,10 @@ async function createHarness(): Promise<TestHarness> {
     notifications,
     widgetLines: () => currentWidget,
     errors: () => notifications.filter((n) => n.level === "error").map((n) => n.text),
+    reconcileSession: async () => {
+      assert.ok(sessionStartHandler, "session_start handler must be registered");
+      await sessionStartHandler({}, ctx);
+    },
     runCommand: async (args: string) => {
       assert.ok(commandHandler);
       await commandHandler(args, ctx);
@@ -547,14 +554,70 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       assert.deepEqual(
         {
           statusLineCount: statusRes.text.split("\n").length,
-          widgetLineCount: h.widgetLines().length,
-          widgetFooter: h.widgetLines()[9],
+          widgetLineCount: h.widgetLines()?.length,
+          widgetFooter: h.widgetLines()?.[9],
         },
         {
           statusLineCount: 11,
           widgetLineCount: 10,
           widgetFooter: " … 2 more",
         },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("clears the TUI widget when cleaning the last member", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("last-done", "done");
+      await h.runCommand("status");
+      const rendered = h.widgetLines();
+
+      await h.runCommand("clean last-done");
+
+      assert.deepEqual(
+        { rendered, afterClean: h.widgetLines(), errors: h.errors() },
+        {
+          rendered: ["fleet: 1 member (0 active)", " · last-done    coder      done"],
+          afterClean: undefined,
+          errors: [],
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("clears a stale TUI widget on status when no members exist", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("stale", "done");
+      await h.runCommand("status");
+      await h.runCommand("clean stale");
+      await h.runCommand("status");
+
+      assert.deepEqual(
+        { widget: h.widgetLines(), errors: h.errors() },
+        { widget: undefined, errors: [] },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("clears a stale TUI widget on session_start when no members exist", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("stale", "done");
+      await h.runCommand("status");
+      await h.runCommand("clean stale");
+      await h.reconcileSession();
+
+      assert.deepEqual(
+        { widget: h.widgetLines(), errors: h.errors() },
+        { widget: undefined, errors: [] },
       );
     } finally {
       await h.cleanup();
