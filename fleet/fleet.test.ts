@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn as spawnChild } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,7 +8,7 @@ import { describe, it } from "node:test";
 import { parseFleetCommand, toolParamsToCommand } from "./fleet.ts";
 import { addWorktree, branchExists, git, headRev, mergeBranch } from "./gitw.ts";
 import registerFleet from "./index.ts";
-import { loadManifest, saveManifest } from "./manifest.ts";
+import { isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import type { Member, MemberStatus, NotifyLevel } from "./types.ts";
 
 const FAKE_PI_SCRIPT = `#!/usr/bin/env node
@@ -330,6 +331,42 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       const afterStop = await loadManifest(h.root);
       assert.equal(afterStop.members.finisher.status, "stopped");
     } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("kills the live process of a detached member when stopped and clears its pid", async () => {
+    const h = await createHarness();
+    const sleeper = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    try {
+      const m = await h.seedMember("ghost", "detached");
+      const man = await loadManifest(h.root);
+      man.members[m.name].pid = sleeper.pid;
+      await saveManifest(man);
+
+      await h.runCommand("stop ghost");
+      const afterStop = await loadManifest(h.root);
+      assert.deepEqual(
+        {
+          status: afterStop.members.ghost.status,
+          pid: afterStop.members.ghost.pid,
+          alive: isPidAlive(sleeper.pid),
+        },
+        {
+          status: "stopped",
+          pid: undefined,
+          alive: false,
+        },
+      );
+    } finally {
+      try {
+        sleeper.kill();
+      } catch {
+        // already killed
+      }
       await h.cleanup();
     }
   });

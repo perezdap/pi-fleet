@@ -417,16 +417,19 @@ export class Fleet {
     const client = this.clients.get(name);
     const man = await this.manifest();
     const member = man.members[name];
+    const canKillDetached =
+      !!member && (isActiveStatus(member.status) || member.status === "detached");
     if (client) {
       await client.abort().catch(() => undefined);
       await client.kill();
       this.clients.delete(name);
       this.unwatchAsk(name);
-    } else if (member?.pid && isPidAlive(member.pid)) {
+    } else if (canKillDetached && member.pid && isPidAlive(member.pid)) {
       await killProcessTree(member.pid);
     }
-    if (member && (isActiveStatus(member.status) || member.status === "detached" || !!client)) {
+    if (member && (canKillDetached || !!client)) {
       member.status = "stopped";
+      member.pid = undefined;
       member.updatedAt = Date.now();
       await this.save();
     }
