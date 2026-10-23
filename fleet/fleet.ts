@@ -32,6 +32,7 @@ export type NotifyLevel = "info" | "warn" | "error";
 
 export interface FleetUi {
   notify(text: string, level?: NotifyLevel): void;
+  /** Pass an empty array to clear the widget. */
   setWidget(lines: string[]): void;
 }
 

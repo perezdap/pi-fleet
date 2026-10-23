@@ -13,9 +13,9 @@ interface TestHarness {
   root: string;
   errors: () => string[];
   widget: () => string[] | undefined;
+  presetWidget: (lines: string[]) => void;
   runFleetCommand: (args: string) => Promise<void>;
   reconcileSession: () => Promise<void>;
-  clearManifestOnDisk: () => Promise<void>;
   seedMember: (name: string, status: MemberStatus, opts?: { unmergedCommit?: boolean; mergedCommit?: boolean }) => Promise<Member>;
   cleanup: () => Promise<void>;
 }
@@ -98,6 +98,9 @@ async function createTestHarness(): Promise<TestHarness> {
     root,
     errors: () => notifications.filter((n) => n.level === "error").map((n) => n.text),
     widget: () => widgets.get("fleet"),
+    presetWidget: (lines: string[]) => {
+      widgets.set("fleet", lines);
+    },
     runFleetCommand: async (args: string) => {
       assert.ok(commandHandler, "fleet command handler must be registered");
       await commandHandler(args, ctx);
@@ -105,12 +108,6 @@ async function createTestHarness(): Promise<TestHarness> {
     reconcileSession: async () => {
       assert.ok(sessionStartHandler, "session_start handler must be registered");
       await sessionStartHandler({}, ctx);
-    },
-    clearManifestOnDisk: async () => {
-      const man = await loadManifest(root);
-      man.members = {};
-      await saveManifest(man);
-      registerFleet(fakePi);
     },
     seedMember,
     cleanup: async () => {
@@ -321,11 +318,11 @@ test("/fleet clean and /fleet clean --force report usage error", async () => {
 test("cleaning the last member clears the fleet TUI widget", async () => {
   const h = await createTestHarness();
   try {
-    await h.seedMember("pr100b-spec", "done");
+    await h.seedMember("last-done", "done");
     await h.runFleetCommand("status");
     const rendered = h.widget();
 
-    await h.runFleetCommand("clean pr100b-spec");
+    await h.runFleetCommand("clean last-done");
 
     assert.deepEqual(
       {
@@ -334,7 +331,7 @@ test("cleaning the last member clears the fleet TUI widget", async () => {
         errors: h.errors(),
       },
       {
-        rendered: ["fleet: 1 member (0 active)", " · pr100b-spec  coder      done"],
+        rendered: ["fleet: 1 member (0 active)", " · last-done    coder      done"],
         afterClean: undefined,
         errors: [],
       },
@@ -344,37 +341,46 @@ test("cleaning the last member clears the fleet TUI widget", async () => {
   }
 });
 
-test("running /fleet status or reconciling when no members exist clears any existing fleet widget", async () => {
-  const hStatus = await createTestHarness();
-  const hReconcile = await createTestHarness();
+test("/fleet status clears any existing fleet widget when no members exist", async () => {
+  const h = await createTestHarness();
   try {
-    await hStatus.seedMember("pr100b-spec", "done");
-    await hStatus.runFleetCommand("status");
-    const statusInitial = hStatus.widget();
-    await hStatus.clearManifestOnDisk();
-    await hStatus.runFleetCommand("status");
+    h.presetWidget(["fleet: 1 member (0 active)", " · stale-member coder      done"]);
 
-    await hReconcile.seedMember("pr100b-spec", "done");
-    await hReconcile.runFleetCommand("status");
-    await hReconcile.clearManifestOnDisk();
-    await hReconcile.reconcileSession();
+    await h.runFleetCommand("status");
 
     assert.deepEqual(
       {
-        statusInitial,
-        afterEmptyStatus: hStatus.widget(),
-        afterEmptyReconcile: hReconcile.widget(),
-        errors: [...hStatus.errors(), ...hReconcile.errors()],
+        widget: h.widget(),
+        errors: h.errors(),
       },
       {
-        statusInitial: ["fleet: 1 member (0 active)", " · pr100b-spec  coder      done"],
-        afterEmptyStatus: undefined,
-        afterEmptyReconcile: undefined,
+        widget: undefined,
         errors: [],
       },
     );
   } finally {
-    await hStatus.cleanup();
-    await hReconcile.cleanup();
+    await h.cleanup();
+  }
+});
+
+test("session_start reconcile clears any existing fleet widget when no members exist", async () => {
+  const h = await createTestHarness();
+  try {
+    h.presetWidget(["fleet: 1 member (0 active)", " · stale-member coder      done"]);
+
+    await h.reconcileSession();
+
+    assert.deepEqual(
+      {
+        widget: h.widget(),
+        errors: h.errors(),
+      },
+      {
+        widget: undefined,
+        errors: [],
+      },
+    );
+  } finally {
+    await h.cleanup();
   }
 });
