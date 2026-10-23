@@ -1,32 +1,42 @@
-/** pi-fleet extension entry point.
+/** pi-fleet extension entry.
  *
- * Registers:
- *  - /fleet command (human-driven fleet management)
- *  - `fleet` tool (so the supervisor LLM can orchestrate members itself)
- *
- * Zero runtime dependencies: only pi's extension API, pi's own CLI in RPC
- * mode, git, and Node built-ins.
+ * Orchestrates a fleet of pi coding agents in isolated git worktrees from a
+ * single supervisor session. Zero runtime dependencies: only pi's extension API,
+ * pi's own CLI in RPC mode, git, and Node built-ins.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-import { Fleet, type FleetUi, type NotifyLevel } from "./fleet";
-import { repoRoot } from "./gitw";
-import { ROLE_NAMES, type RoleName } from "./types";
+import {
+  Fleet,
+  parseFleetCommand,
+  toolParamsToCommand,
+  type FleetUi,
+  type NotifyLevel,
+} from "./fleet.ts";
+import { repoRoot } from "./gitw.ts";
+import { ROLE_NAMES } from "./types.ts";
 
-const USAGE = [
-  "/fleet — run parallel pi agents in isolated git worktrees",
-  "  status                          Show all members",
-  "  spawn [--role r] [--model m] [--over ref] <name> <task…>",
-  "  resume <name> [extra…]          Continue a stale/stopped member",
-  "  send <name> <message…>          Steer or prompt a member",
-  "  log <name> [n]                  Tail a member's activity log",
-  "  merge <name|--done>             Merge a member branch into HEAD",
-  "  stop <name|--all>               Abort + kill member process(es)",
-  "  clean <name|--done|--all> [--force]  Remove worktree (+branch if merged)",
-  "  open <name>                     Resume member session in a new pi window",
-  "Roles: coder, tester, reviewer (read-only), integrator — see README.",
-].join("\n");
+const OPTIONAL = Symbol("optional");
+
+const Type = {
+  Literal: (value: string) => ({ type: "string", const: value }),
+  Union: (anyOf: unknown[], opts?: Record<string, unknown>) => ({ anyOf, ...opts }),
+  String: (opts?: Record<string, unknown>) => ({ type: "string", ...opts }),
+  Number: (opts?: Record<string, unknown>) => ({ type: "number", ...opts }),
+  Boolean: (opts?: Record<string, unknown>) => ({ type: "boolean", ...opts }),
+  Optional: <T extends Record<string, unknown>>(schema: T): T & { [OPTIONAL]?: true } =>
+    ({ ...schema, [OPTIONAL]: true }),
+  Object: (props: Record<string, any>) => {
+    const properties: Record<string, unknown> = {};
+    const required: string[] = [];
+    for (const [k, v] of Object.entries(props)) {
+      const { [OPTIONAL]: isOpt, ...rest } = v;
+      properties[k] = rest;
+      if (!isOpt) required.push(k);
+    }
+    return { type: "object", required, properties } as any;
+  },
+};
 
 export default function (pi: ExtensionAPI) {
   const fleets = new Map<string, Fleet>();
@@ -85,134 +95,17 @@ export default function (pi: ExtensionAPI) {
     for (const fleet of fleets.values()) fleet.dispose();
   });
 
-  // ── /fleet command ────────────────────────────────────────────────────────
+  // ── /fleet command adapter ────────────────────────────────────────────────
 
   pi.registerCommand("fleet", {
     description: "Manage a fleet of pi agents in isolated git worktrees",
     handler: async (args: string, ctx: any) => {
-      const tokens = args.trim().split(/\s+/).filter(Boolean);
-      const sub = tokens[0] ?? "status";
       try {
+        const cmd = parseFleetCommand(args);
         const fleet = await getFleet(ctx);
-        switch (sub) {
-          case "help":
-          case "--help":
-          case "-h":
-            ctx.ui.notify(USAGE, "info");
-            break;
-
-          case "status": {
-            const rows = await fleet.statusRows();
-            await fleet.refreshWidget();
-            if (rows.length === 0) {
-              ctx.ui.notify("fleet: no members; try /fleet spawn <name> <task>", "info");
-              break;
-            }
-            for (const line of fleet.widgetLines(rows)) ctx.ui.notify(line, "info");
-            break;
-          }
-
-          case "spawn": {
-            const { name, task, role, model, over } = parseSpawn(tokens.slice(1));
-            if (!name || !task) {
-              ctx.ui.notify("usage: /fleet spawn [--role r] [--model m] [--over ref] <name> <task…>", "error");
-              break;
-            }
-            const member = await fleet.spawn({ name, task, role, model, over });
-            ctx.ui.notify(`fleet: spawned '${member.name}' (${member.role}) on ${member.branch}`, "info");
-            break;
-          }
-
-          case "resume": {
-            const name = tokens[1];
-            if (!name) throw new Error("usage: /fleet resume <name> [extra instructions…]");
-            const member = fleet.member(name) ?? (await fleet.manifest()).members[name];
-            if (!member) throw new Error(`no such member '${name}'`);
-            const extra = tokens.slice(2).join(" ");
-            const task = extra ? `${member.task}\n\nAdditional instructions from supervisor:\n${extra}` : member.task;
-            const resumed = await fleet.spawn({ name, task, role: member.role, model: member.model });
-            ctx.ui.notify(`fleet: resumed '${resumed.name}'`, "info");
-            break;
-          }
-
-          case "send": {
-            const name = tokens[1];
-            const message = tokens.slice(2).join(" ");
-            if (!name || !message) throw new Error("usage: /fleet send <name> <message…>");
-            const mode = await fleet.send(name, message);
-            ctx.ui.notify(`fleet: sent to '${name}' (${mode})`, "info");
-            break;
-          }
-
-          case "log": {
-            const name = tokens[1];
-            if (!name) throw new Error("usage: /fleet log <name> [n]");
-            const n = Number(tokens[2] ?? 20);
-            const text = await fleet.logTail(name, Number.isFinite(n) && n > 0 ? n : 20);
-            for (const line of text.split("\n")) ctx.ui.notify(line, "info");
-            break;
-          }
-
-          case "merge": {
-            const which = tokens[1];
-            if (!which) throw new Error("usage: /fleet merge <name|--done>");
-            const man = await fleet.manifest();
-            const names =
-              which === "--done"
-                ? Object.values(man.members).filter((m) => m.status === "done").map((m) => m.name)
-                : [which];
-            if (names.length === 0) throw new Error("no members with status 'done' to merge");
-            for (const name of names) {
-              const result = await fleet.merge(name);
-              if (result.ok) ctx.ui.notify(`fleet: merged ${name}`, "info");
-              else {
-                ctx.ui.notify(`fleet: merge ${name} CONFLICTS in: ${result.conflicts.join(", ") || "(unknown)"}`, "error");
-              }
-            }
-            break;
-          }
-
-          case "stop": {
-            const which = tokens[1];
-            if (!which) throw new Error("usage: /fleet stop <name|--all>");
-            const man = await fleet.manifest();
-            const names = which === "--all" ? Object.keys(man.members) : [which];
-            for (const name of names) {
-              await fleet.stop(name);
-              ctx.ui.notify(`fleet: stopped '${name}'`, "info");
-            }
-            break;
-          }
-
-          case "clean": {
-            const { which, force } = parseClean(tokens.slice(1));
-            if (!which) throw new Error("usage: /fleet clean <name|--done|--all> [--force]");
-            const man = await fleet.manifest();
-            const names =
-              which === "--all"
-                ? Object.keys(man.members)
-                : which === "--done"
-                  ? Object.values(man.members)
-                      .filter((m) => ["done", "merged", "failed", "stopped", "stale"].includes(m.status))
-                      .map((m) => m.name)
-                  : [which];
-            for (const name of names) {
-              const outcome = await fleet.clean(name, force);
-              ctx.ui.notify(`fleet: cleaned '${name}' (${outcome})`, "info");
-            }
-            break;
-          }
-
-          case "open": {
-            const name = tokens[1];
-            if (!name) throw new Error("usage: /fleet open <name>");
-            const outcome = await fleet.open(name);
-            ctx.ui.notify(`fleet: ${outcome}`, "info");
-            break;
-          }
-
-          default:
-            ctx.ui.notify(USAGE, "info");
+        const { messages } = await fleet.execute(cmd);
+        for (const m of messages) {
+          ctx.ui.notify(m.text, m.level);
         }
       } catch (err) {
         fail(ctx, err);
@@ -220,21 +113,24 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── fleet tool (LLM-facing) ───────────────────────────────────────────────
+  // ── fleet tool adapter (LLM-facing) ───────────────────────────────────────
 
   pi.registerTool({
     name: "fleet",
     label: "Fleet",
     description:
       "Manage a fleet of pi agents working in isolated git worktrees of this repository. " +
-      "spawn: start a member (role: coder|tester|reviewer|integrator; optionally set its model). " +
+      "spawn: start a member (role: coder|tester|reviewer|integrator; optionally set its model or base ref via over). " +
+      "resume: continue a stale/stopped/failed/done member on its existing worktree. " +
       "status: list members. send: message a member. log: tail member activity. " +
-      "merge: merge a member branch into HEAD. stop: abort+kill a member. clean: remove worktree/branch.",
+      "merge: merge a member branch (or '--done') into HEAD. stop: abort+kill a member (or '--all'). " +
+      "clean: remove worktree/branch for a member (or '--done' / '--all').",
     parameters: Type.Object({
       action: Type.Union(
         [
           Type.Literal("status"),
           Type.Literal("spawn"),
+          Type.Literal("resume"),
           Type.Literal("send"),
           Type.Literal("log"),
           Type.Literal("merge"),
@@ -243,120 +139,59 @@ export default function (pi: ExtensionAPI) {
         ],
         { description: "Fleet action to perform" },
       ),
-      name: Type.Optional(Type.String({ description: "Member name (required for send/log/merge/stop/clean and spawn)" })),
+      name: Type.Optional(
+        Type.String({
+          description:
+            "Member name (or '--done' for merge/clean, '--all' for stop/clean)",
+        }),
+      ),
       task: Type.Optional(Type.String({ description: "Full task description (spawn only)" })),
       role: Type.Optional(
-        Type.Union(ROLE_NAMES.map((r) => Type.Literal(r)), { description: "Member role (spawn only, default coder)" }),
+        Type.Union(
+          ROLE_NAMES.map((r) => Type.Literal(r)),
+          { description: "Member role (spawn only, default coder)" },
+        ),
       ),
-      model: Type.Optional(Type.String({ description: "Model pattern for the member, e.g. anthropic/claude-opus-4-5:high (spawn only)" })),
-      message: Type.Optional(Type.String({ description: "Message text (send only)" })),
+      model: Type.Optional(
+        Type.String({
+          description:
+            "Model pattern for the member, e.g. anthropic/claude-opus-4-5:high (spawn only)",
+        }),
+      ),
+      over: Type.Optional(
+        Type.String({
+          description: "Base branch/ref the worktree starts from (spawn only)",
+        }),
+      ),
+      message: Type.Optional(
+        Type.String({
+          description: "Message text (send) or extra instructions (resume)",
+        }),
+      ),
+      n: Type.Optional(
+        Type.Number({
+          description: "Number of activity log entries to tail (log only, default 20)",
+        }),
+      ),
+      force: Type.Optional(
+        Type.Boolean({
+          description: "Force worktree/branch removal even when attached or unmerged (clean only)",
+        }),
+      ),
     }),
     async execute(_toolCallId, params: any, _signal, _onUpdate, ctx: any) {
-      const lines: string[] = [];
       try {
+        const cmd = toolParamsToCommand(params);
         const fleet = await getFleet(ctx);
-        switch (params.action) {
-          case "status": {
-            const rows = await fleet.statusRows();
-            if (rows.length === 0) lines.push("No fleet members.");
-            for (const { member, live, busy } of rows) {
-              lines.push(
-                `${member.name} [${member.role}] status=${member.status}${busy ? " (busy)" : ""}${live ? "" : " (not attached)"} branch=${member.branch}` +
-                  (member.needsAttention ? ` ASK: ${member.needsAttention}` : ""),
-              );
-            }
-            await fleet.refreshWidget();
-            break;
-          }
-          case "spawn": {
-            if (!params.name || !params.task) throw new Error("spawn requires name and task");
-            const member = await fleet.spawn({
-              name: params.name,
-              task: params.task,
-              role: params.role as RoleName | undefined,
-              model: params.model,
-            });
-            lines.push(`Spawned '${member.name}' (${member.role}) on branch ${member.branch}.`);
-            break;
-          }
-          case "send": {
-            if (!params.name || !params.message) throw new Error("send requires name and message");
-            const mode = await fleet.send(params.name, params.message);
-            lines.push(`Message delivered to '${params.name}' via ${mode}.`);
-            break;
-          }
-          case "log": {
-            if (!params.name) throw new Error("log requires name");
-            lines.push(await fleet.logTail(params.name));
-            break;
-          }
-          case "merge": {
-            if (!params.name) throw new Error("merge requires name");
-            const result = await fleet.merge(params.name);
-            lines.push(
-              result.ok
-                ? `Merged ${params.name} into HEAD.`
-                : `Merge of ${params.name} had conflicts: ${result.conflicts.join(", ")}. Merge aborted; resolve manually or assign an integrator.`,
-            );
-            break;
-          }
-          case "stop": {
-            if (!params.name) throw new Error("stop requires name");
-            await fleet.stop(params.name);
-            lines.push(`Stopped '${params.name}'.`);
-            break;
-          }
-          case "clean": {
-            if (!params.name) throw new Error("clean requires name");
-            lines.push(`Cleaned '${params.name}': ${await fleet.clean(params.name)}`);
-            break;
-          }
-        }
-        return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
+        const { messages } = await fleet.execute(cmd);
+        return {
+          content: [{ type: "text", text: messages.map((m) => m.text).join("\n") }],
+          details: {},
+        };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text", text: `fleet error: ${msg}` }], details: {}, isError: true };
       }
     },
   });
-}
-
-// ── argument parsing ─────────────────────────────────────────────────────────
-
-export function parseClean(tokens: string[]): { which?: string; force: boolean } {
-  const force = tokens.includes("--force");
-  const which = tokens.find((t) => t !== "--force");
-  return { which, force };
-}
-
-function parseSpawn(tokens: string[]): {
-  name?: string;
-  task: string;
-  role?: RoleName;
-  model?: string;
-  over?: string;
-} {
-  const opts: { role?: RoleName; model?: string; over?: string } = {};
-  let i = 0;
-  while (i < tokens.length) {
-    const t = tokens[i];
-    if (t === "--role" && tokens[i + 1]) {
-      const role = tokens[i + 1] as RoleName;
-      if (ROLE_NAMES.includes(role)) opts.role = role;
-      i += 2;
-    } else if (t === "--model" && tokens[i + 1]) {
-      opts.model = tokens[i + 1];
-      i += 2;
-    } else if (t === "--over" && tokens[i + 1]) {
-      opts.over = tokens[i + 1];
-      i += 2;
-    } else {
-      break;
-    }
-  }
-  return {
-    name: tokens[i],
-    task: tokens.slice(i + 1).join(" "),
-    ...opts,
-  };
 }

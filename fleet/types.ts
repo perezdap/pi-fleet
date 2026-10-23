@@ -70,3 +70,71 @@ export interface Manifest {
   repoRoot: string;
   members: Record<string, Member>;
 }
+
+export type NotifyLevel = "info" | "warn" | "error";
+
+export type MergeTarget =
+  | { kind: "member"; name: string }
+  | { kind: "done" };
+
+export type StopTarget =
+  | { kind: "member"; name: string }
+  | { kind: "all" };
+
+export type CleanTarget =
+  | { kind: "member"; name: string }
+  | { kind: "done" }
+  | { kind: "all" };
+
+export type FleetCommand =
+  | { action: "help" }
+  | { action: "status" }
+  | {
+      action: "spawn";
+      name: string;
+      task: string;
+      role?: RoleName;
+      model?: string;
+      over?: string;
+    }
+  | {
+      action: "resume";
+      name: string;
+      extra?: string;
+    }
+  | {
+      action: "send";
+      name: string;
+      message: string;
+    }
+  | {
+      action: "log";
+      name: string;
+      n?: number;
+    }
+  | {
+      action: "merge";
+      target: MergeTarget;
+    }
+  | {
+      action: "stop";
+      target: StopTarget;
+    }
+  | {
+      action: "clean";
+      target: CleanTarget;
+      force?: boolean;
+    }
+  | {
+      action: "open";
+      name: string;
+    };
+
+export interface FleetMessage {
+  text: string;
+  level: NotifyLevel;
+}
+
+export interface FleetResult {
+  messages: FleetMessage[];
+}

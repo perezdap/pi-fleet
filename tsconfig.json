@@ -1,7 +1,7 @@
 {
   // Dev-only typecheck config.
   //
-  // This resolves @earendil-works/pi-coding-agent and typebox from a local
+  // This resolves @earendil-works/pi-coding-agent from a local
   // node_modules/ (e.g. after `npm install` with pi's package linked/installed
   // as a dependency). If your pi installation lives elsewhere, either:
   //   1. `npm link @earendil-works/pi-coding-agent` (or symlink it) into
@@ -17,6 +17,7 @@
     "lib": ["ES2022"],
     "strict": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
     "resolveJsonModule": true

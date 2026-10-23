@@ -33,6 +33,25 @@ function winQuote(arg: string): string {
   return `"${arg}"`;
 }
 
+export async function killProcessTree(pid: number): Promise<void> {
+  if (!pid || pid <= 0) return;
+  if (process.platform === "win32") {
+    await new Promise<void>((resolve) =>
+      execFile("taskkill", ["/pid", String(pid), "/T", "/F"], () => resolve()),
+    );
+  } else {
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        // already gone
+      }
+    }
+  }
+}
+
 export class RpcMember {
   readonly proc: ChildProcess;
   readonly pid: number;
@@ -199,21 +218,7 @@ export class RpcMember {
   /** Kill the member process tree. */
   async kill(): Promise<void> {
     if (this.exited) return;
-    if (process.platform === "win32") {
-      await new Promise<void>((resolve) =>
-        execFile("taskkill", ["/pid", String(this.pid), "/T", "/F"], () => resolve()),
-      );
-    } else {
-      try {
-        process.kill(-this.pid, "SIGTERM");
-      } catch {
-        try {
-          this.proc.kill("SIGTERM");
-        } catch {
-          // already gone
-        }
-      }
-    }
+    await killProcessTree(this.pid);
     const start = Date.now();
     while (!this.exited && Date.now() - start < 5_000) await sleep(100);
   }
