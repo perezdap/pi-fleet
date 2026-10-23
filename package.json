@@ -2,6 +2,10 @@
   "name": "pi-fleet",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "description": "Run a fleet of pi coding agents in isolated git worktrees, orchestrated from one supervisor session. No dependencies beyond pi itself.",
   "keywords": [
     "pi",

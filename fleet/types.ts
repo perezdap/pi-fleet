@@ -70,3 +70,51 @@ export interface Manifest {
   repoRoot: string;
   members: Record<string, Member>;
 }
+
+export type FleetCommand =
+  | { action: "help" }
+  | { action: "status" }
+  | {
+      action: "spawn";
+      name: string;
+      task: string;
+      role?: RoleName;
+      model?: string;
+      over?: string;
+    }
+  | {
+      action: "resume";
+      name: string;
+      extra?: string;
+    }
+  | {
+      action: "send";
+      name: string;
+      message: string;
+    }
+  | {
+      action: "log";
+      name: string;
+      n?: number;
+    }
+  | {
+      action: "merge";
+      target: string;
+    }
+  | {
+      action: "stop";
+      target: string;
+    }
+  | {
+      action: "clean";
+      target: string;
+      force?: boolean;
+    }
+  | {
+      action: "open";
+      name: string;
+    };
+
+export interface FleetResult {
+  lines: string[];
+}

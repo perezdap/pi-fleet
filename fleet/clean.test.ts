@@ -4,10 +4,11 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { addWorktree, branchExists, git, headRev, mergeBranch } from "./gitw";
-import registerFleet, { parseClean } from "./index";
-import { loadManifest, saveManifest } from "./manifest";
-import type { Member, MemberStatus } from "./types";
+import { parseFleetCommand } from "./fleet.ts";
+import { addWorktree, branchExists, git, headRev, mergeBranch } from "./gitw.ts";
+import registerFleet from "./index.ts";
+import { loadManifest, saveManifest } from "./manifest.ts";
+import type { Member, MemberStatus } from "./types.ts";
 
 interface TestHarness {
   root: string;
@@ -99,25 +100,21 @@ async function createTestHarness(): Promise<TestHarness> {
   };
 }
 
-test("parseClean preserves --done and --all targets and reads --force in either order", () => {
+test("parseFleetCommand preserves --done and --all targets and reads --force in either order", () => {
   assert.deepEqual(
     [
-      parseClean(["--done"]),
-      parseClean(["--all"]),
-      parseClean(["--done", "--force"]),
-      parseClean(["--force", "--all"]),
-      parseClean(["alpha", "--force"]),
-      parseClean([]),
-      parseClean(["--force"]),
+      parseFleetCommand("clean --done"),
+      parseFleetCommand("clean --all"),
+      parseFleetCommand("clean --done --force"),
+      parseFleetCommand("clean --force --all"),
+      parseFleetCommand("clean alpha --force"),
     ],
     [
-      { which: "--done", force: false },
-      { which: "--all", force: false },
-      { which: "--done", force: true },
-      { which: "--all", force: true },
-      { which: "alpha", force: true },
-      { which: undefined, force: false },
-      { which: undefined, force: true },
+      { action: "clean", target: "--done" },
+      { action: "clean", target: "--all" },
+      { action: "clean", target: "--done", force: true },
+      { action: "clean", target: "--all", force: true },
+      { action: "clean", target: "alpha", force: true },
     ],
   );
 });

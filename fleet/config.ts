@@ -2,7 +2,7 @@
 
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
-import type { FleetConfig, RoleName, RoleSpec } from "./types";
+import type { FleetConfig, RoleName, RoleSpec } from "./types.ts";
 
 /** Built-in role defaults. Config entries merge over these. */
 export const BUILTIN_ROLES: Record<RoleName, RoleSpec> = {

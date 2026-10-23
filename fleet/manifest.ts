@@ -2,7 +2,7 @@
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import * as path from "node:path";
-import type { Manifest } from "./types";
+import type { Manifest } from "./types.ts";
 
 export function fleetDir(repoRoot: string): string {
   return path.join(repoRoot, ".pi", "fleet");

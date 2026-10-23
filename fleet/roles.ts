@@ -1,6 +1,6 @@
 /** Role contracts: what every member is told, and what each role adds. */
 
-import type { Member, RoleName } from "./types";
+import type { Member, RoleName } from "./types.ts";
 
 export interface ContractInput {
   name: string;
@@ -63,11 +63,13 @@ export function buildSystemAppend(input: ContractInput, extra?: string): string 
 }
 
 /** Preamble sent when resuming a stale member on its existing worktree. */
-export function resumePreamble(member: Member): string {
-  return `You previously worked on this task in this worktree but your session was interrupted.
+export function resumePreamble(member: Member, extra?: string): string {
+  const base = `You previously worked on this task in this worktree but your session was interrupted.
 Inspect "git log --oneline ${member.baseRef}..HEAD" and the working tree to see your progress, then continue from where you left off.
 
 Original assignment:
-${member.task}
-`;
+${member.task}`;
+  return extra?.trim()
+    ? `${base}\n\nAdditional instructions from supervisor:\n${extra.trim()}\n`
+    : `${base}\n`;
 }
