@@ -24,7 +24,7 @@ import {
 } from "./gitw.ts";
 import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import { buildSystemAppend, resumePreamble } from "./roles.ts";
-import { RpcMember } from "./rpc.ts";
+import { killProcessTree, RpcMember } from "./rpc.ts";
 import {
   ROLE_NAMES,
   type CleanTarget,
@@ -422,6 +422,8 @@ export class Fleet {
       await client.kill();
       this.clients.delete(name);
       this.unwatchAsk(name);
+    } else if (member?.pid && isPidAlive(member.pid)) {
+      await killProcessTree(member.pid);
     }
     if (member && (isActiveStatus(member.status) || member.status === "detached" || !!client)) {
       member.status = "stopped";
@@ -735,6 +737,11 @@ function parseCleanTarget(raw: string): CleanTarget {
   return { kind: "member", name: raw };
 }
 
+function parseLogCount(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : raw ? Number(raw) : 20;
+  return Number.isFinite(n) && n > 0 ? n : 20;
+}
+
 export function parseFleetCommand(raw: string): FleetCommand {
   const { token: sub, rest } = shiftToken(raw);
   if (!sub || sub === "status") return { action: "status" };
@@ -801,9 +808,7 @@ export function parseFleetCommand(raw: string): FleetCommand {
       const { token: name, rest: tail } = shiftToken(rest);
       if (!name) throw new Error("usage: /fleet log <name> [n]");
       const { token: nStr } = shiftToken(tail);
-      const parsedN = nStr ? Number(nStr) : 20;
-      const n = Number.isFinite(parsedN) && parsedN > 0 ? parsedN : 20;
-      return { action: "log", name, n };
+      return { action: "log", name, n: parseLogCount(nStr) };
     }
 
     case "merge": {
@@ -892,8 +897,7 @@ export function toolParamsToCommand(params: {
     }
     case "log": {
       if (!params.name) throw new Error("log requires name");
-      const n = typeof params.n === "number" && Number.isFinite(params.n) && params.n > 0 ? params.n : 20;
-      return { action: "log", name: params.name, n };
+      return { action: "log", name: params.name, n: parseLogCount(params.n) };
     }
     case "merge": {
       if (!params.name) throw new Error("merge requires name (or '--done')");

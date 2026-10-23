@@ -12,10 +12,6 @@ _Avoid_: Orchestrator, parent, master, controller
 An agent working on one branch in its own worktree, registered in the fleet manifest.
 _Avoid_: Subagent, worker, child
 
-**Transient member**:
-A member whose worktree and manifest entry are removed after it finishes cleanly.
-_Avoid_: Ephemeral member, temporary agent
-
 **Clean**:
 The removal of a member's worktree and manifest entry, plus its branch when already merged.
 _Avoid_: Delete, wipe, purge

@@ -39,6 +39,12 @@ process.stdin.on("data", (chunk) => {
         success: true,
         data: {},
       }) + "\\n");
+      if (msg.type === "prompt" && typeof msg.message === "string" && msg.message.includes("FINISH_NOW")) {
+        process.stdout.write(JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", content: "DONE: finished work" },
+        }) + "\\n");
+      }
     }
   }
 });
@@ -303,6 +309,26 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       await h.runCommand("stop --all");
       const man = await loadManifest(h.root);
       assert.equal(man.members.api.status, "stopped");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("stops an attached member that already reached done status and transitions it to stopped", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "finisher",
+        task: "FINISH_NOW",
+      });
+      await new Promise((r) => setTimeout(r, 150));
+      const beforeStop = await loadManifest(h.root);
+      assert.equal(beforeStop.members.finisher.status, "done");
+
+      await h.runCommand("stop --all");
+      const afterStop = await loadManifest(h.root);
+      assert.equal(afterStop.members.finisher.status, "stopped");
     } finally {
       await h.cleanup();
     }
