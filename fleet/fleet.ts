@@ -360,8 +360,7 @@ export class Fleet {
   async refreshWidget(): Promise<void> {
     try {
       const rows = await this.statusRows();
-      const lines = this.widgetLines(rows);
-      if (lines.length > 0) this.ui.setWidget(lines);
+      this.ui.setWidget(this.widgetLines(rows));
     } catch {
       // Widget is best-effort.
     }

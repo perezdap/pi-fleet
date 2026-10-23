@@ -42,7 +42,7 @@ export default function (pi: ExtensionAPI) {
       },
       setWidget: (lines: string[]) => {
         try {
-          ctx.ui.setWidget("fleet", lines);
+          ctx.ui.setWidget("fleet", lines.length > 0 ? lines : undefined);
         } catch {
           // best-effort
         }
@@ -103,12 +103,12 @@ export default function (pi: ExtensionAPI) {
 
           case "status": {
             const rows = await fleet.statusRows();
+            await fleet.refreshWidget();
             if (rows.length === 0) {
               ctx.ui.notify("fleet: no members; try /fleet spawn <name> <task>", "info");
               break;
             }
             for (const line of fleet.widgetLines(rows)) ctx.ui.notify(line, "info");
-            await fleet.refreshWidget();
             break;
           }
 

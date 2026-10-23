@@ -12,7 +12,10 @@ import type { Member, MemberStatus } from "./types";
 interface TestHarness {
   root: string;
   errors: () => string[];
+  widget: () => string[] | undefined;
   runFleetCommand: (args: string) => Promise<void>;
+  reconcileSession: () => Promise<void>;
+  clearManifestOnDisk: () => Promise<void>;
   seedMember: (name: string, status: MemberStatus, opts?: { unmergedCommit?: boolean; mergedCommit?: boolean }) => Promise<Member>;
   cleanup: () => Promise<void>;
 }
@@ -29,10 +32,14 @@ async function createTestHarness(): Promise<TestHarness> {
   const root = await git(rawRoot, "rev-parse", "--show-toplevel");
   const baseRef = await headRev(root);
   const notifications: Array<{ text: string; level: string }> = [];
+  const widgets = new Map<string, string[] | undefined>();
 
   let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+  let sessionStartHandler: ((event: any, ctx: any) => Promise<void>) | undefined;
   const fakePi: any = {
-    on: () => {},
+    on: (event: string, handler: (event: any, ctx: any) => Promise<void>) => {
+      if (event === "session_start") sessionStartHandler = handler;
+    },
     registerTool: () => {},
     registerCommand: (name: string, spec: { handler: (args: string, ctx: any) => Promise<void> }) => {
       if (name === "fleet") commandHandler = spec.handler;
@@ -46,7 +53,9 @@ async function createTestHarness(): Promise<TestHarness> {
       notify: (text: string, level = "info") => {
         notifications.push({ text, level });
       },
-      setWidget: () => {},
+      setWidget: (key: string, lines?: string[]) => {
+        widgets.set(key, lines);
+      },
     },
   };
 
@@ -88,9 +97,20 @@ async function createTestHarness(): Promise<TestHarness> {
   return {
     root,
     errors: () => notifications.filter((n) => n.level === "error").map((n) => n.text),
+    widget: () => widgets.get("fleet"),
     runFleetCommand: async (args: string) => {
       assert.ok(commandHandler, "fleet command handler must be registered");
       await commandHandler(args, ctx);
+    },
+    reconcileSession: async () => {
+      assert.ok(sessionStartHandler, "session_start handler must be registered");
+      await sessionStartHandler({}, ctx);
+    },
+    clearManifestOnDisk: async () => {
+      const man = await loadManifest(root);
+      man.members = {};
+      await saveManifest(man);
+      registerFleet(fakePi);
     },
     seedMember,
     cleanup: async () => {
@@ -295,5 +315,66 @@ test("/fleet clean and /fleet clean --force report usage error", async () => {
     ]);
   } finally {
     await h.cleanup();
+  }
+});
+
+test("cleaning the last member clears the fleet TUI widget", async () => {
+  const h = await createTestHarness();
+  try {
+    await h.seedMember("pr100b-spec", "done");
+    await h.runFleetCommand("status");
+    const rendered = h.widget();
+
+    await h.runFleetCommand("clean pr100b-spec");
+
+    assert.deepEqual(
+      {
+        rendered,
+        afterClean: h.widget(),
+        errors: h.errors(),
+      },
+      {
+        rendered: ["fleet: 1 member (0 active)", " · pr100b-spec  coder      done"],
+        afterClean: undefined,
+        errors: [],
+      },
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("running /fleet status or reconciling when no members exist clears any existing fleet widget", async () => {
+  const hStatus = await createTestHarness();
+  const hReconcile = await createTestHarness();
+  try {
+    await hStatus.seedMember("pr100b-spec", "done");
+    await hStatus.runFleetCommand("status");
+    const statusInitial = hStatus.widget();
+    await hStatus.clearManifestOnDisk();
+    await hStatus.runFleetCommand("status");
+
+    await hReconcile.seedMember("pr100b-spec", "done");
+    await hReconcile.runFleetCommand("status");
+    await hReconcile.clearManifestOnDisk();
+    await hReconcile.reconcileSession();
+
+    assert.deepEqual(
+      {
+        statusInitial,
+        afterEmptyStatus: hStatus.widget(),
+        afterEmptyReconcile: hReconcile.widget(),
+        errors: [...hStatus.errors(), ...hReconcile.errors()],
+      },
+      {
+        statusInitial: ["fleet: 1 member (0 active)", " · pr100b-spec  coder      done"],
+        afterEmptyStatus: undefined,
+        afterEmptyReconcile: undefined,
+        errors: [],
+      },
+    );
+  } finally {
+    await hStatus.cleanup();
+    await hReconcile.cleanup();
   }
 });
