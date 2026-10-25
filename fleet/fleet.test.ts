@@ -44,6 +44,11 @@ process.stdin.on("data", (chunk) => {
         typeof msg.message === "string"
           ? msg.message.replace(/Original assignment:[\\s\\S]*?(?=\\n\\nAdditional instructions|$)/, "")
           : "";
+      const parseTimedPayload = (prefix) => {
+        const rest = activeMsg.slice(prefix.length);
+        const colon = rest.indexOf(":");
+        return { ms: Number(rest.slice(0, colon)), payload: rest.slice(colon + 1) };
+      };
       if (msg.type === "prompt" && activeMsg.includes("FINISH_NOW")) {
         const customIdx = activeMsg.indexOf("FINISH_NOW:");
         const content =
@@ -55,31 +60,22 @@ process.stdin.on("data", (chunk) => {
           message: { role: "assistant", content },
         }) + "\\n");
       } else if (msg.type === "prompt" && activeMsg.startsWith("DELAY_DONE:")) {
-        const rest = activeMsg.slice("DELAY_DONE:".length);
-        const colon = rest.indexOf(":");
-        const ms = Number(rest.slice(0, colon));
-        const content = rest.slice(colon + 1);
+        const { ms, payload } = parseTimedPayload("DELAY_DONE:");
         setTimeout(() => {
           process.stdout.write(JSON.stringify({
             type: "message_end",
-            message: { role: "assistant", content },
+            message: { role: "assistant", content: payload },
           }) + "\\n");
         }, ms);
       } else if (msg.type === "prompt" && activeMsg.startsWith("WRITE_ASK:")) {
-        const rest = activeMsg.slice("WRITE_ASK:".length);
-        const colon = rest.indexOf(":");
-        const ms = Number(rest.slice(0, colon));
-        const question = rest.slice(colon + 1);
+        const { ms, payload } = parseTimedPayload("WRITE_ASK:");
         setTimeout(() => {
-          writeFileSync(path.join(process.cwd(), "FLEET_ASK.md"), question + "\\n", "utf8");
+          writeFileSync(path.join(process.cwd(), "FLEET_ASK.md"), payload + "\\n", "utf8");
         }, ms);
       } else if (msg.type === "prompt" && activeMsg.startsWith("EXIT_AFTER:")) {
-        const rest = activeMsg.slice("EXIT_AFTER:".length);
-        const colon = rest.indexOf(":");
-        const ms = Number(rest.slice(0, colon));
-        const code = Number(rest.slice(colon + 1));
+        const { ms, payload } = parseTimedPayload("EXIT_AFTER:");
         setTimeout(() => {
-          process.exit(code);
+          process.exit(Number(payload));
         }, ms);
       }
     }
@@ -869,24 +865,24 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       const asyncReport = "DONE: completed async work\n\nAll checks passed";
       await h.runTool({
         action: "spawn",
-        name: "worker-done",
+        name: "m-done",
         task: `DELAY_DONE:120:${asyncReport}`,
       });
-      const doneWait = await h.runTool({ action: "wait", name: "worker-done" });
+      const doneWait = await h.runTool({ action: "wait", name: "m-done" });
 
       await h.runTool({
         action: "spawn",
-        name: "worker-ask",
+        name: "m-ask",
         task: "WRITE_ASK:80:Should we support legacy tokens?",
       });
-      const askWait = await h.runTool({ action: "wait", name: "worker-ask" });
+      const askWait = await h.runTool({ action: "wait", name: "m-ask" });
 
       await h.runTool({
         action: "spawn",
-        name: "worker-crash",
+        name: "m-crash",
         task: "EXIT_AFTER:80:1",
       });
-      const crashWait = await h.runTool({ action: "wait", name: "worker-crash" });
+      const crashWait = await h.runTool({ action: "wait", name: "m-crash" });
 
       await h.runCommand("stop --all");
 
@@ -993,6 +989,10 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       const revCtxPath = path.join(h.root, ".pi", "fleet", "wt", "rev-branch", ".pi", "fleet", "review-context.md");
       const content = await readFile(revCtxPath, "utf8");
 
+      await h.runCommand('resume rev-branch "Re-check after feedback"');
+      await h.runCommand("stop --all");
+      const contentAfterResume = await readFile(revCtxPath, "utf8");
+
       assert.deepEqual(
         {
           coderHasReviewContext: existsSync(coderCtxPath),
@@ -1001,6 +1001,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           hasAssignment: content.includes("## Assignment\n\nCheck api changes for regressions"),
           hasCommit: content.includes("work by api"),
           hasDiff: content.includes("api.txt"),
+          preservedOnResume: contentAfterResume.includes("Target: `fleet/api`") && contentAfterResume.includes("api.txt"),
         },
         {
           coderHasReviewContext: false,
@@ -1009,6 +1010,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           hasAssignment: true,
           hasCommit: true,
           hasDiff: true,
+          preservedOnResume: true,
         },
       );
     } finally {
@@ -1086,6 +1088,13 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         over: "main...feature",
         task: "Review feature branch against main merge-base",
       });
+      const badBaseRes = await h.runTool({
+        action: "spawn",
+        name: "rev-bad-base",
+        role: "reviewer",
+        over: "nonexistent-ref..feature",
+        task: "Should reject unknown base ref",
+      });
       await h.runCommand("stop --all");
 
       const twoDotWt = path.join(h.root, ".pi", "fleet", "wt", "rev-two-dot");
@@ -1097,6 +1106,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         {
           twoDotError: twoDotRes.isError,
           threeDotError: threeDotRes.isError,
+          badBaseError: badBaseRes.isError,
           twoDotHead: await headRev(twoDotWt, "HEAD"),
           threeDotHead: await headRev(threeDotWt, "HEAD"),
           twoDotDiffBase: twoDotCtx.includes(`Diff base: \`${v1Rev}\``),
@@ -1115,6 +1125,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         {
           twoDotError: false,
           threeDotError: false,
+          badBaseError: true,
           twoDotHead: featureHead,
           threeDotHead: featureHead,
           twoDotDiffBase: true,

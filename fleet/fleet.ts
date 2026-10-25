@@ -311,6 +311,7 @@ export class Fleet {
       }
       baseRef = existing!.baseRef;
     } else {
+      if (range) await headRev(this.root, range.base);
       baseRef = await headRev(this.root, baseInput);
       await addWorktree(this.root, wt, branch, baseRef);
     }
@@ -355,7 +356,10 @@ export class Fleet {
       );
 
       if (role === "reviewer") {
-        await this.writeReviewContext(member, o.over);
+        const ctxPath = path.join(member.worktree, ".pi", "fleet", "review-context.md");
+        if (!resume || o.over || !existsSync(ctxPath)) {
+          await this.writeReviewContext(member, o.over, range);
+        }
       }
 
       const sessionDir = path.join(this.root, cfg.sessionDir ?? ".pi/fleet/sessions");
@@ -417,10 +421,13 @@ export class Fleet {
     });
   }
 
-  private async writeReviewContext(member: Member, over?: string): Promise<void> {
+  private async writeReviewContext(
+    member: Member,
+    over?: string,
+    range = parseCommitRange(over),
+  ): Promise<void> {
     const cfg = await this.config();
     const man = await this.manifest();
-    const range = parseCommitRange(over);
     const target = range ? range.head : (over ?? member.baseRef);
     const targetName = !range && over ? over.replace(/^fleet\//, "") : undefined;
     const targetMember = targetName ? man.members[targetName] : undefined;
@@ -843,7 +850,13 @@ export class Fleet {
 
 // ── helpers & command parsers ────────────────────────────────────────────────
 
-function parseCommitRange(over?: string): { base: string; dots: ".." | "..."; head: string } | undefined {
+interface CommitRange {
+  base: string;
+  dots: ".." | "...";
+  head: string;
+}
+
+function parseCommitRange(over?: string): CommitRange | undefined {
   if (!over) return undefined;
   const match = /^(.*?)(\.{2,3})(.+)$/.exec(over);
   if (!match) return undefined;
@@ -914,6 +927,29 @@ function parseLogCount(raw: unknown): number {
   return Number.isFinite(n) && n > 0 ? n : 20;
 }
 
+const WAIT_USAGE = "usage: /fleet wait [name|--all] [--any] [--timeout <sec>]";
+
+function parseWaitTimeout(raw: unknown): number {
+  if (typeof raw === "string" && (!raw || raw.startsWith("-"))) throw new Error(WAIT_USAGE);
+  const sec = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(sec) || sec <= 0) throw new Error(WAIT_USAGE);
+  return sec;
+}
+
+function parseWaitTarget(tokens: string[]): WaitTarget {
+  let explicitAll = false;
+  const names: string[] = [];
+  for (const raw of tokens) {
+    const token = raw.trim();
+    if (!token) continue;
+    if (token === "--all") explicitAll = true;
+    else if (token.startsWith("-")) throw new Error(WAIT_USAGE);
+    else if (!names.includes(token)) names.push(token);
+  }
+  if (explicitAll && names.length > 0) throw new Error(WAIT_USAGE);
+  return explicitAll || names.length === 0 ? { kind: "all" } : { kind: "members", names };
+}
+
 export function parseFleetCommand(raw: string): FleetCommand {
   const { token: sub, rest } = shiftToken(raw);
   if (!sub || sub === "status") return { action: "status" };
@@ -977,46 +1013,29 @@ export function parseFleetCommand(raw: string): FleetCommand {
     }
 
     case "wait": {
-      const usage = "usage: /fleet wait [name|--all] [--any] [--timeout <sec>]";
       let cursor = rest;
-      let explicitAll = false;
       let mode: "all" | "any" | undefined;
       let timeout: number | undefined;
-      const names: string[] = [];
+      const targetTokens: string[] = [];
 
       while (cursor.trimStart()) {
         const next = shiftToken(cursor);
-        if (next.token === "--all") {
-          explicitAll = true;
-          cursor = next.rest;
-        } else if (next.token === "--any") {
+        if (next.token === "--any") {
           mode = "any";
           cursor = next.rest;
         } else if (next.token === "--timeout") {
           const val = shiftToken(next.rest);
-          const sec = Number(val.token);
-          if (!val.token || val.token.startsWith("-") || !Number.isFinite(sec) || sec <= 0) {
-            throw new Error(usage);
-          }
-          timeout = sec;
+          timeout = parseWaitTimeout(val.token);
           cursor = val.rest;
-        } else if (next.token.startsWith("-")) {
-          throw new Error(usage);
         } else {
-          if (!names.includes(next.token)) names.push(next.token);
+          targetTokens.push(next.token);
           cursor = next.rest;
         }
       }
 
-      if (explicitAll && names.length > 0) {
-        throw new Error(usage);
-      }
-
-      const target: WaitTarget =
-        explicitAll || names.length === 0 ? { kind: "all" } : { kind: "members", names };
       return {
         action: "wait",
-        target,
+        target: parseWaitTarget(targetTokens),
         ...(mode ? { mode } : {}),
         ...(timeout !== undefined ? { timeout } : {}),
       };
@@ -1117,45 +1136,17 @@ export function toolParamsToCommand(params: {
       return { action: "send", name: params.name, message: params.message };
     }
     case "wait": {
-      const usage = "usage: /fleet wait [name|--all] [--any] [--timeout <sec>]";
-      let timeout: number | undefined;
-      if (params.timeout !== undefined) {
-        if (typeof params.timeout !== "number" || !Number.isFinite(params.timeout) || params.timeout <= 0) {
-          throw new Error(usage);
-        }
-        timeout = params.timeout;
-      }
+      const timeout = params.timeout !== undefined ? parseWaitTimeout(params.timeout) : undefined;
       if (params.mode !== undefined && params.mode !== "all" && params.mode !== "any") {
-        throw new Error(usage);
+        throw new Error(WAIT_USAGE);
       }
-      const rawNames: string[] = [];
-      let explicitAll = false;
-      if (params.name) {
-        for (const token of params.name.trim().split(/\s+/).filter(Boolean)) {
-          if (token === "--all") explicitAll = true;
-          else if (token.startsWith("-")) throw new Error(usage);
-          else if (!rawNames.includes(token)) rawNames.push(token);
-        }
-      }
-      if (Array.isArray(params.names)) {
-        for (const n of params.names) {
-          const token = String(n).trim();
-          if (!token) continue;
-          if (token === "--all") explicitAll = true;
-          else if (token.startsWith("-")) throw new Error(usage);
-          else if (!rawNames.includes(token)) rawNames.push(token);
-        }
-      }
-      if (explicitAll && rawNames.length > 0) {
-        throw new Error(usage);
-      }
-      const target: WaitTarget =
-        explicitAll || rawNames.length === 0
-          ? { kind: "all" }
-          : { kind: "members", names: rawNames };
+      const targetTokens = [
+        ...(params.name ? params.name.trim().split(/\s+/) : []),
+        ...(Array.isArray(params.names) ? params.names.map(String) : []),
+      ];
       return {
         action: "wait",
-        target,
+        target: parseWaitTarget(targetTokens),
         ...(params.mode ? { mode: params.mode } : {}),
         ...(timeout !== undefined ? { timeout } : {}),
       };
