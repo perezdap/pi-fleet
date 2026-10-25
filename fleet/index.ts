@@ -24,6 +24,7 @@ const Type = {
   String: (opts?: Record<string, unknown>) => ({ type: "string", ...opts }),
   Number: (opts?: Record<string, unknown>) => ({ type: "number", ...opts }),
   Boolean: (opts?: Record<string, unknown>) => ({ type: "boolean", ...opts }),
+  Array: (items: unknown, opts?: Record<string, unknown>) => ({ type: "array", items, ...opts }),
   Optional: <T extends Record<string, unknown>>(schema: T): T & { [OPTIONAL]?: true } =>
     ({ ...schema, [OPTIONAL]: true }),
   Object: (props: Record<string, any>) => {
@@ -122,7 +123,8 @@ export default function (pi: ExtensionAPI) {
       "Manage a fleet of pi agents working in isolated git worktrees of this repository. " +
       "spawn: start a member (role: coder|tester|reviewer|integrator; optionally set its model or base ref via over). " +
       "resume: continue a stale/stopped/failed/done member on its existing worktree. " +
-      "status: list members. send: message a member. log: tail member activity. " +
+      "status: list members. send: message a member. wait: wait for member(s) (or '--all') to settle or ask a question. " +
+      "log: tail member activity. " +
       "merge: merge a member branch (or '--done') into HEAD. stop: abort+kill a member (or '--all'). " +
       "clean: remove worktree/branch for a member (or '--done' / '--all').",
     parameters: Type.Object({
@@ -132,6 +134,7 @@ export default function (pi: ExtensionAPI) {
           Type.Literal("spawn"),
           Type.Literal("resume"),
           Type.Literal("send"),
+          Type.Literal("wait"),
           Type.Literal("log"),
           Type.Literal("merge"),
           Type.Literal("stop"),
@@ -142,7 +145,22 @@ export default function (pi: ExtensionAPI) {
       name: Type.Optional(
         Type.String({
           description:
-            "Member name (or '--done' for merge/clean, '--all' for stop/clean)",
+            "Member name (or '--done' for merge/clean, '--all' for wait/stop/clean)",
+        }),
+      ),
+      names: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Member names to wait for (wait only)",
+        }),
+      ),
+      mode: Type.Optional(
+        Type.Union([Type.Literal("all"), Type.Literal("any")], {
+          description: "Wait mode: 'all' (default) or 'any' (wait only)",
+        }),
+      ),
+      timeout: Type.Optional(
+        Type.Number({
+          description: "Timeout in seconds (wait only)",
         }),
       ),
       task: Type.Optional(Type.String({ description: "Full task description (spawn only)" })),

@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { mkdir } from "node:fs/promises";
 
 export type RpcEventHandler = (event: any) => void;
+export type RpcExitHandler = (code: number | null) => void;
 
 export interface RpcSpawnOptions {
   piBin: string;
@@ -67,6 +68,7 @@ export class RpcMember {
     { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }
   >();
   private handlers = new Set<RpcEventHandler>();
+  private exitHandlers = new Set<RpcExitHandler>();
   private log?: WriteStream;
 
   private constructor(opts: RpcSpawnOptions) {
@@ -97,6 +99,15 @@ export class RpcMember {
         p.reject(new Error("member process exited"));
       }
       this.pending.clear();
+    });
+    this.proc.on("close", (code) => {
+      for (const h of this.exitHandlers) {
+        try {
+          h(code);
+        } catch {
+          // ignore exit handler error
+        }
+      }
     });
   }
 
@@ -145,6 +156,11 @@ export class RpcMember {
   onEvent(handler: RpcEventHandler): () => void {
     this.handlers.add(handler);
     return () => this.handlers.delete(handler);
+  }
+
+  onExit(handler: RpcExitHandler): () => void {
+    this.exitHandlers.add(handler);
+    return () => this.exitHandlers.delete(handler);
   }
 
   /** Send one command, await its correlated response. */
@@ -211,6 +227,7 @@ export class RpcMember {
   /** Stop receiving events and close the log (does not kill the process). */
   detach(): void {
     this.handlers.clear();
+    this.exitHandlers.clear();
     this.log?.end();
     this.log = undefined;
   }

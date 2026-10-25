@@ -6,7 +6,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { loadFleetConfig, piBinary, resolveRoleSpec } from "./config.ts";
 import {
@@ -17,9 +17,12 @@ import {
   commitsSince,
   deleteBranch,
   diffForReview,
+  git,
   headRev,
   mergeBranch,
+  parseCommitRange,
   removeWorktree,
+  type CommitRange,
   type MergeResult,
 } from "./gitw.ts";
 import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
@@ -39,6 +42,8 @@ import {
   type NotifyLevel,
   type RoleName,
   type StopTarget,
+  type WaitMode,
+  type WaitTarget,
 } from "./types.ts";
 
 export type { NotifyLevel } from "./types.ts";
@@ -71,6 +76,7 @@ const USAGE = [
   "  spawn [--role r] [--model m] [--over ref] <name> <task…>",
   "  resume <name> [extra…]          Continue a stale/stopped member",
   "  send <name> <message…>          Steer or prompt a member",
+  "  wait [name|--all] [--any] [--timeout <sec>]  Wait for member(s) to settle",
   "  log <name> [n]                  Tail a member's activity log",
   "  merge <name|--done>             Merge a member branch into HEAD",
   "  stop <name|--all>               Abort + kill member process(es)",
@@ -82,6 +88,11 @@ const USAGE = [
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const RESUMABLE = new Set<MemberStatus>(["stale", "stopped", "failed", "done"]);
 const CLEANABLE_DONE = new Set<MemberStatus>(["done", "merged", "failed", "stopped", "stale"]);
+const SETTLED_STATUSES = new Set<MemberStatus>(["done", "failed", "stopped", "stale", "merged"]);
+
+function isMemberSettled(member: Member): boolean {
+  return SETTLED_STATUSES.has(member.status) || Boolean(member.needsAttention);
+}
 
 const GLYPH: Record<Member["status"], string> = {
   starting: "…",
@@ -105,6 +116,8 @@ export class Fleet {
 
   private clients = new Map<string, RpcMember>();
   private askWatchers = new Map<string, FSWatcher>();
+  private stateListeners = new Set<() => void>();
+  private saveChain: Promise<void> = Promise.resolve();
   private cfg?: FleetConfig;
   private man?: Manifest;
 
@@ -125,10 +138,21 @@ export class Fleet {
   }
 
   private async save(): Promise<void> {
-    if (this.man) {
-      await saveManifest(this.man);
+    if (!this.man) return;
+    const man = this.man;
+    const op = this.saveChain.then(async () => {
+      await saveManifest(man);
       await this.refreshWidget();
-    }
+      for (const listener of this.stateListeners) {
+        try {
+          listener();
+        } catch {
+          // ignore listener error
+        }
+      }
+    });
+    this.saveChain = op.catch(() => undefined);
+    await op;
   }
 
   // ── command dispatch ─────────────────────────────────────────────────────
@@ -166,6 +190,10 @@ export class Fleet {
       case "send": {
         const mode = await this.send(cmd.name, cmd.message);
         return info([`fleet: sent to '${cmd.name}' (${mode})`]);
+      }
+
+      case "wait": {
+        return this.waitForMembers(cmd.target, cmd.mode ?? "all", cmd.timeout);
       }
 
       case "log": {
@@ -273,19 +301,35 @@ export class Fleet {
 
     const branch = `fleet/${o.name}`;
     const wt = path.join(this.root, cfg.worktreeRoot ?? ".pi/fleet/wt", o.name);
-    const baseInput = o.over ?? (resume ? existing!.baseRef : (cfg.baseRef ?? "HEAD"));
+    const effectiveOver = o.over ?? (o.preserveTask ? existing?.over : undefined);
+    const range = parseCommitRange(effectiveOver);
+    const baseInput = range
+      ? range.head
+      : (effectiveOver ?? (resume ? existing!.baseRef : (cfg.baseRef ?? "HEAD")));
     let baseRef: string;
 
     if (resume) {
+      if (this.clients.has(o.name)) {
+        await this.stop(o.name);
+      }
       if (!existsSync(wt)) {
         if (await branchExists(this.root, branch)) await attachWorktree(this.root, wt, branch);
         else throw new Error(`cannot resume '${o.name}': worktree and branch are gone; run /fleet clean ${o.name} first`);
       }
-      baseRef = existing!.baseRef;
+      if (!o.preserveTask && o.over) {
+        if (range) await headRev(this.root, range.base);
+        baseRef = await headRev(this.root, baseInput);
+        await git(wt, "reset", "--hard", baseRef);
+      } else {
+        baseRef = existing!.baseRef;
+      }
     } else {
+      if (range) await headRev(this.root, range.base);
       baseRef = await headRev(this.root, baseInput);
       await addWorktree(this.root, wt, branch, baseRef);
     }
+
+    await rm(path.join(wt, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
 
     const now = Date.now();
     const member: Member = existing ?? {
@@ -305,8 +349,12 @@ export class Fleet {
     } else {
       member.model = model;
     }
+    member.role = role;
+    member.baseRef = baseRef;
+    member.over = effectiveOver;
     member.status = "starting";
     member.needsAttention = undefined;
+    member.result = undefined;
     member.updatedAt = now;
     man.members[o.name] = member;
     await this.save();
@@ -325,8 +373,8 @@ export class Fleet {
         "utf8",
       );
 
-      if (role === "reviewer" && o.over) {
-        await this.writeReviewContext(member, o.over);
+      if (role === "reviewer") {
+        await this.writeReviewContext(member, effectiveOver, range);
       }
 
       const sessionDir = path.join(this.root, cfg.sessionDir ?? ".pi/fleet/sessions");
@@ -351,6 +399,7 @@ export class Fleet {
       });
       this.clients.set(o.name, client);
       client.onEvent((ev) => void this.onMemberEvent(o.name, ev));
+      client.onExit(() => void this.onClientExit(o.name, client));
       this.watchAsk(member);
 
       await client.waitReady();
@@ -387,31 +436,140 @@ export class Fleet {
     });
   }
 
-  private async writeReviewContext(member: Member, target: string): Promise<void> {
+  private async writeReviewContext(
+    member: Member,
+    over?: string,
+    range = parseCommitRange(over),
+  ): Promise<void> {
+    const cfg = await this.config();
     const man = await this.manifest();
-    const targetName = target.replace(/^fleet\//, "");
-    const targetMember = man.members[targetName];
-    const diffBase = targetMember?.baseRef ?? (await this.config()).baseRef ?? "HEAD";
+    const target = range ? range.head : (over ?? member.baseRef);
+    const targetName = !range && over ? over.replace(/^fleet\//, "") : undefined;
+    const targetMember = targetName ? man.members[targetName] : undefined;
+    const diffBase = range ? range.base : (targetMember?.baseRef ?? cfg.baseRef ?? "HEAD");
     const commits = await commitsSince(this.root, diffBase, target).catch(() => [] as string[]);
-    const diff = await diffForReview(this.root, diffBase, target);
+    const diff = await diffForReview(this.root, diffBase, target, range?.dots);
     const dir = path.join(member.worktree, ".pi", "fleet");
     await mkdir(dir, { recursive: true });
     const commitList = commits.length ? commits.map((c) => `- ${c}`).join("\n") : "(no commits)";
     await writeFile(
       path.join(dir, "review-context.md"),
-      `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Commits\n\n${commitList}\n\n## Diff\n\n\`\`\`diff\n${diff}\n\`\`\`\n`,
+      `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Assignment\n\n${member.task}\n\n## Commits\n\n${commitList}\n\n## Diff\n\n\`\`\`diff\n${diff}\n\`\`\`\n`,
       "utf8",
     );
   }
 
   private async send(name: string, message: string): Promise<"steer" | "prompt"> {
     const client = this.mustClient(name);
+    const man = await this.manifest();
+    const member = man.members[name];
+    if (member) {
+      await rm(path.join(member.worktree, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
+      if (member.needsAttention) {
+        member.needsAttention = undefined;
+        member.updatedAt = Date.now();
+        await this.save();
+      }
+    }
     if (client.busy) {
       await client.steer(message);
       return "steer";
     }
     await client.prompt(message);
     return "prompt";
+  }
+
+  private async waitForMembers(
+    target: WaitTarget,
+    mode: WaitMode,
+    timeoutSec?: number,
+  ): Promise<FleetResult> {
+    const man = await this.manifest();
+    let names: string[];
+    if (target.kind === "all") {
+      names = Object.values(man.members)
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .map((m) => m.name);
+      if (names.length === 0) {
+        return info(["fleet: no members to wait for"]);
+      }
+    } else {
+      for (const name of target.names) {
+        if (!man.members[name]) throw new Error(`no such member '${name}'`);
+      }
+      names = target.names;
+    }
+
+    const isSatisfied = (): boolean =>
+      mode === "any"
+        ? names.some((n) => !man.members[n] || isMemberSettled(man.members[n]))
+        : names.every((n) => !man.members[n] || isMemberSettled(man.members[n]));
+
+    const syncAsks = async (): Promise<void> => {
+      for (const name of names) {
+        const member = man.members[name];
+        if (member && existsSync(path.join(member.worktree, "FLEET_ASK.md"))) {
+          await this.readAsk(name);
+        }
+      }
+    };
+
+    let timedOut = false;
+    await syncAsks();
+    if (!isSatisfied()) {
+      await new Promise<void>((resolve) => {
+        let timer: NodeJS.Timeout | undefined;
+        const done = () => {
+          this.stateListeners.delete(check);
+          clearInterval(poll);
+          if (timer) clearTimeout(timer);
+          resolve();
+        };
+        const check = () => {
+          if (isSatisfied()) done();
+        };
+        const poll = setInterval(() => {
+          void syncAsks().then(check);
+        }, 50);
+        if (timeoutSec !== undefined) {
+          timer = setTimeout(() => {
+            if (!isSatisfied()) timedOut = true;
+            done();
+          }, Math.max(1, Math.round(timeoutSec * 1000)));
+        }
+        this.stateListeners.add(check);
+      });
+    }
+
+    const lines: string[] = [];
+    if (timedOut) {
+      const settled = names.filter((n) => man.members[n] && isMemberSettled(man.members[n]));
+      const running = names.filter((n) => man.members[n] && !isMemberSettled(man.members[n]));
+      lines.push(
+        `fleet: wait timed out after ${timeoutSec}s (settled: ${settled.join(", ") || "none"}; running: ${running.join(", ") || "none"})`,
+      );
+    }
+    for (const name of names) {
+      const member = man.members[name];
+      if (!member) continue;
+      lines.push(...(await this.formatWaitMember(member)));
+    }
+    return info(lines);
+  }
+
+  private async formatWaitMember(member: Member): Promise<string[]> {
+    const commits = await commitsSince(this.root, member.baseRef, member.branch).catch(() => [] as string[]);
+    const lines = [
+      `${member.name} [${member.role}] status=${member.status} branch=${member.branch}`,
+      commits.length > 0 ? `  commits: ${commits.join("; ")}` : "  commits: (no commits)",
+    ];
+    if (member.needsAttention) {
+      lines.push(`  ASK: ${member.needsAttention}`);
+    }
+    if (member.result) {
+      lines.push(`  result: ${member.result}`);
+    }
+    return lines;
   }
 
   private async stop(name: string): Promise<void> {
@@ -421,10 +579,10 @@ export class Fleet {
     const canKillDetached =
       !!member && (isActiveStatus(member.status) || member.status === "detached");
     if (client) {
-      await client.abort().catch(() => undefined);
-      await client.kill();
       this.clients.delete(name);
       this.unwatchAsk(name);
+      await client.abort().catch(() => undefined);
+      await client.kill();
     } else if (canKillDetached && member.pid && isPidAlive(member.pid)) {
       await killProcessTree(member.pid);
     }
@@ -444,6 +602,7 @@ export class Fleet {
       if (!force) throw new Error(`member '${name}' is still attached; run /fleet stop ${name} first`);
       await this.stop(name);
     }
+    this.unwatchAsk(name);
     if (existsSync(member.worktree)) {
       const r = await removeWorktree(this.root, member.worktree, force);
       if (!r.ok) throw new Error(`worktree remove failed: ${r.out}`);
@@ -559,7 +718,11 @@ export class Fleet {
     } catch {
       return `(no log yet for '${name}')`;
     }
-    const entries: string[] = [];
+    const items: Array<
+      | { kind: "assistant"; text: string }
+      | { kind: "tool"; toolName: string }
+    > = [];
+    let lastDoneIdx = -1;
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       let ev: any;
@@ -570,11 +733,19 @@ export class Fleet {
       }
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const text = extractText(ev.message).trim();
-        if (text) entries.push(`assistant: ${truncate(text.replace(/\s+/g, " "), 220)}`);
+        if (text) {
+          if (isDoneText(text)) lastDoneIdx = items.length;
+          items.push({ kind: "assistant", text });
+        }
       } else if (ev.type === "tool_execution_start") {
-        entries.push(`tool: ${ev.toolName}`);
+        items.push({ kind: "tool", toolName: ev.toolName });
       }
     }
+    const entries = items.map((item, idx) => {
+      if (item.kind === "tool") return `tool: ${item.toolName}`;
+      if (idx === lastDoneIdx) return `assistant: ${item.text}`;
+      return `assistant: ${truncate(item.text.replace(/\s+/g, " "), 220)}`;
+    });
     const tail = entries.slice(-n);
     return tail.length ? tail.join("\n") : `(no activity logged for '${name}')`;
   }
@@ -602,11 +773,12 @@ export class Fleet {
 
   /** Detach from all clients without killing them (used on session shutdown). */
   dispose(): void {
-    for (const [name, client] of this.clients) {
+    const entries = Array.from(this.clients.entries());
+    this.clients.clear();
+    for (const [name, client] of entries) {
       client.detach();
       this.unwatchAsk(name);
     }
-    this.clients.clear();
   }
 
   // ── internals ────────────────────────────────────────────────────────────
@@ -634,12 +806,28 @@ export class Fleet {
       await this.save();
     } else if (ev.type === "message_end" && ev.message?.role === "assistant") {
       const text = extractText(ev.message);
-      if (/^\s*DONE:/im.test(text.slice(0, 500))) {
+      if (isDoneText(text)) {
         member.status = "done";
+        member.result = text.trim();
         member.updatedAt = Date.now();
         await this.save();
         this.ui.notify(`fleet member '${name}' reports DONE`, "info");
       }
+    }
+  }
+
+  private async onClientExit(name: string, client: RpcMember): Promise<void> {
+    if (this.clients.get(name) !== client) return;
+    this.clients.delete(name);
+    this.unwatchAsk(name);
+    const man = await this.manifest();
+    const member = man.members[name];
+    if (!member) return;
+    if (isActiveStatus(member.status)) {
+      member.status = "failed";
+      member.pid = undefined;
+      member.updatedAt = Date.now();
+      await this.save();
     }
   }
 
@@ -686,6 +874,10 @@ export class Fleet {
 }
 
 // ── helpers & command parsers ────────────────────────────────────────────────
+
+function isDoneText(text: string): boolean {
+  return /^\s*DONE:/im.test(text.slice(0, 500));
+}
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -743,6 +935,29 @@ function parseCleanTarget(raw: string): CleanTarget {
 function parseLogCount(raw: unknown): number {
   const n = typeof raw === "number" ? raw : raw ? Number(raw) : 20;
   return Number.isFinite(n) && n > 0 ? n : 20;
+}
+
+const WAIT_USAGE = "usage: /fleet wait [name|--all] [--any] [--timeout <sec>]";
+
+function parseWaitTimeout(raw: unknown): number {
+  if (typeof raw === "string" && (!raw || raw.startsWith("-"))) throw new Error(WAIT_USAGE);
+  const sec = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(sec) || sec <= 0) throw new Error(WAIT_USAGE);
+  return sec;
+}
+
+function parseWaitTarget(tokens: string[]): WaitTarget {
+  let explicitAll = false;
+  const names: string[] = [];
+  for (const raw of tokens) {
+    const token = raw.trim();
+    if (!token) continue;
+    if (token === "--all") explicitAll = true;
+    else if (token.startsWith("-")) throw new Error(WAIT_USAGE);
+    else if (!names.includes(token)) names.push(token);
+  }
+  if (explicitAll && names.length > 0) throw new Error(WAIT_USAGE);
+  return explicitAll || names.length === 0 ? { kind: "all" } : { kind: "members", names };
 }
 
 export function parseFleetCommand(raw: string): FleetCommand {
@@ -807,6 +1022,35 @@ export function parseFleetCommand(raw: string): FleetCommand {
       return { action: "send", name, message };
     }
 
+    case "wait": {
+      let cursor = rest;
+      let mode: WaitMode | undefined;
+      let timeout: number | undefined;
+      const targetTokens: string[] = [];
+
+      while (cursor.trimStart()) {
+        const next = shiftToken(cursor);
+        if (next.token === "--any") {
+          mode = "any";
+          cursor = next.rest;
+        } else if (next.token === "--timeout") {
+          const val = shiftToken(next.rest);
+          timeout = parseWaitTimeout(val.token);
+          cursor = val.rest;
+        } else {
+          targetTokens.push(next.token);
+          cursor = next.rest;
+        }
+      }
+
+      return {
+        action: "wait",
+        target: parseWaitTarget(targetTokens),
+        ...(mode ? { mode } : {}),
+        ...(timeout !== undefined ? { timeout } : {}),
+      };
+    }
+
     case "log": {
       const { token: name, rest: tail } = shiftToken(rest);
       if (!name) throw new Error("usage: /fleet log <name> [n]");
@@ -863,6 +1107,7 @@ export function parseFleetCommand(raw: string): FleetCommand {
 export function toolParamsToCommand(params: {
   action: string;
   name?: string;
+  names?: string[];
   task?: string;
   role?: RoleName;
   model?: string;
@@ -870,6 +1115,8 @@ export function toolParamsToCommand(params: {
   message?: string;
   n?: number;
   force?: boolean;
+  mode?: WaitMode;
+  timeout?: number;
 }): FleetCommand {
   switch (params.action) {
     case "status":
@@ -897,6 +1144,25 @@ export function toolParamsToCommand(params: {
     case "send": {
       if (!params.name || !params.message) throw new Error("send requires name and message");
       return { action: "send", name: params.name, message: params.message };
+    }
+    case "wait": {
+      const timeout = params.timeout !== undefined ? parseWaitTimeout(params.timeout) : undefined;
+      if (params.mode !== undefined && params.mode !== "all" && params.mode !== "any") {
+        throw new Error(WAIT_USAGE);
+      }
+      const targetTokens = [
+        ...(params.name ? params.name.trim().split(/\s+/) : []),
+        ...(Array.isArray(params.names) ? params.names.map(String) : []),
+      ].filter((t) => t.trim().length > 0);
+      if ((params.name !== undefined || params.names !== undefined) && targetTokens.length === 0) {
+        throw new Error(WAIT_USAGE);
+      }
+      return {
+        action: "wait",
+        target: parseWaitTarget(targetTokens),
+        ...(params.mode ? { mode: params.mode } : {}),
+        ...(timeout !== undefined ? { timeout } : {}),
+      };
     }
     case "log": {
       if (!params.name) throw new Error("log requires name");

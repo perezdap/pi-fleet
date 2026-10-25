@@ -2,6 +2,22 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import type { RangeDots } from "./types.ts";
+
+export interface CommitRange {
+  base: string;
+  dots: RangeDots;
+  head: string;
+}
+
+export function parseCommitRange(over?: string): CommitRange | undefined {
+  if (!over) return undefined;
+  const match = /^(.*?)(\.{2,3})(.+)$/.exec(over);
+  if (!match) return undefined;
+  const [, base, dots, head] = match;
+  if (!base || !head || base.endsWith(".") || head.startsWith(".")) return undefined;
+  return { base, dots: dots as RangeDots, head };
+}
 
 const pExecFile = promisify(execFile);
 
@@ -96,8 +112,14 @@ export async function mergeBranch(root: string, branch: string, message: string)
 }
 
 /** Diff stat between baseRef and branch (for review context). */
-export async function diffForReview(root: string, baseRef: string, branch: string): Promise<string> {
-  const stat = await tryGit(root, "diff", "--stat", `${baseRef}...${branch}`);
-  const diff = await tryGit(root, "diff", `${baseRef}...${branch}`);
+export async function diffForReview(
+  root: string,
+  baseRef: string,
+  branch: string,
+  dots: RangeDots = "...",
+): Promise<string> {
+  const range = `${baseRef}${dots}${branch}`;
+  const stat = await tryGit(root, "diff", "--stat", range);
+  const diff = await tryGit(root, "diff", range);
   return [stat.ok ? stat.out : "", diff.ok ? diff.out : ""].filter(Boolean).join("\n\n");
 }

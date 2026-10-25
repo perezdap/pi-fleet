@@ -55,12 +55,16 @@ export interface Member {
   worktree: string;
   /** Commit the branch was created from. */
   baseRef: string;
+  /** Target ref or commit range passed via --over. */
+  over?: string;
   model?: string;
   pid?: number;
   sessionFile?: string;
   status: MemberStatus;
   /** First line of FLEET_ASK.md if the member raised a question. */
   needsAttention?: string;
+  /** Full DONE: completion message emitted by the member. */
+  result?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -86,6 +90,14 @@ export type CleanTarget =
   | { kind: "done" }
   | { kind: "all" };
 
+export type WaitMode = "all" | "any";
+
+export type RangeDots = ".." | "...";
+
+export type WaitTarget =
+  | { kind: "all" }
+  | { kind: "members"; names: string[] };
+
 export type FleetCommand =
   | { action: "help" }
   | { action: "status" }
@@ -106,6 +118,12 @@ export type FleetCommand =
       action: "send";
       name: string;
       message: string;
+    }
+  | {
+      action: "wait";
+      target: WaitTarget;
+      mode?: WaitMode;
+      timeout?: number;
     }
   | {
       action: "log";
