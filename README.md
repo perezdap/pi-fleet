@@ -29,7 +29,7 @@ fleet: 3 members (2 active)
 | Command | Description |
 |---|---|
 | `/fleet status` | Show all members (also shown as a status widget) |
-| `/fleet spawn [--role r] [--model m] [--over ref] <name> <task…>` | Start a member |
+| `/fleet spawn [--role r] [--model m] [--over ref] [--transient\|--no-transient] <name> <task…>` | Start a member |
 | `/fleet resume <name> [extra…]` | Continue a stale/stopped member on its existing worktree |
 | `/fleet send <name> <message…>` | Steer a busy member, or prompt an idle one |
 | `/fleet wait [name\|--all] [--any] [--timeout <sec>]` | Wait for member(s) to settle or raise a question |
@@ -40,7 +40,7 @@ fleet: 3 members (2 active)
 | `/fleet open <name>` | Resume the member's session in a new interactive pi window |
 
 The extension also registers a **`fleet` tool**, so the supervisor LLM can
-spawn, steer, merge, and clean members by itself.
+spawn (single member or parallel batch via `members: [...]`), steer, wait, merge, and clean members by itself.
 
 ## Roles: who codes, tests, reviews, consolidates
 
@@ -79,19 +79,20 @@ and any spawn can override it:
   "roles": {
     "coder":      { "model": "anthropic/claude-sonnet-4-5" },
     "tester":     { "model": "anthropic/claude-haiku-4-5" },
-    "reviewer":   { "model": "anthropic/claude-opus-4-5", "thinking": "high" },
+    "reviewer":   { "model": "anthropic/claude-opus-4-5", "thinking": "high", "autoClean": true },
     "integrator": { "model": "anthropic/claude-sonnet-4-5", "thinking": "high" }
   }
 }
 ```
 
 Per-spawn override: `/fleet spawn --role reviewer --model openai/gpt-5 r1 "Review the auth work"`.
+Roles can also set `"autoClean": true` (default for `reviewer`) to automatically clean transient members when they finish cleanly; override per spawn with `--transient` or `--no-transient` (or `transient: true|false` in the `fleet` tool).
 
 ## Coordination protocol
 
 - **Supervisor → member:** direct RPC (`/fleet send`).
 - **Member → supervisor:**
-  - Members reply `DONE: …` when finished (detected → status `done` + notify).
+  - Members reply `DONE: …` when passing (status `done` + notify) or `FAILED: …` when checks fail or blockers remain (status `failed` + notify; skipped by `/fleet merge --done`).
   - Blocked members write `FLEET_ASK.md` in their worktree root; the supervisor
     watches it, notifies you, and answers via `/fleet send`.
   - All progress is git commits on the member branch — inspectable anytime.

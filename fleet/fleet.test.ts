@@ -121,6 +121,11 @@ async function createHarness(): Promise<TestHarness> {
   await writeFile(path.join(rawRoot, "README.md"), "initial\n", "utf8");
   await git(rawRoot, "add", "README.md");
   await git(rawRoot, "commit", "-m", "initial");
+  await writeFile(
+    path.join(rawRoot, ".git", "info", "exclude"),
+    ".rpc-received.jsonl\nsession.json\n",
+    "utf8",
+  );
 
   const root = await git(rawRoot, "rev-parse", "--show-toplevel");
   const baseRef = await headRev(root);
@@ -708,11 +713,19 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         await h.seedMember(`keep-${status}`, status);
       }
 
+      const directDetachedClean = await h.runTool({ action: "clean", name: "fin-detached" });
+      await h.seedMember("dirty-stopped", "stopped");
+      await writeFile(path.join(h.root, ".pi", "fleet", "wt", "dirty-stopped", "uncommitted.txt"), "dirty\n", "utf8");
+      const dirtyCleanWithoutForce = await h.runTool({ action: "clean", name: "dirty-stopped" });
+      await h.runTool({ action: "clean", name: "dirty-stopped", force: true });
+
       await h.runCommand("clean --done");
       const man = await loadManifest(h.root);
 
       assert.deepEqual(
         {
+          directDetachedCleanError: directDetachedClean.isError,
+          dirtyCleanRejectedWithoutForce: dirtyCleanWithoutForce.isError,
           remaining: Object.keys(man.members).sort(),
           mergedBranchGone: !(await branchExists(h.root, "fleet/fin-merged")),
           unmergedDoneBranchKept: await branchExists(h.root, "fleet/fin-done"),
@@ -723,6 +736,8 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           errors: h.errors(),
         },
         {
+          directDetachedCleanError: true,
+          dirtyCleanRejectedWithoutForce: true,
           remaining: ["keep-idle", "keep-running", "keep-starting"],
           mergedBranchGone: true,
           unmergedDoneBranchKept: true,
@@ -891,7 +906,8 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     try {
       await h.seedMember("passing-coder", "done", { unmergedCommit: true });
 
-      const fullFailed = "FAILED: 2 blocker defects found\n\n- auth.ts:42 missing signature check\n- session.ts:18 token leak";
+      const fullFailed =
+        "FAILED: 2 blocker defects found\nDONE: parser step passed\n- auth.ts:42 missing signature check\n- session.ts:18 token leak";
       await h.runTool({
         action: "spawn",
         name: "failing-rev",
@@ -1482,9 +1498,19 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         ],
       });
 
+      const badSecondRefRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "rollback-first", task: "Created then rolled back" },
+          { name: "bad-second", over: "nonexistent-ref", task: "Fails headRev" },
+        ],
+      });
+
       const manAfterRejected = await loadManifest(h.root);
       const validFirstWtExists = existsSync(path.join(h.root, ".pi", "fleet", "wt", "valid-first"));
       const m1WtExists = existsSync(path.join(h.root, ".pi", "fleet", "wt", "m1"));
+      const rollbackFirstWtExists = existsSync(path.join(h.root, ".pi", "fleet", "wt", "rollback-first"));
+      const rollbackFirstBranchExists = await branchExists(h.root, "fleet/rollback-first");
 
       await h.seedMember("existing-active", "running");
       const conflictExistingRes = await h.runTool({
@@ -1508,9 +1534,12 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           dupError: dupRes.isError,
           invalidSecondError: invalidSecondRes.isError,
           overLimitError: overLimitRes.isError && overLimitRes.text.includes("fleet is at max members (2)"),
+          badSecondRefError: badSecondRefRes.isError,
           membersAfterRejected: Object.keys(manAfterRejected.members),
           validFirstWtExists,
           m1WtExists,
+          rollbackFirstWtExists,
+          rollbackFirstBranchExists,
           conflictExistingError:
             conflictExistingRes.isError &&
             conflictExistingRes.text.includes("member 'existing-active' already exists with status 'running'"),
@@ -1523,9 +1552,12 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           dupError: true,
           invalidSecondError: true,
           overLimitError: true,
+          badSecondRefError: true,
           membersAfterRejected: [],
           validFirstWtExists: false,
           m1WtExists: false,
+          rollbackFirstWtExists: false,
+          rollbackFirstBranchExists: false,
           conflictExistingError: true,
           overLimitWithActiveError: true,
           membersAfterActiveChecks: ["existing-active"],
