@@ -384,22 +384,28 @@ export class Fleet {
       );
       const createdWorktrees: Array<{ name: string; wt: string; branch: string }> = [];
 
+      const attachedWorktrees: string[] = [];
       const prepared: PreparedSpawn[] = [];
       try {
+        // Reversible worktree work first: a failure here leaves resumed members untouched.
+        for (const { input, resume, branch, wt, baseRef } of validated) {
+          if (!resume) {
+            await addWorktree(this.root, wt, branch, baseRef);
+            createdWorktrees.push({ name: input.name, wt, branch });
+          } else if (!existsSync(wt)) {
+            await attachWorktree(this.root, wt, branch);
+            attachedWorktrees.push(wt);
+          }
+        }
+
         for (const { input, existing, resume, role, spec, model, branch, wt, effectiveOver, range, baseRef } of validated) {
           if (resume) {
             if (this.clients.has(input.name)) {
               await this.stop(input.name);
             }
-            if (!existsSync(wt)) {
-              await attachWorktree(this.root, wt, branch);
-            }
             if (!input.preserveTask && input.over) {
               await git(wt, "reset", "--hard", baseRef);
             }
-          } else {
-            await addWorktree(this.root, wt, branch, baseRef);
-            createdWorktrees.push({ name: input.name, wt, branch });
           }
 
           await rm(path.join(wt, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
@@ -445,6 +451,9 @@ export class Fleet {
         for (const created of createdWorktrees) {
           await removeWorktree(this.root, created.wt, true).catch(() => undefined);
           await deleteBranch(this.root, created.branch, true).catch(() => undefined);
+        }
+        for (const wt of attachedWorktrees) {
+          await removeWorktree(this.root, wt).catch(() => undefined);
         }
         for (const [name, snap] of prevSnapshots) {
           if (snap) man.members[name] = snap;

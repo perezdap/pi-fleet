@@ -1586,6 +1586,51 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     }
   });
 
+  it("leaves resumed members untouched and removes re-attached worktrees when a batch fails during worktree creation", async () => {
+    const h = await createHarness();
+    try {
+      const goneWt = (await h.seedMember("gone-wt", "stopped")).worktree;
+      await git(h.root, "worktree", "remove", "--force", goneWt);
+
+      await h.runTool({ action: "spawn", name: "live-done", task: "FINISH_NOW:DONE: first run" });
+      await h.runTool({ action: "wait", name: "live-done" });
+      const livePid = (await loadManifest(h.root)).members["live-done"]?.pid;
+
+      await git(h.root, "branch", "fleet/collide");
+      const res = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "live-done", task: "Second run" },
+          { name: "gone-wt", task: "Re-attached, then rolled back" },
+          { name: "collide", task: "addWorktree fails because the branch exists" },
+        ],
+      });
+      const after = (await loadManifest(h.root)).members;
+      const actual = {
+        error: res.isError,
+        liveStatus: after["live-done"]?.status,
+        liveResult: after["live-done"]?.result,
+        livePidAlive: !!livePid && isPidAlive(livePid),
+        goneWtStatus: after["gone-wt"]?.status,
+        goneWtReattached: existsSync(goneWt),
+        collideInManifest: "collide" in after,
+      };
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(actual, {
+        error: true,
+        liveStatus: "done",
+        liveResult: "DONE: first run",
+        livePidAlive: true,
+        goneWtStatus: "stopped",
+        goneWtReattached: false,
+        collideInManifest: false,
+      });
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("serializes manifest writes and preserves all members across concurrent spawn calls and status updates", async () => {
     const h = await createHarness();
     try {
