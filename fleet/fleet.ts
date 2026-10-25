@@ -39,6 +39,7 @@ import {
   type NotifyLevel,
   type RoleName,
   type StopTarget,
+  type WaitTarget,
 } from "./types.ts";
 
 export type { NotifyLevel } from "./types.ts";
@@ -71,6 +72,7 @@ const USAGE = [
   "  spawn [--role r] [--model m] [--over ref] <name> <task…>",
   "  resume <name> [extra…]          Continue a stale/stopped member",
   "  send <name> <message…>          Steer or prompt a member",
+  "  wait [name|--all] [--any] [--timeout <sec>]  Wait for member(s) to settle",
   "  log <name> [n]                  Tail a member's activity log",
   "  merge <name|--done>             Merge a member branch into HEAD",
   "  stop <name|--all>               Abort + kill member process(es)",
@@ -82,6 +84,11 @@ const USAGE = [
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const RESUMABLE = new Set<MemberStatus>(["stale", "stopped", "failed", "done"]);
 const CLEANABLE_DONE = new Set<MemberStatus>(["done", "merged", "failed", "stopped", "stale"]);
+const SETTLED_STATUSES = new Set<MemberStatus>(["done", "failed", "stopped", "stale", "merged"]);
+
+function isMemberSettled(member: Member): boolean {
+  return SETTLED_STATUSES.has(member.status) || Boolean(member.needsAttention);
+}
 
 const GLYPH: Record<Member["status"], string> = {
   starting: "…",
@@ -105,6 +112,8 @@ export class Fleet {
 
   private clients = new Map<string, RpcMember>();
   private askWatchers = new Map<string, FSWatcher>();
+  private stateListeners = new Set<() => void>();
+  private saveChain: Promise<void> = Promise.resolve();
   private cfg?: FleetConfig;
   private man?: Manifest;
 
@@ -125,10 +134,21 @@ export class Fleet {
   }
 
   private async save(): Promise<void> {
-    if (this.man) {
-      await saveManifest(this.man);
+    if (!this.man) return;
+    const man = this.man;
+    const op = this.saveChain.then(async () => {
+      await saveManifest(man);
       await this.refreshWidget();
-    }
+      for (const listener of this.stateListeners) {
+        try {
+          listener();
+        } catch {
+          // ignore listener error
+        }
+      }
+    });
+    this.saveChain = op.catch(() => undefined);
+    await op;
   }
 
   // ── command dispatch ─────────────────────────────────────────────────────
@@ -166,6 +186,10 @@ export class Fleet {
       case "send": {
         const mode = await this.send(cmd.name, cmd.message);
         return info([`fleet: sent to '${cmd.name}' (${mode})`]);
+      }
+
+      case "wait": {
+        return this.waitForMembers(cmd.target, cmd.mode ?? "all", cmd.timeout);
       }
 
       case "log": {
@@ -307,6 +331,7 @@ export class Fleet {
     }
     member.status = "starting";
     member.needsAttention = undefined;
+    member.result = undefined;
     member.updatedAt = now;
     man.members[o.name] = member;
     await this.save();
@@ -351,6 +376,7 @@ export class Fleet {
       });
       this.clients.set(o.name, client);
       client.onEvent((ev) => void this.onMemberEvent(o.name, ev));
+      client.proc.on("close", () => void this.onClientExit(o.name, client));
       this.watchAsk(member);
 
       await client.waitReady();
@@ -414,6 +440,99 @@ export class Fleet {
     return "prompt";
   }
 
+  private async waitForMembers(
+    target: WaitTarget,
+    mode: "all" | "any",
+    timeoutSec?: number,
+  ): Promise<FleetResult> {
+    const man = await this.manifest();
+    let names: string[];
+    if (target.kind === "all") {
+      names = Object.values(man.members)
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .map((m) => m.name);
+      if (names.length === 0) {
+        return info(["fleet: no members to wait for"]);
+      }
+    } else {
+      for (const name of target.names) {
+        if (!man.members[name]) throw new Error(`no such member '${name}'`);
+      }
+      names = target.names;
+    }
+
+    const isSatisfied = (): boolean =>
+      mode === "any"
+        ? names.some((n) => !man.members[n] || isMemberSettled(man.members[n]))
+        : names.every((n) => !man.members[n] || isMemberSettled(man.members[n]));
+
+    const syncAsks = async (): Promise<void> => {
+      for (const name of names) {
+        const member = man.members[name];
+        if (member && !member.needsAttention && existsSync(path.join(member.worktree, "FLEET_ASK.md"))) {
+          await this.readAsk(name);
+        }
+      }
+    };
+
+    let timedOut = false;
+    await syncAsks();
+    if (!isSatisfied()) {
+      await new Promise<void>((resolve) => {
+        let timer: NodeJS.Timeout | undefined;
+        const done = () => {
+          this.stateListeners.delete(check);
+          clearInterval(poll);
+          if (timer) clearTimeout(timer);
+          resolve();
+        };
+        const check = () => {
+          if (isSatisfied()) done();
+        };
+        const poll = setInterval(() => {
+          void syncAsks().then(check);
+        }, 50);
+        if (timeoutSec !== undefined) {
+          timer = setTimeout(() => {
+            if (!isSatisfied()) timedOut = true;
+            done();
+          }, Math.max(1, Math.round(timeoutSec * 1000)));
+        }
+        this.stateListeners.add(check);
+      });
+    }
+
+    const lines: string[] = [];
+    if (timedOut) {
+      const settled = names.filter((n) => man.members[n] && isMemberSettled(man.members[n]));
+      const running = names.filter((n) => man.members[n] && !isMemberSettled(man.members[n]));
+      lines.push(
+        `fleet: wait timed out after ${timeoutSec}s (settled: ${settled.join(", ") || "none"}; running: ${running.join(", ") || "none"})`,
+      );
+    }
+    for (const name of names) {
+      const member = man.members[name];
+      if (!member) continue;
+      lines.push(...(await this.formatWaitMember(member)));
+    }
+    return info(lines);
+  }
+
+  private async formatWaitMember(member: Member): Promise<string[]> {
+    const commits = await commitsSince(this.root, member.baseRef, member.branch).catch(() => [] as string[]);
+    const lines = [
+      `${member.name} [${member.role}] status=${member.status} branch=${member.branch}`,
+      commits.length > 0 ? `  commits: ${commits.join("; ")}` : "  commits: (no commits)",
+    ];
+    if (member.needsAttention) {
+      lines.push(`  ASK: ${member.needsAttention}`);
+    }
+    if (member.result) {
+      lines.push(`  result: ${member.result}`);
+    }
+    return lines;
+  }
+
   private async stop(name: string): Promise<void> {
     const client = this.clients.get(name);
     const man = await this.manifest();
@@ -421,10 +540,10 @@ export class Fleet {
     const canKillDetached =
       !!member && (isActiveStatus(member.status) || member.status === "detached");
     if (client) {
-      await client.abort().catch(() => undefined);
-      await client.kill();
       this.clients.delete(name);
       this.unwatchAsk(name);
+      await client.abort().catch(() => undefined);
+      await client.kill();
     } else if (canKillDetached && member.pid && isPidAlive(member.pid)) {
       await killProcessTree(member.pid);
     }
@@ -559,7 +678,11 @@ export class Fleet {
     } catch {
       return `(no log yet for '${name}')`;
     }
-    const entries: string[] = [];
+    const items: Array<
+      | { kind: "assistant"; text: string }
+      | { kind: "tool"; toolName: string }
+    > = [];
+    let lastDoneIdx = -1;
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       let ev: any;
@@ -570,11 +693,19 @@ export class Fleet {
       }
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const text = extractText(ev.message).trim();
-        if (text) entries.push(`assistant: ${truncate(text.replace(/\s+/g, " "), 220)}`);
+        if (text) {
+          if (isDoneText(text)) lastDoneIdx = items.length;
+          items.push({ kind: "assistant", text });
+        }
       } else if (ev.type === "tool_execution_start") {
-        entries.push(`tool: ${ev.toolName}`);
+        items.push({ kind: "tool", toolName: ev.toolName });
       }
     }
+    const entries = items.map((item, idx) => {
+      if (item.kind === "tool") return `tool: ${item.toolName}`;
+      if (idx === lastDoneIdx) return `assistant: ${item.text}`;
+      return `assistant: ${truncate(item.text.replace(/\s+/g, " "), 220)}`;
+    });
     const tail = entries.slice(-n);
     return tail.length ? tail.join("\n") : `(no activity logged for '${name}')`;
   }
@@ -602,11 +733,12 @@ export class Fleet {
 
   /** Detach from all clients without killing them (used on session shutdown). */
   dispose(): void {
-    for (const [name, client] of this.clients) {
+    const entries = Array.from(this.clients.entries());
+    this.clients.clear();
+    for (const [name, client] of entries) {
       client.detach();
       this.unwatchAsk(name);
     }
-    this.clients.clear();
   }
 
   // ── internals ────────────────────────────────────────────────────────────
@@ -634,12 +766,28 @@ export class Fleet {
       await this.save();
     } else if (ev.type === "message_end" && ev.message?.role === "assistant") {
       const text = extractText(ev.message);
-      if (/^\s*DONE:/im.test(text.slice(0, 500))) {
+      if (isDoneText(text)) {
         member.status = "done";
+        member.result = text.trim();
         member.updatedAt = Date.now();
         await this.save();
         this.ui.notify(`fleet member '${name}' reports DONE`, "info");
       }
+    }
+  }
+
+  private async onClientExit(name: string, client: RpcMember): Promise<void> {
+    if (this.clients.get(name) !== client) return;
+    this.clients.delete(name);
+    this.unwatchAsk(name);
+    const man = await this.manifest();
+    const member = man.members[name];
+    if (!member) return;
+    if (isActiveStatus(member.status)) {
+      member.status = "failed";
+      member.pid = undefined;
+      member.updatedAt = Date.now();
+      await this.save();
     }
   }
 
@@ -686,6 +834,10 @@ export class Fleet {
 }
 
 // ── helpers & command parsers ────────────────────────────────────────────────
+
+function isDoneText(text: string): boolean {
+  return /^\s*DONE:/im.test(text.slice(0, 500));
+}
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -807,6 +959,52 @@ export function parseFleetCommand(raw: string): FleetCommand {
       return { action: "send", name, message };
     }
 
+    case "wait": {
+      const usage = "usage: /fleet wait [name|--all] [--any] [--timeout <sec>]";
+      let cursor = rest;
+      let explicitAll = false;
+      let mode: "all" | "any" | undefined;
+      let timeout: number | undefined;
+      const names: string[] = [];
+
+      while (cursor.trimStart()) {
+        const next = shiftToken(cursor);
+        if (next.token === "--all") {
+          explicitAll = true;
+          cursor = next.rest;
+        } else if (next.token === "--any") {
+          mode = "any";
+          cursor = next.rest;
+        } else if (next.token === "--timeout") {
+          const val = shiftToken(next.rest);
+          const sec = Number(val.token);
+          if (!val.token || val.token.startsWith("-") || !Number.isFinite(sec) || sec <= 0) {
+            throw new Error(usage);
+          }
+          timeout = sec;
+          cursor = val.rest;
+        } else if (next.token.startsWith("-")) {
+          throw new Error(usage);
+        } else {
+          if (!names.includes(next.token)) names.push(next.token);
+          cursor = next.rest;
+        }
+      }
+
+      if (explicitAll && names.length > 0) {
+        throw new Error(usage);
+      }
+
+      const target: WaitTarget =
+        explicitAll || names.length === 0 ? { kind: "all" } : { kind: "members", names };
+      return {
+        action: "wait",
+        target,
+        ...(mode ? { mode } : {}),
+        ...(timeout !== undefined ? { timeout } : {}),
+      };
+    }
+
     case "log": {
       const { token: name, rest: tail } = shiftToken(rest);
       if (!name) throw new Error("usage: /fleet log <name> [n]");
@@ -863,6 +1061,7 @@ export function parseFleetCommand(raw: string): FleetCommand {
 export function toolParamsToCommand(params: {
   action: string;
   name?: string;
+  names?: string[];
   task?: string;
   role?: RoleName;
   model?: string;
@@ -870,6 +1069,8 @@ export function toolParamsToCommand(params: {
   message?: string;
   n?: number;
   force?: boolean;
+  mode?: "all" | "any";
+  timeout?: number;
 }): FleetCommand {
   switch (params.action) {
     case "status":
@@ -897,6 +1098,50 @@ export function toolParamsToCommand(params: {
     case "send": {
       if (!params.name || !params.message) throw new Error("send requires name and message");
       return { action: "send", name: params.name, message: params.message };
+    }
+    case "wait": {
+      const usage = "usage: /fleet wait [name|--all] [--any] [--timeout <sec>]";
+      let timeout: number | undefined;
+      if (params.timeout !== undefined) {
+        if (typeof params.timeout !== "number" || !Number.isFinite(params.timeout) || params.timeout <= 0) {
+          throw new Error(usage);
+        }
+        timeout = params.timeout;
+      }
+      if (params.mode !== undefined && params.mode !== "all" && params.mode !== "any") {
+        throw new Error(usage);
+      }
+      const rawNames: string[] = [];
+      let explicitAll = false;
+      if (params.name) {
+        for (const token of params.name.trim().split(/\s+/).filter(Boolean)) {
+          if (token === "--all") explicitAll = true;
+          else if (token.startsWith("-")) throw new Error(usage);
+          else if (!rawNames.includes(token)) rawNames.push(token);
+        }
+      }
+      if (Array.isArray(params.names)) {
+        for (const n of params.names) {
+          const token = String(n).trim();
+          if (!token) continue;
+          if (token === "--all") explicitAll = true;
+          else if (token.startsWith("-")) throw new Error(usage);
+          else if (!rawNames.includes(token)) rawNames.push(token);
+        }
+      }
+      if (explicitAll && rawNames.length > 0) {
+        throw new Error(usage);
+      }
+      const target: WaitTarget =
+        explicitAll || rawNames.length === 0
+          ? { kind: "all" }
+          : { kind: "members", names: rawNames };
+      return {
+        action: "wait",
+        target,
+        ...(params.mode ? { mode: params.mode } : {}),
+        ...(timeout !== undefined ? { timeout } : {}),
+      };
     }
     case "log": {
       if (!params.name) throw new Error("log requires name");

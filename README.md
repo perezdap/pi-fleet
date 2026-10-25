@@ -32,6 +32,7 @@ fleet: 3 members (2 active)
 | `/fleet spawn [--role r] [--model m] [--over ref] <name> <task…>` | Start a member |
 | `/fleet resume <name> [extra…]` | Continue a stale/stopped member on its existing worktree |
 | `/fleet send <name> <message…>` | Steer a busy member, or prompt an idle one |
+| `/fleet wait [name\|--all] [--any] [--timeout <sec>]` | Wait for member(s) to settle or raise a question |
 | `/fleet log <name> [n]` | Tail the member's recorded activity |
 | `/fleet merge <name\|--done>` | Merge a member branch into HEAD (aborts + reports on conflict) |
 | `/fleet stop <name\|--all>` | Abort + kill member process(es) |
