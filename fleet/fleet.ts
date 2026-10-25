@@ -55,15 +55,23 @@ export interface FleetUi {
   setWidget(lines: string[]): void;
 }
 
-interface SpawnOptions {
-  name: string;
-  task: string;
-  role?: RoleName;
-  model?: string;
-  over?: string;
-  transient?: boolean;
+interface SpawnOptions extends SpawnMemberInput {
   extra?: string;
   preserveTask?: boolean;
+}
+
+interface SpawnPlan {
+  o: SpawnOptions;
+  existing: Member | undefined;
+  resume: boolean;
+  role: RoleName;
+  spec: ReturnType<typeof resolveRoleSpec>;
+  model?: string;
+  branch: string;
+  wt: string;
+  effectiveOver?: string;
+  range: CommitRange | undefined;
+  baseRef: string;
 }
 
 interface StatusRow {
@@ -315,8 +323,7 @@ export class Fleet {
       const man = await this.manifest();
 
       const seenNames = new Set<string>();
-      let netNewActiveCount = 0;
-      for (const o of batch) {
+      const candidates = batch.map((o) => {
         if (!NAME_RE.test(o.name)) {
           throw new Error(`invalid member name '${o.name}' (use lowercase letters, digits, dashes)`);
         }
@@ -330,34 +337,21 @@ export class Fleet {
         if (existing && !resume) {
           throw new Error(`member '${o.name}' already exists with status '${existing.status}'`);
         }
-        if (!existing || !isActiveStatus(existing.status)) {
-          netNewActiveCount++;
-        }
-      }
+        return { o, existing, resume };
+      });
 
+      const netNewActiveCount = candidates.filter(
+        ({ existing }) => !existing || !isActiveStatus(existing.status),
+      ).length;
       const live = Object.values(man.members).filter((m) => isActiveStatus(m.status)).length;
       const maxMembers = cfg.maxMembers ?? 6;
       if (live + netNewActiveCount > maxMembers) {
         throw new Error(`fleet is at max members (${maxMembers}); stop or clean one first`);
       }
 
-      const plans: Array<{
-        o: SpawnOptions;
-        existing: Member | undefined;
-        resume: boolean;
-        role: RoleName;
-        spec: ReturnType<typeof resolveRoleSpec>;
-        model?: string;
-        branch: string;
-        wt: string;
-        effectiveOver?: string;
-        range: CommitRange | undefined;
-        baseRef: string;
-      }> = [];
+      const plans: SpawnPlan[] = [];
 
-      for (const o of batch) {
-        const existing = man.members[o.name];
-        const resume = !!existing && RESUMABLE.has(existing.status);
+      for (const { o, existing, resume } of candidates) {
         const role: RoleName = o.role ?? (resume ? existing!.role : (cfg.defaultRole ?? "coder"));
         const spec = resolveRoleSpec(cfg, role);
         const model = o.model ?? spec.model;
@@ -714,21 +708,26 @@ export class Fleet {
     return lines;
   }
 
-  private async stop(name: string): Promise<void> {
+  private async killAttachedClient(name: string): Promise<boolean> {
     const client = this.clients.get(name);
+    if (!client) return false;
+    this.clients.delete(name);
+    this.unwatchAsk(name);
+    await client.abort().catch(() => undefined);
+    await client.kill();
+    return true;
+  }
+
+  private async stop(name: string): Promise<void> {
+    const hadClient = await this.killAttachedClient(name);
     const man = await this.manifest();
     const member = man.members[name];
     const canKillDetached =
       !!member && (isActiveStatus(member.status) || member.status === "detached");
-    if (client) {
-      this.clients.delete(name);
-      this.unwatchAsk(name);
-      await client.abort().catch(() => undefined);
-      await client.kill();
-    } else if (canKillDetached && member.pid && isPidAlive(member.pid)) {
+    if (!hadClient && canKillDetached && member.pid && isPidAlive(member.pid)) {
       await killProcessTree(member.pid);
     }
-    if (member && (canKillDetached || !!client)) {
+    if (member && (canKillDetached || hadClient)) {
       member.status = "stopped";
       member.pid = undefined;
       member.updatedAt = Date.now();
@@ -1017,13 +1016,7 @@ export class Fleet {
       const current = man.members[name];
       if (!current || current.status === "failed") return;
       await this.recordCompletedTransient(current);
-      const client = this.clients.get(name);
-      if (client) {
-        this.clients.delete(name);
-        this.unwatchAsk(name);
-        await client.abort().catch(() => undefined);
-        await client.kill();
-      }
+      await this.killAttachedClient(name);
       await this.clean(name, false);
     } finally {
       this.cleaningTransient.delete(name);
@@ -1147,6 +1140,26 @@ function parseWaitTimeout(raw: unknown): number {
   const sec = typeof raw === "number" ? raw : Number(raw);
   if (!Number.isFinite(sec) || sec <= 0) throw new Error(WAIT_USAGE);
   return sec;
+}
+
+function parseSpawnMemberInput(raw: any, missingMsg: string): SpawnMemberInput {
+  if (!raw || typeof raw !== "object" || !raw.name || !raw.task) {
+    throw new Error(missingMsg);
+  }
+  if (raw.role !== undefined && !ROLE_NAMES.includes(raw.role)) {
+    throw new Error(`invalid role '${raw.role}'`);
+  }
+  if (raw.transient !== undefined && typeof raw.transient !== "boolean") {
+    throw new Error("transient must be a boolean");
+  }
+  return {
+    name: raw.name,
+    task: raw.task,
+    ...(raw.role ? { role: raw.role } : {}),
+    ...(raw.model ? { model: raw.model } : {}),
+    ...(raw.over ? { over: raw.over } : {}),
+    ...(raw.transient !== undefined ? { transient: raw.transient } : {}),
+  };
 }
 
 function parseWaitTarget(tokens: string[]): WaitTarget {
@@ -1351,42 +1364,14 @@ export function toolParamsToCommand(params: {
         if (!Array.isArray(params.members) || params.members.length === 0) {
           throw new Error("spawn members must be a non-empty array");
         }
-        const members: SpawnMemberInput[] = params.members.map((m) => {
-          if (!m || typeof m !== "object" || !m.name || !m.task) {
-            throw new Error("each spawn member requires name and task");
-          }
-          if (m.role !== undefined && !ROLE_NAMES.includes(m.role)) {
-            throw new Error(`invalid role '${m.role}'`);
-          }
-          if (m.transient !== undefined && typeof m.transient !== "boolean") {
-            throw new Error("transient must be a boolean");
-          }
-          return {
-            name: m.name,
-            task: m.task,
-            ...(m.role ? { role: m.role } : {}),
-            ...(m.model ? { model: m.model } : {}),
-            ...(m.over ? { over: m.over } : {}),
-            ...(m.transient !== undefined ? { transient: m.transient } : {}),
-          };
-        });
+        const members = params.members.map((m) =>
+          parseSpawnMemberInput(m, "each spawn member requires name and task"),
+        );
         return { action: "spawn", members };
-      }
-      if (!params.name || !params.task) throw new Error("spawn requires name and task");
-      if (params.role !== undefined && !ROLE_NAMES.includes(params.role)) {
-        throw new Error(`invalid role '${params.role}'`);
-      }
-      if (params.transient !== undefined && typeof params.transient !== "boolean") {
-        throw new Error("transient must be a boolean");
       }
       return {
         action: "spawn",
-        name: params.name,
-        task: params.task,
-        ...(params.role ? { role: params.role } : {}),
-        ...(params.model ? { model: params.model } : {}),
-        ...(params.over ? { over: params.over } : {}),
-        ...(params.transient !== undefined ? { transient: params.transient } : {}),
+        ...parseSpawnMemberInput(params, "spawn requires name and task"),
       };
     }
     case "resume": {

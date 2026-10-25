@@ -65,7 +65,7 @@ export interface Member {
   status: MemberStatus;
   /** First line of FLEET_ASK.md if the member raised a question. */
   needsAttention?: string;
-  /** Full DONE: completion message emitted by the member. */
+  /** Full DONE: or FAILED: terminal message emitted by the member. */
   result?: string;
   /** Whether the member is automatically cleaned after a clean finish. */
   transient?: boolean;
@@ -114,15 +114,7 @@ export interface SpawnMemberInput {
 export type FleetCommand =
   | { action: "help" }
   | { action: "status" }
-  | {
-      action: "spawn";
-      name: string;
-      task: string;
-      role?: RoleName;
-      model?: string;
-      over?: string;
-      transient?: boolean;
-    }
+  | ({ action: "spawn" } & SpawnMemberInput)
   | {
       action: "spawn";
       members: SpawnMemberInput[];

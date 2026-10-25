@@ -15,3 +15,7 @@ _Avoid_: Subagent, worker, child
 **Clean**:
 The removal of a member's worktree and manifest entry, plus its branch when already merged.
 _Avoid_: Delete, wipe, purge
+
+**Transient**:
+A member that is automatically cleaned when it finishes cleanly, configured per spawn (`transient`) or defaulted per role (`autoClean`).
+_Avoid_: Ephemeral, temporary, disposable

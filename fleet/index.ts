@@ -39,6 +39,32 @@ const Type = {
   },
 };
 
+function spawnOptionProps(suffix: string) {
+  return {
+    role: Type.Optional(
+      Type.Union(
+        ROLE_NAMES.map((r) => Type.Literal(r)),
+        { description: `Member role${suffix} (default coder)` },
+      ),
+    ),
+    model: Type.Optional(
+      Type.String({
+        description: `Model pattern for the member, e.g. anthropic/claude-opus-4-5:high${suffix}`,
+      }),
+    ),
+    over: Type.Optional(
+      Type.String({
+        description: `Base branch/ref the worktree starts from${suffix}`,
+      }),
+    ),
+    transient: Type.Optional(
+      Type.Boolean({
+        description: `Automatically clean the member after a clean finish${suffix}`,
+      }),
+    ),
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   const fleets = new Map<string, Fleet>();
 
@@ -164,55 +190,13 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
       task: Type.Optional(Type.String({ description: "Full task description (spawn only)" })),
-      role: Type.Optional(
-        Type.Union(
-          ROLE_NAMES.map((r) => Type.Literal(r)),
-          { description: "Member role (spawn only, default coder)" },
-        ),
-      ),
-      model: Type.Optional(
-        Type.String({
-          description:
-            "Model pattern for the member, e.g. anthropic/claude-opus-4-5:high (spawn only)",
-        }),
-      ),
-      over: Type.Optional(
-        Type.String({
-          description: "Base branch/ref the worktree starts from (spawn only)",
-        }),
-      ),
-      transient: Type.Optional(
-        Type.Boolean({
-          description: "Automatically clean the member after a clean finish (spawn only)",
-        }),
-      ),
+      ...spawnOptionProps(" (spawn only)"),
       members: Type.Optional(
         Type.Array(
           Type.Object({
             name: Type.String({ description: "Member name" }),
             task: Type.String({ description: "Full task description" }),
-            role: Type.Optional(
-              Type.Union(
-                ROLE_NAMES.map((r) => Type.Literal(r)),
-                { description: "Member role (default coder)" },
-              ),
-            ),
-            model: Type.Optional(
-              Type.String({
-                description:
-                  "Model pattern for the member, e.g. anthropic/claude-opus-4-5:high",
-              }),
-            ),
-            over: Type.Optional(
-              Type.String({
-                description: "Base branch/ref the worktree starts from",
-              }),
-            ),
-            transient: Type.Optional(
-              Type.Boolean({
-                description: "Automatically clean the member after a clean finish",
-              }),
-            ),
+            ...spawnOptionProps(""),
           }),
           {
             description: "Batch of members to spawn in parallel (spawn only)",
