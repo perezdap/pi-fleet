@@ -966,4 +966,171 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       await h.cleanup();
     }
   });
+
+  it("writes review-context.md with target, diff base, assignment, commits, and diff for reviewer with --over branch, and not for coder", async () => {
+    const h = await createHarness();
+    try {
+      const apiMember = await h.seedMember("api", "done", { unmergedCommit: true });
+      await h.runTool({
+        action: "spawn",
+        name: "impl",
+        role: "coder",
+        over: "fleet/api",
+        task: "Follow-up coder work",
+      });
+      await h.runTool({
+        action: "spawn",
+        name: "rev-branch",
+        role: "reviewer",
+        over: "fleet/api",
+        task: "Check api changes for regressions",
+      });
+      await h.runCommand("stop --all");
+
+      const coderCtxPath = path.join(h.root, ".pi", "fleet", "wt", "impl", ".pi", "fleet", "review-context.md");
+      const revCtxPath = path.join(h.root, ".pi", "fleet", "wt", "rev-branch", ".pi", "fleet", "review-context.md");
+      const content = await readFile(revCtxPath, "utf8");
+
+      assert.deepEqual(
+        {
+          coderHasReviewContext: existsSync(coderCtxPath),
+          hasTarget: content.includes("Target: `fleet/api`"),
+          hasDiffBase: content.includes(`Diff base: \`${apiMember.baseRef}\``),
+          hasAssignment: content.includes("## Assignment\n\nCheck api changes for regressions"),
+          hasCommit: content.includes("work by api"),
+          hasDiff: content.includes("api.txt"),
+        },
+        {
+          coderHasReviewContext: false,
+          hasTarget: true,
+          hasDiffBase: true,
+          hasAssignment: true,
+          hasCommit: true,
+          hasDiff: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("writes review-context.md when spawning a reviewer without --over", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "rev-default",
+        role: "reviewer",
+        task: "Audit current HEAD state",
+      });
+      await h.runCommand("stop --all");
+
+      const man = await loadManifest(h.root);
+      const revCtxPath = path.join(h.root, ".pi", "fleet", "wt", "rev-default", ".pi", "fleet", "review-context.md");
+      const exists = existsSync(revCtxPath);
+      const content = exists ? await readFile(revCtxPath, "utf8") : "";
+
+      assert.deepEqual(
+        {
+          exists,
+          hasTarget: content.includes(`Target: \`${man.members["rev-default"].baseRef}\``),
+          hasDiffBase: content.includes("Diff base: `HEAD`"),
+          hasAssignment: content.includes("## Assignment\n\nAudit current HEAD state"),
+          hasNoCommits: content.includes("## Commits\n\n(no commits)"),
+        },
+        {
+          exists: true,
+          hasTarget: true,
+          hasDiffBase: true,
+          hasAssignment: true,
+          hasNoCommits: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("supports two-dot and three-dot commit ranges in --over for reviewer members", async () => {
+    const h = await createHarness();
+    try {
+      await git(h.root, "checkout", "-b", "feature");
+      await writeFile(path.join(h.root, "v1.txt"), "v1\n", "utf8");
+      await git(h.root, "add", "v1.txt");
+      await git(h.root, "commit", "-m", "add v1");
+      const v1Rev = await headRev(h.root, "HEAD");
+
+      await writeFile(path.join(h.root, "v2.txt"), "v2\n", "utf8");
+      await git(h.root, "add", "v2.txt");
+      await git(h.root, "commit", "-m", "add v2");
+      const featureHead = await headRev(h.root, "HEAD");
+
+      await git(h.root, "checkout", "main");
+      await writeFile(path.join(h.root, "main-only.txt"), "main\n", "utf8");
+      await git(h.root, "add", "main-only.txt");
+      await git(h.root, "commit", "-m", "advance main");
+
+      const twoDotRes = await h.runTool({
+        action: "spawn",
+        name: "rev-two-dot",
+        role: "reviewer",
+        over: `${v1Rev}..feature`,
+        task: "Review v2 commit range",
+      });
+      const threeDotRes = await h.runTool({
+        action: "spawn",
+        name: "rev-three-dot",
+        role: "reviewer",
+        over: "main...feature",
+        task: "Review feature branch against main merge-base",
+      });
+      await h.runCommand("stop --all");
+
+      const twoDotWt = path.join(h.root, ".pi", "fleet", "wt", "rev-two-dot");
+      const threeDotWt = path.join(h.root, ".pi", "fleet", "wt", "rev-three-dot");
+      const twoDotCtx = await readFile(path.join(twoDotWt, ".pi", "fleet", "review-context.md"), "utf8");
+      const threeDotCtx = await readFile(path.join(threeDotWt, ".pi", "fleet", "review-context.md"), "utf8");
+
+      assert.deepEqual(
+        {
+          twoDotError: twoDotRes.isError,
+          threeDotError: threeDotRes.isError,
+          twoDotHead: await headRev(twoDotWt, "HEAD"),
+          threeDotHead: await headRev(threeDotWt, "HEAD"),
+          twoDotDiffBase: twoDotCtx.includes(`Diff base: \`${v1Rev}\``),
+          twoDotHasV2Commit: twoDotCtx.includes("add v2"),
+          twoDotHasV1Commit: twoDotCtx.includes("add v1"),
+          twoDotHasV2Diff: twoDotCtx.includes("v2.txt"),
+          twoDotHasV1Diff: twoDotCtx.includes("v1.txt"),
+          threeDotDiffBase: threeDotCtx.includes("Diff base: `main`"),
+          threeDotHasV1Commit: threeDotCtx.includes("add v1"),
+          threeDotHasV2Commit: threeDotCtx.includes("add v2"),
+          threeDotHasMainOnlyCommit: threeDotCtx.includes("advance main"),
+          threeDotHasV1Diff: threeDotCtx.includes("v1.txt"),
+          threeDotHasV2Diff: threeDotCtx.includes("v2.txt"),
+          threeDotHasMainOnlyDiff: threeDotCtx.includes("main-only.txt"),
+        },
+        {
+          twoDotError: false,
+          threeDotError: false,
+          twoDotHead: featureHead,
+          threeDotHead: featureHead,
+          twoDotDiffBase: true,
+          twoDotHasV2Commit: true,
+          twoDotHasV1Commit: false,
+          twoDotHasV2Diff: true,
+          twoDotHasV1Diff: false,
+          threeDotDiffBase: true,
+          threeDotHasV1Commit: true,
+          threeDotHasV2Commit: true,
+          threeDotHasMainOnlyCommit: false,
+          threeDotHasV1Diff: true,
+          threeDotHasV2Diff: true,
+          threeDotHasMainOnlyDiff: false,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
