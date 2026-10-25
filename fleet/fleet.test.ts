@@ -1710,7 +1710,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     }
   });
 
-  it("auto-cleans transient members on clean process exit (exitCode 0) and preserves them on spawn failure, non-zero exit, or FAILED report", async () => {
+  it("preserves transient members when spawn fails, process exits without DONE (code 0 or non-zero), or member reports FAILED", async () => {
     const h = await createHarness();
     try {
       await h.runTool({
@@ -1749,8 +1749,8 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
 
       assert.deepEqual(
         {
-          exit0WaitStatusDone: !exit0Wait.isError && exit0Wait.text.includes("status=done"),
-          exit0InManifest: "trans-exit-0" in man.members,
+          exit0WaitStatusFailed: !exit0Wait.isError && exit0Wait.text.includes("status=failed"),
+          exit0Status: man.members["trans-exit-0"]?.status,
           exit0WorktreeExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "trans-exit-0")),
           exit0BranchExists: await branchExists(h.root, "fleet/trans-exit-0"),
           spawnFailError: spawnFailRes.isError,
@@ -1765,10 +1765,10 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           failedMsgBranchExists: await branchExists(h.root, "fleet/trans-failed-msg"),
         },
         {
-          exit0WaitStatusDone: true,
-          exit0InManifest: false,
-          exit0WorktreeExists: false,
-          exit0BranchExists: false,
+          exit0WaitStatusFailed: true,
+          exit0Status: "failed",
+          exit0WorktreeExists: true,
+          exit0BranchExists: true,
           spawnFailError: true,
           spawnFailStatus: "failed",
           spawnFailWorktreeExists: true,

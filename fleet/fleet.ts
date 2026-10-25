@@ -978,11 +978,11 @@ export class Fleet {
     const man = await this.manifest();
     const member = man.members[name];
     if (!member) return;
+    if (member.status === "done" && client.exitCode === 0 && member.transient) {
+      await this.completeAndCleanTransient(member);
+      return;
+    }
     if (isActiveStatus(member.status)) {
-      if (client.exitCode === 0 && member.transient && member.status !== "starting") {
-        await this.completeAndCleanTransient(member);
-        return;
-      }
       member.status = "failed";
       member.pid = undefined;
       member.updatedAt = Date.now();
