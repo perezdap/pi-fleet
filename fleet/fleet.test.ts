@@ -362,6 +362,53 @@ describe("toolParamsToCommand", () => {
     );
   });
 
+  it("maps batch spawn members and rejects empty, mixed, or invalid member entries", () => {
+    assert.deepEqual(
+      toolParamsToCommand({
+        action: "spawn",
+        members: [
+          { name: "rev-std", task: "Standards review", role: "reviewer", over: "main..HEAD" },
+          { name: "coder-1", task: "Implement feature", model: "openai/gpt-5" },
+        ],
+      }),
+      {
+        action: "spawn",
+        members: [
+          { name: "rev-std", task: "Standards review", role: "reviewer", over: "main..HEAD" },
+          { name: "coder-1", task: "Implement feature", model: "openai/gpt-5" },
+        ],
+      },
+    );
+
+    assert.throws(() => toolParamsToCommand({ action: "spawn", members: [] }), /non-empty/);
+    assert.throws(
+      () =>
+        toolParamsToCommand({
+          action: "spawn",
+          name: "single",
+          task: "Single task",
+          members: [{ name: "m1", task: "Task 1" }],
+        }),
+      /cannot mix|requires/i,
+    );
+    assert.throws(
+      () =>
+        toolParamsToCommand({
+          action: "spawn",
+          members: [{ name: "m1", task: "" }],
+        }),
+      /name and task/i,
+    );
+    assert.throws(
+      () =>
+        toolParamsToCommand({
+          action: "spawn",
+          members: [{ name: "m1", task: "Task 1", role: "bogus" as any }],
+        }),
+      /role/i,
+    );
+  });
+
   it("maps resume message to extra instructions", () => {
     assert.deepEqual(
       toolParamsToCommand({
@@ -1189,6 +1236,204 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           threeDotHasV1Diff: true,
           threeDotHasV2Diff: true,
           threeDotHasMainOnlyDiff: false,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("spawns a batch of members concurrently via members array and registers all in manifest.json", async () => {
+    const h = await createHarness();
+    try {
+      const res = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "rev-standards", role: "reviewer", task: "DELAY_DONE:80:DONE: standards ok" },
+          { name: "rev-spec", role: "reviewer", task: "DELAY_DONE:80:DONE: spec ok" },
+          { name: "coder-fix", role: "coder", task: "DELAY_DONE:80:DONE: fix applied" },
+        ],
+      });
+      const manAfterSpawn = await loadManifest(h.root);
+      const waitRes = await h.runTool({ action: "wait", name: "--all" });
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          isError: res.isError,
+          lines: res.text.split("\n"),
+          manifestNames: Object.keys(manAfterSpawn.members).sort(),
+          roles: {
+            standards: manAfterSpawn.members["rev-standards"]?.role,
+            spec: manAfterSpawn.members["rev-spec"]?.role,
+            coder: manAfterSpawn.members["coder-fix"]?.role,
+          },
+          allSettledInWait:
+            waitRes.text.includes("DONE: standards ok") &&
+            waitRes.text.includes("DONE: spec ok") &&
+            waitRes.text.includes("DONE: fix applied"),
+        },
+        {
+          isError: false,
+          lines: [
+            "fleet: spawned 'rev-standards' (reviewer) on fleet/rev-standards",
+            "fleet: spawned 'rev-spec' (reviewer) on fleet/rev-spec",
+            "fleet: spawned 'coder-fix' (coder) on fleet/coder-fix",
+          ],
+          manifestNames: ["coder-fix", "rev-spec", "rev-standards"],
+          roles: {
+            standards: "reviewer",
+            spec: "reviewer",
+            coder: "coder",
+          },
+          allSettledInWait: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("validates the entire spawn batch upfront and rejects without partial spawns when exceeding maxMembers or invalid", async () => {
+    const h = await createHarness();
+    try {
+      const cfgPath = path.join(h.root, ".pi", "fleet", "config.json");
+      const cfg = JSON.parse(await readFile(cfgPath, "utf8"));
+      await writeFile(cfgPath, JSON.stringify({ ...cfg, maxMembers: 2 }), "utf8");
+
+      const dupRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "m-dup", task: "First" },
+          { name: "m-dup", task: "Duplicate" },
+        ],
+      });
+
+      const invalidSecondRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "valid-first", task: "Should not be created" },
+          { name: "INVALID_NAME", task: "Bad name" },
+        ],
+      });
+
+      const overLimitRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "m1", task: "Task 1" },
+          { name: "m2", task: "Task 2" },
+          { name: "m3", task: "Task 3 exceeds maxMembers=2" },
+        ],
+      });
+
+      const manAfterRejected = await loadManifest(h.root);
+      const validFirstWtExists = existsSync(path.join(h.root, ".pi", "fleet", "wt", "valid-first"));
+      const m1WtExists = existsSync(path.join(h.root, ".pi", "fleet", "wt", "m1"));
+
+      await h.seedMember("existing-active", "running");
+      const conflictExistingRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "uncreated-peer", task: "Should not be created" },
+          { name: "existing-active", task: "Already running" },
+        ],
+      });
+      const overLimitWithActiveRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "batch-a", task: "Task A" },
+          { name: "batch-b", task: "Task B pushes live 1 + 2 > 2" },
+        ],
+      });
+      const manAfterActiveChecks = await loadManifest(h.root);
+
+      assert.deepEqual(
+        {
+          dupError: dupRes.isError,
+          invalidSecondError: invalidSecondRes.isError,
+          overLimitError: overLimitRes.isError && overLimitRes.text.includes("fleet is at max members (2)"),
+          membersAfterRejected: Object.keys(manAfterRejected.members),
+          validFirstWtExists,
+          m1WtExists,
+          conflictExistingError:
+            conflictExistingRes.isError &&
+            conflictExistingRes.text.includes("member 'existing-active' already exists with status 'running'"),
+          overLimitWithActiveError:
+            overLimitWithActiveRes.isError &&
+            overLimitWithActiveRes.text.includes("fleet is at max members (2)"),
+          membersAfterActiveChecks: Object.keys(manAfterActiveChecks.members),
+        },
+        {
+          dupError: true,
+          invalidSecondError: true,
+          overLimitError: true,
+          membersAfterRejected: [],
+          validFirstWtExists: false,
+          m1WtExists: false,
+          conflictExistingError: true,
+          overLimitWithActiveError: true,
+          membersAfterActiveChecks: ["existing-active"],
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("serializes manifest writes and preserves all members across concurrent spawn calls and status updates", async () => {
+    const h = await createHarness();
+    try {
+      const m1 = await loadManifest(h.root);
+      const m2 = await loadManifest(h.root);
+      await Promise.all([
+        saveManifest(m1),
+        saveManifest(m2),
+        saveManifest(m1),
+        saveManifest(m2),
+      ]);
+
+      const spawnResults = await Promise.all([
+        h.runTool({
+          action: "spawn",
+          name: "c1",
+          task: "FINISH_NOW:DONE: c1 finished",
+        }),
+        h.runTool({
+          action: "spawn",
+          name: "c2",
+          task: "FINISH_NOW:DONE: c2 finished",
+        }),
+        h.runTool({
+          action: "spawn",
+          name: "c3",
+          task: "FINISH_NOW:DONE: c3 finished",
+        }),
+      ]);
+
+      const waitRes = await h.runTool({ action: "wait", name: "--all" });
+      await h.runCommand("stop --all");
+      const finalMan = await loadManifest(h.root);
+
+      assert.deepEqual(
+        {
+          anySpawnError: spawnResults.some((r) => r.isError),
+          waitError: waitRes.isError,
+          manifestMembers: Object.keys(finalMan.members).sort(),
+          results: {
+            c1: finalMan.members.c1?.result,
+            c2: finalMan.members.c2?.result,
+            c3: finalMan.members.c3?.result,
+          },
+        },
+        {
+          anySpawnError: false,
+          waitError: false,
+          manifestMembers: ["c1", "c2", "c3"],
+          results: {
+            c1: "DONE: c1 finished",
+            c2: "DONE: c2 finished",
+            c3: "DONE: c3 finished",
+          },
         },
       );
     } finally {

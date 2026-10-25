@@ -98,6 +98,14 @@ export type WaitTarget =
   | { kind: "all" }
   | { kind: "members"; names: string[] };
 
+export interface SpawnMemberInput {
+  name: string;
+  task: string;
+  role?: RoleName;
+  model?: string;
+  over?: string;
+}
+
 export type FleetCommand =
   | { action: "help" }
   | { action: "status" }
@@ -108,6 +116,10 @@ export type FleetCommand =
       role?: RoleName;
       model?: string;
       over?: string;
+    }
+  | {
+      action: "spawn";
+      members: SpawnMemberInput[];
     }
   | {
       action: "resume";
