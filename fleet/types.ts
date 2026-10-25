@@ -65,7 +65,7 @@ export interface Member {
   status: MemberStatus;
   /** First line of FLEET_ASK.md if the member raised a question. */
   needsAttention?: string;
-  /** Full DONE: or FAILED: terminal message emitted by the member. */
+  /** Full DONE: or FAILED: message emitted by the member. */
   result?: string;
   /** Whether the member is automatically cleaned after a clean finish. */
   transient?: boolean;

@@ -121,11 +121,6 @@ async function createHarness(): Promise<TestHarness> {
   await writeFile(path.join(rawRoot, "README.md"), "initial\n", "utf8");
   await git(rawRoot, "add", "README.md");
   await git(rawRoot, "commit", "-m", "initial");
-  await writeFile(
-    path.join(rawRoot, ".git", "info", "exclude"),
-    ".rpc-received.jsonl\nsession.json\n",
-    "utf8",
-  );
 
   const root = await git(rawRoot, "rev-parse", "--show-toplevel");
   const baseRef = await headRev(root);
@@ -713,7 +708,8 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         await h.seedMember(`keep-${status}`, status);
       }
 
-      const directDetachedClean = await h.runTool({ action: "clean", name: "fin-detached" });
+      await h.seedMember("direct-detached", "detached");
+      const directDetachedClean = await h.runTool({ action: "clean", name: "direct-detached" });
       await h.seedMember("dirty-stopped", "stopped");
       await writeFile(path.join(h.root, ".pi", "fleet", "wt", "dirty-stopped", "uncommitted.txt"), "dirty\n", "utf8");
       const dirtyCleanWithoutForce = await h.runTool({ action: "clean", name: "dirty-stopped" });
@@ -724,7 +720,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
 
       assert.deepEqual(
         {
-          directDetachedCleanError: directDetachedClean.isError,
+          directDetachedCleanOk: !directDetachedClean.isError,
           dirtyCleanRejectedWithoutForce: dirtyCleanWithoutForce.isError,
           remaining: Object.keys(man.members).sort(),
           mergedBranchGone: !(await branchExists(h.root, "fleet/fin-merged")),
@@ -736,7 +732,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           errors: h.errors(),
         },
         {
-          directDetachedCleanError: true,
+          directDetachedCleanOk: true,
           dirtyCleanRejectedWithoutForce: true,
           remaining: ["keep-idle", "keep-running", "keep-starting"],
           mergedBranchGone: true,
@@ -1512,6 +1508,17 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       const rollbackFirstWtExists = existsSync(path.join(h.root, ".pi", "fleet", "wt", "rollback-first"));
       const rollbackFirstBranchExists = await branchExists(h.root, "fleet/rollback-first");
 
+      await h.seedMember("resumable-done", "done", { result: "DONE: prior result" });
+      const resumeThenBadSecondRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "resumable-done", task: "Would re-spawn if batch succeeded" },
+          { name: "bad-second-2", over: "nonexistent-ref", task: "Fails validation" },
+        ],
+      });
+      const manAfterResumeRejected = await loadManifest(h.root);
+      await h.runTool({ action: "clean", name: "resumable-done", force: true });
+
       await h.seedMember("existing-active", "running");
       const conflictExistingRes = await h.runTool({
         action: "spawn",
@@ -1535,6 +1542,9 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           invalidSecondError: invalidSecondRes.isError,
           overLimitError: overLimitRes.isError && overLimitRes.text.includes("fleet is at max members (2)"),
           badSecondRefError: badSecondRefRes.isError,
+          resumeThenBadSecondError: resumeThenBadSecondRes.isError,
+          resumablePreservedStatus: manAfterResumeRejected.members["resumable-done"]?.status,
+          resumablePreservedResult: manAfterResumeRejected.members["resumable-done"]?.result,
           membersAfterRejected: Object.keys(manAfterRejected.members),
           validFirstWtExists,
           m1WtExists,
@@ -1553,6 +1563,9 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           invalidSecondError: true,
           overLimitError: true,
           badSecondRefError: true,
+          resumeThenBadSecondError: true,
+          resumablePreservedStatus: "done",
+          resumablePreservedResult: "DONE: prior result",
           membersAfterRejected: [],
           validFirstWtExists: false,
           m1WtExists: false,

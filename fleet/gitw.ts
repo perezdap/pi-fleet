@@ -22,11 +22,22 @@ export function parseCommitRange(over?: string): CommitRange | undefined {
 const pExecFile = promisify(execFile);
 
 export async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await pExecFile("git", args, {
-    cwd,
-    maxBuffer: 32 * 1024 * 1024,
-  });
-  return stdout.trim();
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const { stdout } = await pExecFile("git", args, {
+        cwd,
+        maxBuffer: 32 * 1024 * 1024,
+      });
+      return stdout.trim();
+    } catch (err: any) {
+      const msg = String(err?.stderr ?? err?.message ?? err);
+      if (attempt < 10 && /\.lock['":\s]/i.test(msg)) {
+        await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 export async function tryGit(
