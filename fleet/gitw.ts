@@ -74,8 +74,13 @@ export async function branchMerged(root: string, branch: string): Promise<boolea
 }
 
 /** One-line commits on `branch` since `baseRef`. */
-export async function commitsSince(root: string, baseRef: string, branch: string): Promise<string[]> {
-  const r = await tryGit(root, "log", "--oneline", `${baseRef}..${branch}`);
+export async function commitsSince(
+  root: string,
+  baseRef: string,
+  branch: string,
+  dots: ".." | "..." = "..",
+): Promise<string[]> {
+  const r = await tryGit(root, "log", "--oneline", `${baseRef}${dots}${branch}`);
   return r.ok ? r.out.split("\n").filter(Boolean) : [];
 }
 
@@ -96,8 +101,14 @@ export async function mergeBranch(root: string, branch: string, message: string)
 }
 
 /** Diff stat between baseRef and branch (for review context). */
-export async function diffForReview(root: string, baseRef: string, branch: string): Promise<string> {
-  const stat = await tryGit(root, "diff", "--stat", `${baseRef}...${branch}`);
-  const diff = await tryGit(root, "diff", `${baseRef}...${branch}`);
+export async function diffForReview(
+  root: string,
+  baseRef: string,
+  branch: string,
+  dots: ".." | "..." = "...",
+): Promise<string> {
+  const range = `${baseRef}${dots}${branch}`;
+  const stat = await tryGit(root, "diff", "--stat", range);
+  const diff = await tryGit(root, "diff", range);
   return [stat.ok ? stat.out : "", diff.ok ? diff.out : ""].filter(Boolean).join("\n\n");
 }

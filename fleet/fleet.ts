@@ -273,7 +273,8 @@ export class Fleet {
 
     const branch = `fleet/${o.name}`;
     const wt = path.join(this.root, cfg.worktreeRoot ?? ".pi/fleet/wt", o.name);
-    const baseInput = o.over ?? (resume ? existing!.baseRef : (cfg.baseRef ?? "HEAD"));
+    const range = parseCommitRange(o.over);
+    const baseInput = range ? range.head : (o.over ?? (resume ? existing!.baseRef : (cfg.baseRef ?? "HEAD")));
     let baseRef: string;
 
     if (resume) {
@@ -325,7 +326,7 @@ export class Fleet {
         "utf8",
       );
 
-      if (role === "reviewer" && o.over) {
+      if (role === "reviewer") {
         await this.writeReviewContext(member, o.over);
       }
 
@@ -387,19 +388,22 @@ export class Fleet {
     });
   }
 
-  private async writeReviewContext(member: Member, target: string): Promise<void> {
+  private async writeReviewContext(member: Member, over?: string): Promise<void> {
+    const cfg = await this.config();
     const man = await this.manifest();
-    const targetName = target.replace(/^fleet\//, "");
-    const targetMember = man.members[targetName];
-    const diffBase = targetMember?.baseRef ?? (await this.config()).baseRef ?? "HEAD";
-    const commits = await commitsSince(this.root, diffBase, target).catch(() => [] as string[]);
-    const diff = await diffForReview(this.root, diffBase, target);
+    const range = parseCommitRange(over);
+    const target = range ? range.head : (over ?? member.baseRef);
+    const targetName = !range && over ? over.replace(/^fleet\//, "") : undefined;
+    const targetMember = targetName ? man.members[targetName] : undefined;
+    const diffBase = range ? range.base : (targetMember?.baseRef ?? cfg.baseRef ?? "HEAD");
+    const commits = await commitsSince(this.root, diffBase, target, range?.dots).catch(() => [] as string[]);
+    const diff = await diffForReview(this.root, diffBase, target, range?.dots);
     const dir = path.join(member.worktree, ".pi", "fleet");
     await mkdir(dir, { recursive: true });
     const commitList = commits.length ? commits.map((c) => `- ${c}`).join("\n") : "(no commits)";
     await writeFile(
       path.join(dir, "review-context.md"),
-      `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Commits\n\n${commitList}\n\n## Diff\n\n\`\`\`diff\n${diff}\n\`\`\`\n`,
+      `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Assignment\n\n${member.task}\n\n## Commits\n\n${commitList}\n\n## Diff\n\n\`\`\`diff\n${diff}\n\`\`\`\n`,
       "utf8",
     );
   }
@@ -686,6 +690,15 @@ export class Fleet {
 }
 
 // ── helpers & command parsers ────────────────────────────────────────────────
+
+function parseCommitRange(over?: string): { base: string; dots: ".." | "..."; head: string } | undefined {
+  if (!over) return undefined;
+  const match = /^(.*?)(\.{2,3})(.+)$/.exec(over);
+  if (!match) return undefined;
+  const [, base, dots, head] = match;
+  if (!base || !head || base.endsWith(".") || head.startsWith(".")) return undefined;
+  return { base, dots: dots as ".." | "...", head };
+}
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
