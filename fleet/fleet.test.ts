@@ -40,10 +40,19 @@ process.stdin.on("data", (chunk) => {
         success: true,
         data: {},
       }) + "\\n");
-      if (msg.type === "prompt" && typeof msg.message === "string" && msg.message.includes("FINISH_NOW")) {
+      const activeMsg =
+        typeof msg.message === "string"
+          ? msg.message.replace(/Original assignment:[\\s\\S]*?(?=\\n\\nAdditional instructions|$)/, "")
+          : "";
+      if (msg.type === "prompt" && activeMsg.includes("FINISH_NOW")) {
+        const customIdx = activeMsg.indexOf("FINISH_NOW:");
+        const content =
+          customIdx >= 0
+            ? activeMsg.slice(customIdx + "FINISH_NOW:".length)
+            : "DONE: finished work";
         process.stdout.write(JSON.stringify({
           type: "message_end",
-          message: { role: "assistant", content: "DONE: finished work" },
+          message: { role: "assistant", content },
         }) + "\\n");
       }
     }
@@ -618,6 +627,90 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       assert.deepEqual(
         { widget: h.widgetLines(), errors: h.errors() },
         { widget: undefined, errors: [] },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("persists full DONE message on member.result and clears it on resume or re-spawn", async () => {
+    const h = await createHarness();
+    try {
+      const fullDone = "DONE: implemented auth flow\n\nDetails:\n- added token validation\n- added refresh tests";
+      await h.runTool({
+        action: "spawn",
+        name: "finisher",
+        task: `FINISH_NOW:  ${fullDone}  \n`,
+      });
+      await new Promise((r) => setTimeout(r, 150));
+      const afterDone = await loadManifest(h.root);
+
+      await h.runCommand("stop finisher");
+      await h.runCommand('resume finisher "Continue with edge cases"');
+      const afterResume = await loadManifest(h.root);
+      await h.runCommand("stop finisher");
+
+      assert.deepEqual(
+        {
+          doneStatus: afterDone.members.finisher.status,
+          doneResult: afterDone.members.finisher.result,
+          resumedResult: afterResume.members.finisher.result,
+        },
+        {
+          doneStatus: "done",
+          doneResult: fullDone,
+          resumedResult: undefined,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("keeps the final DONE message untruncated in log while truncating earlier assistant messages", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("logger", "done");
+      const logPath = path.join(h.root, ".pi", "fleet", "logs", "logger.jsonl");
+      await mkdir(path.dirname(logPath), { recursive: true });
+
+      const longProgress = `Investigating module\n${"a".repeat(260)}`;
+      const earlierDone = `DONE: first attempt\n${"b".repeat(260)}`;
+      const finalDone = `DONE: final report\n\nSection 1:\n${"c".repeat(260)}\n\nSection 2: verified`;
+
+      await writeFile(
+        logPath,
+        [
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: longProgress },
+          }),
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: earlierDone },
+          }),
+          JSON.stringify({ type: "tool_execution_start", toolName: "bash" }),
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: finalDone },
+          }),
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      const logRes = await h.runTool({ action: "log", name: "logger", n: 10 });
+
+      assert.deepEqual(
+        {
+          progressTruncated: !logRes.text.includes("a".repeat(240)) && logRes.text.includes("assistant: Investigating module "),
+          earlierDoneTruncated: !logRes.text.includes("b".repeat(240)) && logRes.text.includes("assistant: DONE: first attempt "),
+          finalDoneUntruncated: logRes.text.includes(`assistant: ${finalDone}`),
+        },
+        {
+          progressTruncated: true,
+          earlierDoneTruncated: true,
+          finalDoneUntruncated: true,
+        },
       );
     } finally {
       await h.cleanup();

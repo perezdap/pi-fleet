@@ -105,6 +105,7 @@ export class Fleet {
 
   private clients = new Map<string, RpcMember>();
   private askWatchers = new Map<string, FSWatcher>();
+  private saveChain: Promise<void> = Promise.resolve();
   private cfg?: FleetConfig;
   private man?: Manifest;
 
@@ -125,10 +126,14 @@ export class Fleet {
   }
 
   private async save(): Promise<void> {
-    if (this.man) {
-      await saveManifest(this.man);
+    if (!this.man) return;
+    const man = this.man;
+    const op = this.saveChain.then(async () => {
+      await saveManifest(man);
       await this.refreshWidget();
-    }
+    });
+    this.saveChain = op.catch(() => undefined);
+    await op;
   }
 
   // ── command dispatch ─────────────────────────────────────────────────────
@@ -307,6 +312,7 @@ export class Fleet {
     }
     member.status = "starting";
     member.needsAttention = undefined;
+    member.result = undefined;
     member.updatedAt = now;
     man.members[o.name] = member;
     await this.save();
@@ -559,7 +565,11 @@ export class Fleet {
     } catch {
       return `(no log yet for '${name}')`;
     }
-    const entries: string[] = [];
+    const items: Array<
+      | { kind: "assistant"; text: string }
+      | { kind: "tool"; toolName: string }
+    > = [];
+    let lastDoneIdx = -1;
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       let ev: any;
@@ -570,11 +580,19 @@ export class Fleet {
       }
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const text = extractText(ev.message).trim();
-        if (text) entries.push(`assistant: ${truncate(text.replace(/\s+/g, " "), 220)}`);
+        if (text) {
+          if (isDoneText(text)) lastDoneIdx = items.length;
+          items.push({ kind: "assistant", text });
+        }
       } else if (ev.type === "tool_execution_start") {
-        entries.push(`tool: ${ev.toolName}`);
+        items.push({ kind: "tool", toolName: ev.toolName });
       }
     }
+    const entries = items.map((item, idx) => {
+      if (item.kind === "tool") return `tool: ${item.toolName}`;
+      if (idx === lastDoneIdx) return `assistant: ${item.text}`;
+      return `assistant: ${truncate(item.text.replace(/\s+/g, " "), 220)}`;
+    });
     const tail = entries.slice(-n);
     return tail.length ? tail.join("\n") : `(no activity logged for '${name}')`;
   }
@@ -634,8 +652,9 @@ export class Fleet {
       await this.save();
     } else if (ev.type === "message_end" && ev.message?.role === "assistant") {
       const text = extractText(ev.message);
-      if (/^\s*DONE:/im.test(text.slice(0, 500))) {
+      if (isDoneText(text)) {
         member.status = "done";
+        member.result = text.trim();
         member.updatedAt = Date.now();
         await this.save();
         this.ui.notify(`fleet member '${name}' reports DONE`, "info");
@@ -686,6 +705,10 @@ export class Fleet {
 }
 
 // ── helpers & command parsers ────────────────────────────────────────────────
+
+function isDoneText(text: string): boolean {
+  return /^\s*DONE:/im.test(text.slice(0, 500));
+}
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;

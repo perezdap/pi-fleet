@@ -61,6 +61,8 @@ export interface Member {
   status: MemberStatus;
   /** First line of FLEET_ASK.md if the member raised a question. */
   needsAttention?: string;
+  /** Full DONE: completion message emitted by the member. */
+  result?: string;
   createdAt: number;
   updatedAt: number;
 }
