@@ -2,6 +2,22 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import type { RangeDots } from "./types.ts";
+
+export interface CommitRange {
+  base: string;
+  dots: RangeDots;
+  head: string;
+}
+
+export function parseCommitRange(over?: string): CommitRange | undefined {
+  if (!over) return undefined;
+  const match = /^(.*?)(\.{2,3})(.+)$/.exec(over);
+  if (!match) return undefined;
+  const [, base, dots, head] = match;
+  if (!base || !head || base.endsWith(".") || head.startsWith(".")) return undefined;
+  return { base, dots: dots as RangeDots, head };
+}
 
 const pExecFile = promisify(execFile);
 
@@ -100,7 +116,7 @@ export async function diffForReview(
   root: string,
   baseRef: string,
   branch: string,
-  dots: ".." | "..." = "...",
+  dots: RangeDots = "...",
 ): Promise<string> {
   const range = `${baseRef}${dots}${branch}`;
   const stat = await tryGit(root, "diff", "--stat", range);

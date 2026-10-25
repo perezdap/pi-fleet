@@ -55,6 +55,8 @@ export interface Member {
   worktree: string;
   /** Commit the branch was created from. */
   baseRef: string;
+  /** Target ref or commit range passed via --over. */
+  over?: string;
   model?: string;
   pid?: number;
   sessionFile?: string;
@@ -88,6 +90,10 @@ export type CleanTarget =
   | { kind: "done" }
   | { kind: "all" };
 
+export type WaitMode = "all" | "any";
+
+export type RangeDots = ".." | "...";
+
 export type WaitTarget =
   | { kind: "all" }
   | { kind: "members"; names: string[] };
@@ -116,7 +122,7 @@ export type FleetCommand =
   | {
       action: "wait";
       target: WaitTarget;
-      mode?: "all" | "any";
+      mode?: WaitMode;
       timeout?: number;
     }
   | {

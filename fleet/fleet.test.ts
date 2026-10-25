@@ -378,6 +378,9 @@ describe("toolParamsToCommand", () => {
   });
 
   it("maps wait parameters for all, single name, and multiple names with mode and timeout", () => {
+    const usageRe = /usage: \/fleet wait \[name\|--all\] \[--any\] \[--timeout <sec>\]/;
+    assert.throws(() => toolParamsToCommand({ action: "wait", names: [] }), usageRe);
+    assert.throws(() => toolParamsToCommand({ action: "wait", name: "   " }), usageRe);
     assert.deepEqual(
       {
         allOmitted: toolParamsToCommand({ action: "wait" }),
@@ -876,6 +879,12 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         task: "WRITE_ASK:80:Should we support legacy tokens?",
       });
       const askWait = await h.runTool({ action: "wait", name: "m-ask" });
+      await h.runTool({
+        action: "send",
+        name: "m-ask",
+        message: "DELAY_DONE:100:DONE: answered and completed",
+      });
+      const afterSendWait = await h.runTool({ action: "wait", name: "m-ask" });
 
       await h.runTool({
         action: "spawn",
@@ -890,11 +899,16 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         {
           doneResolved: doneWait.text.includes("status=done") && doneWait.text.includes(asyncReport),
           askResolved: askWait.text.includes("ASK: Should we support legacy tokens?"),
+          afterSendBlockedUntilDone:
+            afterSendWait.text.includes("status=done") &&
+            afterSendWait.text.includes("DONE: answered and completed") &&
+            !afterSendWait.text.includes("ASK:"),
           crashResolved: crashWait.text.includes("status=failed"),
         },
         {
           doneResolved: true,
           askResolved: true,
+          afterSendBlockedUntilDone: true,
           crashResolved: true,
         },
       );
@@ -993,6 +1007,15 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       await h.runCommand("stop --all");
       const contentAfterResume = await readFile(revCtxPath, "utf8");
 
+      await h.runTool({
+        action: "spawn",
+        name: "rev-branch",
+        role: "reviewer",
+        task: "Fresh reviewer task without --over",
+      });
+      await h.runCommand("stop --all");
+      const contentAfterRespawnWithoutOver = await readFile(revCtxPath, "utf8");
+
       assert.deepEqual(
         {
           coderHasReviewContext: existsSync(coderCtxPath),
@@ -1002,6 +1025,9 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           hasCommit: content.includes("work by api"),
           hasDiff: content.includes("api.txt"),
           preservedOnResume: contentAfterResume.includes("Target: `fleet/api`") && contentAfterResume.includes("api.txt"),
+          refreshedOnRespawnWithoutOver:
+            contentAfterRespawnWithoutOver.includes("## Assignment\n\nFresh reviewer task without --over") &&
+            !contentAfterRespawnWithoutOver.includes("Target: `fleet/api`"),
         },
         {
           coderHasReviewContext: false,
@@ -1011,6 +1037,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           hasCommit: true,
           hasDiff: true,
           preservedOnResume: true,
+          refreshedOnRespawnWithoutOver: true,
         },
       );
     } finally {
@@ -1097,10 +1124,28 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       });
       await h.runCommand("stop --all");
 
+      await h.runTool({
+        action: "spawn",
+        name: "rev-default-then-range",
+        role: "reviewer",
+        task: "Initial review at main",
+      });
+      await h.runCommand("stop rev-default-then-range");
+      await h.runTool({
+        action: "spawn",
+        name: "rev-default-then-range",
+        role: "reviewer",
+        over: `${v1Rev}..feature`,
+        task: "Re-spawned reviewer on commit range",
+      });
+      await h.runCommand("stop --all");
+
       const twoDotWt = path.join(h.root, ".pi", "fleet", "wt", "rev-two-dot");
       const threeDotWt = path.join(h.root, ".pi", "fleet", "wt", "rev-three-dot");
+      const respawnRangeWt = path.join(h.root, ".pi", "fleet", "wt", "rev-default-then-range");
       const twoDotCtx = await readFile(path.join(twoDotWt, ".pi", "fleet", "review-context.md"), "utf8");
       const threeDotCtx = await readFile(path.join(threeDotWt, ".pi", "fleet", "review-context.md"), "utf8");
+      const respawnRangeCtx = await readFile(path.join(respawnRangeWt, ".pi", "fleet", "review-context.md"), "utf8");
 
       assert.deepEqual(
         {
@@ -1109,6 +1154,8 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           badBaseError: badBaseRes.isError,
           twoDotHead: await headRev(twoDotWt, "HEAD"),
           threeDotHead: await headRev(threeDotWt, "HEAD"),
+          respawnRangeHead: await headRev(respawnRangeWt, "HEAD"),
+          respawnRangeHasAssignment: respawnRangeCtx.includes("## Assignment\n\nRe-spawned reviewer on commit range"),
           twoDotDiffBase: twoDotCtx.includes(`Diff base: \`${v1Rev}\``),
           twoDotHasV2Commit: twoDotCtx.includes("add v2"),
           twoDotHasV1Commit: twoDotCtx.includes("add v1"),
@@ -1128,6 +1175,8 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           badBaseError: true,
           twoDotHead: featureHead,
           threeDotHead: featureHead,
+          respawnRangeHead: featureHead,
+          respawnRangeHasAssignment: true,
           twoDotDiffBase: true,
           twoDotHasV2Commit: true,
           twoDotHasV1Commit: false,

@@ -6,7 +6,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { loadFleetConfig, piBinary, resolveRoleSpec } from "./config.ts";
 import {
@@ -17,9 +17,12 @@ import {
   commitsSince,
   deleteBranch,
   diffForReview,
+  git,
   headRev,
   mergeBranch,
+  parseCommitRange,
   removeWorktree,
+  type CommitRange,
   type MergeResult,
 } from "./gitw.ts";
 import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
@@ -39,6 +42,7 @@ import {
   type NotifyLevel,
   type RoleName,
   type StopTarget,
+  type WaitMode,
   type WaitTarget,
 } from "./types.ts";
 
@@ -297,8 +301,11 @@ export class Fleet {
 
     const branch = `fleet/${o.name}`;
     const wt = path.join(this.root, cfg.worktreeRoot ?? ".pi/fleet/wt", o.name);
-    const range = parseCommitRange(o.over);
-    const baseInput = range ? range.head : (o.over ?? (resume ? existing!.baseRef : (cfg.baseRef ?? "HEAD")));
+    const effectiveOver = o.over ?? (o.preserveTask ? existing?.over : undefined);
+    const range = parseCommitRange(effectiveOver);
+    const baseInput = range
+      ? range.head
+      : (effectiveOver ?? (resume ? existing!.baseRef : (cfg.baseRef ?? "HEAD")));
     let baseRef: string;
 
     if (resume) {
@@ -309,12 +316,20 @@ export class Fleet {
         if (await branchExists(this.root, branch)) await attachWorktree(this.root, wt, branch);
         else throw new Error(`cannot resume '${o.name}': worktree and branch are gone; run /fleet clean ${o.name} first`);
       }
-      baseRef = existing!.baseRef;
+      if (!o.preserveTask && o.over) {
+        if (range) await headRev(this.root, range.base);
+        baseRef = await headRev(this.root, baseInput);
+        await git(wt, "reset", "--hard", baseRef);
+      } else {
+        baseRef = existing!.baseRef;
+      }
     } else {
       if (range) await headRev(this.root, range.base);
       baseRef = await headRev(this.root, baseInput);
       await addWorktree(this.root, wt, branch, baseRef);
     }
+
+    await rm(path.join(wt, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
 
     const now = Date.now();
     const member: Member = existing ?? {
@@ -334,6 +349,9 @@ export class Fleet {
     } else {
       member.model = model;
     }
+    member.role = role;
+    member.baseRef = baseRef;
+    member.over = effectiveOver;
     member.status = "starting";
     member.needsAttention = undefined;
     member.result = undefined;
@@ -356,10 +374,7 @@ export class Fleet {
       );
 
       if (role === "reviewer") {
-        const ctxPath = path.join(member.worktree, ".pi", "fleet", "review-context.md");
-        if (!resume || o.over || !existsSync(ctxPath)) {
-          await this.writeReviewContext(member, o.over, range);
-        }
+        await this.writeReviewContext(member, effectiveOver, range);
       }
 
       const sessionDir = path.join(this.root, cfg.sessionDir ?? ".pi/fleet/sessions");
@@ -384,7 +399,7 @@ export class Fleet {
       });
       this.clients.set(o.name, client);
       client.onEvent((ev) => void this.onMemberEvent(o.name, ev));
-      client.proc.on("close", () => void this.onClientExit(o.name, client));
+      client.onExit(() => void this.onClientExit(o.name, client));
       this.watchAsk(member);
 
       await client.waitReady();
@@ -446,6 +461,16 @@ export class Fleet {
 
   private async send(name: string, message: string): Promise<"steer" | "prompt"> {
     const client = this.mustClient(name);
+    const man = await this.manifest();
+    const member = man.members[name];
+    if (member) {
+      await rm(path.join(member.worktree, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
+      if (member.needsAttention) {
+        member.needsAttention = undefined;
+        member.updatedAt = Date.now();
+        await this.save();
+      }
+    }
     if (client.busy) {
       await client.steer(message);
       return "steer";
@@ -456,7 +481,7 @@ export class Fleet {
 
   private async waitForMembers(
     target: WaitTarget,
-    mode: "all" | "any",
+    mode: WaitMode,
     timeoutSec?: number,
   ): Promise<FleetResult> {
     const man = await this.manifest();
@@ -483,7 +508,7 @@ export class Fleet {
     const syncAsks = async (): Promise<void> => {
       for (const name of names) {
         const member = man.members[name];
-        if (member && !member.needsAttention && existsSync(path.join(member.worktree, "FLEET_ASK.md"))) {
+        if (member && existsSync(path.join(member.worktree, "FLEET_ASK.md"))) {
           await this.readAsk(name);
         }
       }
@@ -850,21 +875,6 @@ export class Fleet {
 
 // ── helpers & command parsers ────────────────────────────────────────────────
 
-interface CommitRange {
-  base: string;
-  dots: ".." | "...";
-  head: string;
-}
-
-function parseCommitRange(over?: string): CommitRange | undefined {
-  if (!over) return undefined;
-  const match = /^(.*?)(\.{2,3})(.+)$/.exec(over);
-  if (!match) return undefined;
-  const [, base, dots, head] = match;
-  if (!base || !head || base.endsWith(".") || head.startsWith(".")) return undefined;
-  return { base, dots: dots as ".." | "...", head };
-}
-
 function isDoneText(text: string): boolean {
   return /^\s*DONE:/im.test(text.slice(0, 500));
 }
@@ -1014,7 +1024,7 @@ export function parseFleetCommand(raw: string): FleetCommand {
 
     case "wait": {
       let cursor = rest;
-      let mode: "all" | "any" | undefined;
+      let mode: WaitMode | undefined;
       let timeout: number | undefined;
       const targetTokens: string[] = [];
 
@@ -1105,7 +1115,7 @@ export function toolParamsToCommand(params: {
   message?: string;
   n?: number;
   force?: boolean;
-  mode?: "all" | "any";
+  mode?: WaitMode;
   timeout?: number;
 }): FleetCommand {
   switch (params.action) {
@@ -1143,7 +1153,10 @@ export function toolParamsToCommand(params: {
       const targetTokens = [
         ...(params.name ? params.name.trim().split(/\s+/) : []),
         ...(Array.isArray(params.names) ? params.names.map(String) : []),
-      ];
+      ].filter((t) => t.trim().length > 0);
+      if ((params.name !== undefined || params.names !== undefined) && targetTokens.length === 0) {
+        throw new Error(WAIT_USAGE);
+      }
       return {
         action: "wait",
         target: parseWaitTarget(targetTokens),
