@@ -12,7 +12,7 @@ import { isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import type { Member, MemberStatus, NotifyLevel } from "./types.ts";
 
 const FAKE_PI_SCRIPT = `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 
 let buf = "";
@@ -40,11 +40,47 @@ process.stdin.on("data", (chunk) => {
         success: true,
         data: {},
       }) + "\\n");
-      if (msg.type === "prompt" && typeof msg.message === "string" && msg.message.includes("FINISH_NOW")) {
+      const activeMsg =
+        typeof msg.message === "string"
+          ? msg.message.replace(/Original assignment:[\\s\\S]*?(?=\\n\\nAdditional instructions|$)/, "")
+          : "";
+      if (msg.type === "prompt" && activeMsg.includes("FINISH_NOW")) {
+        const customIdx = activeMsg.indexOf("FINISH_NOW:");
+        const content =
+          customIdx >= 0
+            ? activeMsg.slice(customIdx + "FINISH_NOW:".length)
+            : "DONE: finished work";
         process.stdout.write(JSON.stringify({
           type: "message_end",
-          message: { role: "assistant", content: "DONE: finished work" },
+          message: { role: "assistant", content },
         }) + "\\n");
+      } else if (msg.type === "prompt" && activeMsg.startsWith("DELAY_DONE:")) {
+        const rest = activeMsg.slice("DELAY_DONE:".length);
+        const colon = rest.indexOf(":");
+        const ms = Number(rest.slice(0, colon));
+        const content = rest.slice(colon + 1);
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content },
+          }) + "\\n");
+        }, ms);
+      } else if (msg.type === "prompt" && activeMsg.startsWith("WRITE_ASK:")) {
+        const rest = activeMsg.slice("WRITE_ASK:".length);
+        const colon = rest.indexOf(":");
+        const ms = Number(rest.slice(0, colon));
+        const question = rest.slice(colon + 1);
+        setTimeout(() => {
+          writeFileSync(path.join(process.cwd(), "FLEET_ASK.md"), question + "\\n", "utf8");
+        }, ms);
+      } else if (msg.type === "prompt" && activeMsg.startsWith("EXIT_AFTER:")) {
+        const rest = activeMsg.slice("EXIT_AFTER:".length);
+        const colon = rest.indexOf(":");
+        const ms = Number(rest.slice(0, colon));
+        const code = Number(rest.slice(colon + 1));
+        setTimeout(() => {
+          process.exit(code);
+        }, ms);
       }
     }
   }
@@ -68,6 +104,8 @@ interface TestHarness {
       mergedCommit?: boolean;
       conflictingCommit?: boolean;
       createdAt?: number;
+      result?: string;
+      needsAttention?: string;
     },
   ) => Promise<Member>;
   shutdown: () => Promise<void>;
@@ -153,6 +191,8 @@ async function createHarness(): Promise<TestHarness> {
       mergedCommit?: boolean;
       conflictingCommit?: boolean;
       createdAt?: number;
+      result?: string;
+      needsAttention?: string;
     },
   ): Promise<Member> {
     const branch = `fleet/${name}`;
@@ -185,6 +225,8 @@ async function createHarness(): Promise<TestHarness> {
       worktree: wt,
       baseRef,
       status,
+      ...(opts?.result !== undefined ? { result: opts.result } : {}),
+      ...(opts?.needsAttention !== undefined ? { needsAttention: opts.needsAttention } : {}),
       createdAt: ts,
       updatedAt: ts,
     };
@@ -265,6 +307,43 @@ describe("parseFleetCommand", () => {
   it("rejects missing required target on clean", () => {
     assert.throws(() => parseFleetCommand("clean --force"), /usage: \/fleet clean/);
   });
+
+  it("parses wait with default all, --all, named members, --any, and --timeout in any order", () => {
+    assert.deepEqual(
+      {
+        defaultAll: parseFleetCommand("wait"),
+        explicitAll: parseFleetCommand("wait --all --any"),
+        namedWithFlags: parseFleetCommand("wait --any --timeout 15 api ui"),
+        flagsAfterTarget: parseFleetCommand("wait api --timeout 5 --any"),
+      },
+      {
+        defaultAll: { action: "wait", target: { kind: "all" } },
+        explicitAll: { action: "wait", target: { kind: "all" }, mode: "any" },
+        namedWithFlags: {
+          action: "wait",
+          target: { kind: "members", names: ["api", "ui"] },
+          mode: "any",
+          timeout: 15,
+        },
+        flagsAfterTarget: {
+          action: "wait",
+          target: { kind: "members", names: ["api"] },
+          mode: "any",
+          timeout: 5,
+        },
+      },
+    );
+  });
+
+  it("rejects invalid --timeout values, unknown flags, or mixing --all with names on wait", () => {
+    const usageRe = /usage: \/fleet wait \[name\|--all\] \[--any\] \[--timeout <sec>\]/;
+    assert.throws(() => parseFleetCommand("wait --timeout"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --timeout 0"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --timeout -5"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --timeout abc"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --bogus"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --all api"), usageRe);
+  });
 });
 
 describe("toolParamsToCommand", () => {
@@ -298,6 +377,33 @@ describe("toolParamsToCommand", () => {
         action: "resume",
         name: "api",
         extra: "Cover edge cases",
+      },
+    );
+  });
+
+  it("maps wait parameters for all, single name, and multiple names with mode and timeout", () => {
+    assert.deepEqual(
+      {
+        allOmitted: toolParamsToCommand({ action: "wait" }),
+        allExplicit: toolParamsToCommand({ action: "wait", name: "--all", mode: "any", timeout: 10 }),
+        singleName: toolParamsToCommand({ action: "wait", name: "api" }),
+        multipleNames: toolParamsToCommand({
+          action: "wait",
+          names: ["api", "ui"],
+          mode: "any",
+          timeout: 30,
+        }),
+      },
+      {
+        allOmitted: { action: "wait", target: { kind: "all" } },
+        allExplicit: { action: "wait", target: { kind: "all" }, mode: "any", timeout: 10 },
+        singleName: { action: "wait", target: { kind: "members", names: ["api"] } },
+        multipleNames: {
+          action: "wait",
+          target: { kind: "members", names: ["api", "ui"] },
+          mode: "any",
+          timeout: 30,
+        },
       },
     );
   });
@@ -624,6 +730,243 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     }
   });
 
+  it("persists full DONE message on member.result and clears it on resume or re-spawn", async () => {
+    const h = await createHarness();
+    try {
+      const fullDone = "DONE: implemented auth flow\n\nDetails:\n- added token validation\n- added refresh tests";
+      await h.runTool({
+        action: "spawn",
+        name: "finisher",
+        task: `FINISH_NOW:  ${fullDone}  \n`,
+      });
+      await new Promise((r) => setTimeout(r, 150));
+      const afterDone = await loadManifest(h.root);
+
+      await h.runCommand("stop finisher");
+      await h.runCommand('resume finisher "Continue with edge cases"');
+      const afterResume = await loadManifest(h.root);
+      await h.runCommand("stop finisher");
+
+      assert.deepEqual(
+        {
+          doneStatus: afterDone.members.finisher.status,
+          doneResult: afterDone.members.finisher.result,
+          resumedResult: afterResume.members.finisher.result,
+        },
+        {
+          doneStatus: "done",
+          doneResult: fullDone,
+          resumedResult: undefined,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("keeps the final DONE message untruncated in log while truncating earlier assistant messages", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("logger", "done");
+      const logPath = path.join(h.root, ".pi", "fleet", "logs", "logger.jsonl");
+      await mkdir(path.dirname(logPath), { recursive: true });
+
+      const longProgress = `Investigating module\n${"a".repeat(260)}`;
+      const earlierDone = `DONE: first attempt\n${"b".repeat(260)}`;
+      const finalDone = `DONE: final report\n\nSection 1:\n${"c".repeat(260)}\n\nSection 2: verified`;
+
+      await writeFile(
+        logPath,
+        [
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: longProgress },
+          }),
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: earlierDone },
+          }),
+          JSON.stringify({ type: "tool_execution_start", toolName: "bash" }),
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: finalDone },
+          }),
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      const logRes = await h.runTool({ action: "log", name: "logger", n: 10 });
+
+      assert.deepEqual(
+        {
+          progressTruncated: !logRes.text.includes("a".repeat(240)) && logRes.text.includes("assistant: Investigating module "),
+          earlierDoneTruncated: !logRes.text.includes("b".repeat(240)) && logRes.text.includes("assistant: DONE: first attempt "),
+          finalDoneUntruncated: logRes.text.includes(`assistant: ${finalDone}`),
+        },
+        {
+          progressTruncated: true,
+          earlierDoneTruncated: true,
+          finalDoneUntruncated: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("resolves wait immediately for already-settled or needsAttention members and rejects unknown members", async () => {
+    const h = await createHarness();
+    try {
+      const missingRes = await h.runTool({ action: "wait", name: "missing" });
+
+      const fullResult = "DONE: completed auth\n\nParagraph 2: all 14 tests green";
+      await h.seedMember("m-done", "done", { unmergedCommit: true, result: fullResult });
+      await h.seedMember("m-ask", "running", { needsAttention: "Use JWT or session cookies?" });
+      await h.seedMember("m-failed", "failed");
+      await h.seedMember("m-stopped", "stopped");
+      await h.seedMember("m-stale", "stale");
+      await h.seedMember("m-merged", "merged", { mergedCommit: true });
+
+      const doneWait = await h.runTool({ action: "wait", name: "m-done" });
+      const askWait = await h.runTool({ action: "wait", name: "m-ask" });
+      const allWait = await h.runTool({ action: "wait" });
+
+      assert.deepEqual(
+        {
+          missingError: missingRes.isError && missingRes.text.includes("no such member 'missing'"),
+          doneHasStatus: doneWait.text.includes("status=done"),
+          doneHasCommit: doneWait.text.includes("work by m-done"),
+          doneHasFullResult: doneWait.text.includes(fullResult),
+          askHasQuestion: askWait.text.includes("Use JWT or session cookies?"),
+          allHasAllSettled:
+            !allWait.isError &&
+            allWait.text.includes("m-done") &&
+            allWait.text.includes("m-ask") &&
+            allWait.text.includes("m-failed") &&
+            allWait.text.includes("m-stopped") &&
+            allWait.text.includes("m-stale") &&
+            allWait.text.includes("m-merged"),
+        },
+        {
+          missingError: true,
+          doneHasStatus: true,
+          doneHasCommit: true,
+          doneHasFullResult: true,
+          askHasQuestion: true,
+          allHasAllSettled: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("blocks wait on running members until they finish with DONE, write FLEET_ASK.md, or exit unexpectedly", async () => {
+    const h = await createHarness();
+    try {
+      const asyncReport = "DONE: completed async work\n\nAll checks passed";
+      await h.runTool({
+        action: "spawn",
+        name: "worker-done",
+        task: `DELAY_DONE:120:${asyncReport}`,
+      });
+      const doneWait = await h.runTool({ action: "wait", name: "worker-done" });
+
+      await h.runTool({
+        action: "spawn",
+        name: "worker-ask",
+        task: "WRITE_ASK:80:Should we support legacy tokens?",
+      });
+      const askWait = await h.runTool({ action: "wait", name: "worker-ask" });
+
+      await h.runTool({
+        action: "spawn",
+        name: "worker-crash",
+        task: "EXIT_AFTER:80:1",
+      });
+      const crashWait = await h.runTool({ action: "wait", name: "worker-crash" });
+
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          doneResolved: doneWait.text.includes("status=done") && doneWait.text.includes(asyncReport),
+          askResolved: askWait.text.includes("ASK: Should we support legacy tokens?"),
+          crashResolved: crashWait.text.includes("status=failed"),
+        },
+        {
+          doneResolved: true,
+          askResolved: true,
+          crashResolved: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("supports wait mode=any, wait --all, and reports settled vs running members on timeout", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "fast",
+        task: "DELAY_DONE:100:DONE: fast member finished",
+      });
+      await h.runTool({
+        action: "spawn",
+        name: "slow",
+        task: "Stay running until prompted",
+      });
+
+      const anyRes = await h.runTool({
+        action: "wait",
+        names: ["fast", "slow"],
+        mode: "any",
+      });
+      const manAfterAny = await loadManifest(h.root);
+
+      const timeoutRes = await h.runTool({
+        action: "wait",
+        timeout: 0.15,
+      });
+
+      await h.runTool({
+        action: "send",
+        name: "slow",
+        message: "FINISH_NOW:DONE: slow member finished",
+      });
+      const allRes = await h.runTool({ action: "wait", name: "--all" });
+
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          fastDoneAfterAny: manAfterAny.members.fast.status,
+          slowStillRunningAfterAny: manAfterAny.members.slow.status,
+          anyHasFastResult: anyRes.text.includes("DONE: fast member finished"),
+          timeoutIndicatesTimeout: /timed out/i.test(timeoutRes.text),
+          timeoutShowsSettled: timeoutRes.text.includes("settled: fast"),
+          timeoutShowsRunning: timeoutRes.text.includes("running: slow"),
+          allHasBothResults:
+            allRes.text.includes("DONE: fast member finished") &&
+            allRes.text.includes("DONE: slow member finished"),
+        },
+        {
+          fastDoneAfterAny: "done",
+          slowStillRunningAfterAny: "running",
+          anyHasFastResult: true,
+          timeoutIndicatesTimeout: true,
+          timeoutShowsSettled: true,
+          timeoutShowsRunning: true,
+          allHasBothResults: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("writes review-context.md with target, diff base, assignment, commits, and diff for reviewer with --over branch, and not for coder", async () => {
     const h = await createHarness();
     try {
@@ -760,6 +1103,9 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           twoDotHasV2Diff: twoDotCtx.includes("v2.txt"),
           twoDotHasV1Diff: twoDotCtx.includes("v1.txt"),
           threeDotDiffBase: threeDotCtx.includes("Diff base: `main`"),
+          threeDotHasV1Commit: threeDotCtx.includes("add v1"),
+          threeDotHasV2Commit: threeDotCtx.includes("add v2"),
+          threeDotHasMainOnlyCommit: threeDotCtx.includes("advance main"),
           threeDotHasV1Diff: threeDotCtx.includes("v1.txt"),
           threeDotHasV2Diff: threeDotCtx.includes("v2.txt"),
           threeDotHasMainOnlyDiff: threeDotCtx.includes("main-only.txt"),
@@ -775,6 +1121,9 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           twoDotHasV2Diff: true,
           twoDotHasV1Diff: false,
           threeDotDiffBase: true,
+          threeDotHasV1Commit: true,
+          threeDotHasV2Commit: true,
+          threeDotHasMainOnlyCommit: false,
           threeDotHasV1Diff: true,
           threeDotHasV2Diff: true,
           threeDotHasMainOnlyDiff: false,

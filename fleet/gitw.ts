@@ -74,13 +74,8 @@ export async function branchMerged(root: string, branch: string): Promise<boolea
 }
 
 /** One-line commits on `branch` since `baseRef`. */
-export async function commitsSince(
-  root: string,
-  baseRef: string,
-  branch: string,
-  dots: ".." | "..." = "..",
-): Promise<string[]> {
-  const r = await tryGit(root, "log", "--oneline", `${baseRef}${dots}${branch}`);
+export async function commitsSince(root: string, baseRef: string, branch: string): Promise<string[]> {
+  const r = await tryGit(root, "log", "--oneline", `${baseRef}..${branch}`);
   return r.ok ? r.out.split("\n").filter(Boolean) : [];
 }
 
