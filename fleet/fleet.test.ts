@@ -121,6 +121,11 @@ async function createHarness(): Promise<TestHarness> {
   await writeFile(path.join(rawRoot, "README.md"), "initial\n", "utf8");
   await git(rawRoot, "add", "README.md");
   await git(rawRoot, "commit", "-m", "initial");
+  await writeFile(
+    path.join(rawRoot, ".git", "info", "exclude"),
+    ".rpc-received.jsonl\nsession.json\n",
+    "utf8",
+  );
 
   const root = await git(rawRoot, "rev-parse", "--show-toplevel");
   const baseRef = await headRev(root);
@@ -1642,7 +1647,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     }
   });
 
-  it("auto-cleans transient members on DONE (keeping unmerged branch, deleting merged branch), resolves wait, and keeps non-transient members", async () => {
+  it("auto-cleans transient members on DONE (keeping unmerged branch, deleting merged branch), resolves wait, keeps non-transient members, and keeps a transient member with uncommitted work", async () => {
     const h = await createHarness();
     try {
       await h.runTool({
@@ -1673,6 +1678,16 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         task: "FINISH_NOW:DONE: persistent finished",
       });
       const persistentWait = await h.runTool({ action: "wait", name: "persistent-coder" });
+
+      await h.runTool({ action: "spawn", name: "trans-dirty", transient: true, task: "Hold for uncommitted work" });
+      const dirtyWt = path.join(h.root, ".pi", "fleet", "wt", "trans-dirty");
+      await writeFile(path.join(dirtyWt, "uncommitted.txt"), "work in progress\n", "utf8");
+      await h.runTool({
+        action: "send",
+        name: "trans-dirty",
+        message: "DELAY_DONE:60:DONE: dirty transient finished",
+      });
+      const dirtyWait = await h.runTool({ action: "wait", name: "trans-dirty" });
       await h.runCommand("stop --all");
 
       const man = await loadManifest(h.root);
@@ -1702,6 +1717,10 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           persistentInManifest: "persistent-coder" in man.members,
           persistentWorktreeExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "persistent-coder")),
           persistentWaitOk: !persistentWait.isError && persistentWait.text.includes("DONE: persistent finished"),
+          dirtyStatus: man.members["trans-dirty"]?.status,
+          dirtyWorkKept: existsSync(path.join(dirtyWt, "uncommitted.txt")),
+          dirtyWaitOk: !dirtyWait.isError && dirtyWait.text.includes("DONE: dirty transient finished"),
+          dirtyCleanFailureNotified: h.errors().some((e) => e.includes("kept transient member 'trans-dirty'")),
         },
         {
           unmergedInManifest: false,
@@ -1716,6 +1735,10 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           persistentInManifest: true,
           persistentWorktreeExists: true,
           persistentWaitOk: true,
+          dirtyStatus: "done",
+          dirtyWorkKept: true,
+          dirtyWaitOk: true,
+          dirtyCleanFailureNotified: true,
         },
       );
     } finally {

@@ -384,67 +384,63 @@ export class Fleet {
       );
       const createdWorktrees: Array<{ name: string; wt: string; branch: string }> = [];
 
+      const prepared: PreparedSpawn[] = [];
       try {
-        const prepared = await Promise.all(
-          validated.map(
-            async ({ input, existing, resume, role, spec, model, branch, wt, effectiveOver, range, baseRef }) => {
-              if (resume) {
-                if (this.clients.has(input.name)) {
-                  await this.stop(input.name);
-                }
-                if (!existsSync(wt)) {
-                  await attachWorktree(this.root, wt, branch);
-                }
-                if (!input.preserveTask && input.over) {
-                  await git(wt, "reset", "--hard", baseRef);
-                }
-              } else {
-                await addWorktree(this.root, wt, branch, baseRef);
-                createdWorktrees.push({ name: input.name, wt, branch });
-              }
+        for (const { input, existing, resume, role, spec, model, branch, wt, effectiveOver, range, baseRef } of validated) {
+          if (resume) {
+            if (this.clients.has(input.name)) {
+              await this.stop(input.name);
+            }
+            if (!existsSync(wt)) {
+              await attachWorktree(this.root, wt, branch);
+            }
+            if (!input.preserveTask && input.over) {
+              await git(wt, "reset", "--hard", baseRef);
+            }
+          } else {
+            await addWorktree(this.root, wt, branch, baseRef);
+            createdWorktrees.push({ name: input.name, wt, branch });
+          }
 
-              await rm(path.join(wt, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
-              this.completedTransient.delete(input.name);
+          await rm(path.join(wt, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
+          this.completedTransient.delete(input.name);
 
-              const transient =
-                input.transient ??
-                (input.preserveTask && existing?.transient !== undefined
-                  ? existing.transient
-                  : Boolean(spec.autoClean));
+          const transient =
+            input.transient ??
+            (input.preserveTask && existing?.transient !== undefined
+              ? existing.transient
+              : Boolean(spec.autoClean));
 
-              const now = Date.now();
-              const member: Member = existing ?? {
-                name: input.name,
-                role,
-                task: input.task,
-                branch,
-                worktree: wt,
-                baseRef,
-                status: "starting",
-                createdAt: now,
-                updatedAt: now,
-              };
-              if (resume) {
-                if (!input.preserveTask && input.task) member.task = input.task;
-                member.model = model ?? member.model;
-              } else {
-                member.model = model;
-              }
-              member.role = role;
-              member.baseRef = baseRef;
-              member.over = effectiveOver;
-              member.transient = transient;
-              member.status = "starting";
-              member.needsAttention = undefined;
-              member.result = undefined;
-              member.updatedAt = now;
-              man.members[input.name] = member;
-              return { input, member, resume, role, spec, model, branch, wt, effectiveOver, range };
-            },
-          ),
-        );
+          const now = Date.now();
+          const member: Member = existing ?? {
+            name: input.name,
+            role,
+            task: input.task,
+            branch,
+            worktree: wt,
+            baseRef,
+            status: "starting",
+            createdAt: now,
+            updatedAt: now,
+          };
+          if (resume) {
+            if (!input.preserveTask && input.task) member.task = input.task;
+            member.model = model ?? member.model;
+          } else {
+            member.model = model;
+          }
+          member.role = role;
+          member.baseRef = baseRef;
+          member.over = effectiveOver;
+          member.transient = transient;
+          member.status = "starting";
+          member.needsAttention = undefined;
+          member.result = undefined;
+          member.updatedAt = now;
+          man.members[input.name] = member;
+          prepared.push({ input, member, resume, role, spec, model, branch, wt, effectiveOver, range });
+        }
         await this.save();
-        return { cfg, prepared };
       } catch (err) {
         for (const created of createdWorktrees) {
           await removeWorktree(this.root, created.wt, true).catch(() => undefined);
@@ -458,7 +454,6 @@ export class Fleet {
         throw err;
       }
 
-      await this.save();
       return { cfg, prepared };
     });
 
@@ -508,8 +503,8 @@ export class Fleet {
             logFile,
           });
           this.clients.set(input.name, client);
-          client.onEvent((ev) => void this.onMemberEvent(input.name, ev).catch(() => undefined));
-          client.onExit(() => void this.onClientExit(input.name, client).catch(() => undefined));
+          client.onEvent((ev) => void this.onMemberEvent(input.name, ev).catch((err) => this.reportHandlerError(input.name, err)));
+          client.onExit(() => void this.onClientExit(input.name, client).catch((err) => this.reportHandlerError(input.name, err)));
           this.watchAsk(member);
 
           await client.waitReady();
@@ -593,11 +588,11 @@ export class Fleet {
     const diffBase = range ? range.base : (targetMember?.baseRef ?? cfg.baseRef ?? "HEAD");
     const commits = await commitsSince(this.root, diffBase, target).catch(() => [] as string[]);
     const diff = await diffForReview(this.root, diffBase, target, range?.dots);
-    const dir = path.join(member.worktree, ".pi", "fleet");
-    await mkdir(dir, { recursive: true });
+    const file = reviewContextPath(member.worktree);
+    await mkdir(path.dirname(file), { recursive: true });
     const commitList = commits.length ? commits.map((c) => `- ${c}`).join("\n") : "(no commits)";
     await writeFile(
-      path.join(dir, "review-context.md"),
+      file,
       `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Assignment\n\n${member.task}\n\n## Commits\n\n${commitList}\n\n## Diff\n\n\`\`\`diff\n${diff}\n\`\`\`\n`,
       "utf8",
     );
@@ -1031,15 +1026,26 @@ export class Fleet {
       const lines = await this.formatWaitMember(current);
       this.completedTransient.set(current.name, { createdAt: current.createdAt, lines });
       await this.killAttachedClient(name);
+      await rm(reviewContextPath(current.worktree), { force: true }).catch(() => undefined);
       try {
         await this.clean(name, false);
-      } catch {
-        await removeWorktree(this.root, current.worktree, true);
-        await this.clean(name, false);
+      } catch (err) {
+        this.completedTransient.delete(name);
+        await this.save();
+        const msg = err instanceof Error ? err.message : String(err);
+        this.ui.notify(
+          `fleet: kept transient member '${name}' because clean failed (${msg}); merge it or run /fleet clean ${name} --force`,
+          "error",
+        );
       }
     } finally {
       this.cleaningTransient.delete(name);
     }
+  }
+
+  private reportHandlerError(name: string, err: unknown): void {
+    const msg = err instanceof Error ? err.message : String(err);
+    this.ui.notify(`fleet member '${name}': ${msg}`, "error");
   }
 
   private watchAsk(member: Member): void {
@@ -1090,6 +1096,10 @@ function parseResultPrefix(text: string): "done" | "failed" | undefined {
   const match = /^\s*(DONE|FAILED):/i.exec(text.slice(0, 500));
   if (!match) return undefined;
   return match[1].toUpperCase() === "DONE" ? "done" : "failed";
+}
+
+function reviewContextPath(worktree: string): string {
+  return path.join(worktree, ".pi", "fleet", "review-context.md");
 }
 
 function truncate(s: string, n: number): string {

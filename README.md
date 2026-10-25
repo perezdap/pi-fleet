@@ -86,7 +86,7 @@ and any spawn can override it:
 ```
 
 Per-spawn override: `/fleet spawn --role reviewer --model openai/gpt-5 r1 "Review the auth work"`.
-Roles can also set `"autoClean": true` (default for `reviewer`) to automatically clean transient members when they finish cleanly; override per spawn with `--transient` or `--no-transient` (or `transient: true|false` in the `fleet` tool).
+Roles can also set `"autoClean": true` (default for `reviewer`) to automatically clean transient members when they finish cleanly; override per spawn with `--transient` or `--no-transient` (or `transient: true|false` in the `fleet` tool). Auto-clean never forces: a transient member whose worktree has uncommitted changes stays in the manifest and the supervisor gets an error notification.
 
 ## Coordination protocol
 
