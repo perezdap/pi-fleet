@@ -12,7 +12,7 @@ import { isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import type { Member, MemberStatus, NotifyLevel } from "./types.ts";
 
 const FAKE_PI_SCRIPT = `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 
 let buf = "";
@@ -54,6 +54,33 @@ process.stdin.on("data", (chunk) => {
           type: "message_end",
           message: { role: "assistant", content },
         }) + "\\n");
+      } else if (msg.type === "prompt" && activeMsg.startsWith("DELAY_DONE:")) {
+        const rest = activeMsg.slice("DELAY_DONE:".length);
+        const colon = rest.indexOf(":");
+        const ms = Number(rest.slice(0, colon));
+        const content = rest.slice(colon + 1);
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content },
+          }) + "\\n");
+        }, ms);
+      } else if (msg.type === "prompt" && activeMsg.startsWith("WRITE_ASK:")) {
+        const rest = activeMsg.slice("WRITE_ASK:".length);
+        const colon = rest.indexOf(":");
+        const ms = Number(rest.slice(0, colon));
+        const question = rest.slice(colon + 1);
+        setTimeout(() => {
+          writeFileSync(path.join(process.cwd(), "FLEET_ASK.md"), question + "\\n", "utf8");
+        }, ms);
+      } else if (msg.type === "prompt" && activeMsg.startsWith("EXIT_AFTER:")) {
+        const rest = activeMsg.slice("EXIT_AFTER:".length);
+        const colon = rest.indexOf(":");
+        const ms = Number(rest.slice(0, colon));
+        const code = Number(rest.slice(colon + 1));
+        setTimeout(() => {
+          process.exit(code);
+        }, ms);
       }
     }
   }
@@ -77,6 +104,8 @@ interface TestHarness {
       mergedCommit?: boolean;
       conflictingCommit?: boolean;
       createdAt?: number;
+      result?: string;
+      needsAttention?: string;
     },
   ) => Promise<Member>;
   shutdown: () => Promise<void>;
@@ -162,6 +191,8 @@ async function createHarness(): Promise<TestHarness> {
       mergedCommit?: boolean;
       conflictingCommit?: boolean;
       createdAt?: number;
+      result?: string;
+      needsAttention?: string;
     },
   ): Promise<Member> {
     const branch = `fleet/${name}`;
@@ -194,6 +225,8 @@ async function createHarness(): Promise<TestHarness> {
       worktree: wt,
       baseRef,
       status,
+      ...(opts?.result !== undefined ? { result: opts.result } : {}),
+      ...(opts?.needsAttention !== undefined ? { needsAttention: opts.needsAttention } : {}),
       createdAt: ts,
       updatedAt: ts,
     };
@@ -274,6 +307,43 @@ describe("parseFleetCommand", () => {
   it("rejects missing required target on clean", () => {
     assert.throws(() => parseFleetCommand("clean --force"), /usage: \/fleet clean/);
   });
+
+  it("parses wait with default all, --all, named members, --any, and --timeout in any order", () => {
+    assert.deepEqual(
+      {
+        defaultAll: parseFleetCommand("wait"),
+        explicitAll: parseFleetCommand("wait --all --any"),
+        namedWithFlags: parseFleetCommand("wait --any --timeout 15 api ui"),
+        flagsAfterTarget: parseFleetCommand("wait api --timeout 5 --any"),
+      },
+      {
+        defaultAll: { action: "wait", target: { kind: "all" } },
+        explicitAll: { action: "wait", target: { kind: "all" }, mode: "any" },
+        namedWithFlags: {
+          action: "wait",
+          target: { kind: "members", names: ["api", "ui"] },
+          mode: "any",
+          timeout: 15,
+        },
+        flagsAfterTarget: {
+          action: "wait",
+          target: { kind: "members", names: ["api"] },
+          mode: "any",
+          timeout: 5,
+        },
+      },
+    );
+  });
+
+  it("rejects invalid --timeout values, unknown flags, or mixing --all with names on wait", () => {
+    const usageRe = /usage: \/fleet wait \[name\|--all\] \[--any\] \[--timeout <sec>\]/;
+    assert.throws(() => parseFleetCommand("wait --timeout"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --timeout 0"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --timeout -5"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --timeout abc"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --bogus"), usageRe);
+    assert.throws(() => parseFleetCommand("wait --all api"), usageRe);
+  });
 });
 
 describe("toolParamsToCommand", () => {
@@ -307,6 +377,33 @@ describe("toolParamsToCommand", () => {
         action: "resume",
         name: "api",
         extra: "Cover edge cases",
+      },
+    );
+  });
+
+  it("maps wait parameters for all, single name, and multiple names with mode and timeout", () => {
+    assert.deepEqual(
+      {
+        allOmitted: toolParamsToCommand({ action: "wait" }),
+        allExplicit: toolParamsToCommand({ action: "wait", name: "--all", mode: "any", timeout: 10 }),
+        singleName: toolParamsToCommand({ action: "wait", name: "api" }),
+        multipleNames: toolParamsToCommand({
+          action: "wait",
+          names: ["api", "ui"],
+          mode: "any",
+          timeout: 30,
+        }),
+      },
+      {
+        allOmitted: { action: "wait", target: { kind: "all" } },
+        allExplicit: { action: "wait", target: { kind: "all" }, mode: "any", timeout: 10 },
+        singleName: { action: "wait", target: { kind: "members", names: ["api"] } },
+        multipleNames: {
+          action: "wait",
+          target: { kind: "members", names: ["api", "ui"] },
+          mode: "any",
+          timeout: 30,
+        },
       },
     );
   });
@@ -710,6 +807,159 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           progressTruncated: true,
           earlierDoneTruncated: true,
           finalDoneUntruncated: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("resolves wait immediately for already-settled or needsAttention members and rejects unknown members", async () => {
+    const h = await createHarness();
+    try {
+      const missingRes = await h.runTool({ action: "wait", name: "missing" });
+
+      const fullResult = "DONE: completed auth\n\nParagraph 2: all 14 tests green";
+      await h.seedMember("m-done", "done", { unmergedCommit: true, result: fullResult });
+      await h.seedMember("m-ask", "running", { needsAttention: "Use JWT or session cookies?" });
+      await h.seedMember("m-failed", "failed");
+      await h.seedMember("m-stopped", "stopped");
+      await h.seedMember("m-stale", "stale");
+      await h.seedMember("m-merged", "merged", { mergedCommit: true });
+
+      const doneWait = await h.runTool({ action: "wait", name: "m-done" });
+      const askWait = await h.runTool({ action: "wait", name: "m-ask" });
+      const allWait = await h.runTool({ action: "wait" });
+
+      assert.deepEqual(
+        {
+          missingError: missingRes.isError && missingRes.text.includes("no such member 'missing'"),
+          doneHasStatus: doneWait.text.includes("status=done"),
+          doneHasCommit: doneWait.text.includes("work by m-done"),
+          doneHasFullResult: doneWait.text.includes(fullResult),
+          askHasQuestion: askWait.text.includes("Use JWT or session cookies?"),
+          allHasAllSettled:
+            !allWait.isError &&
+            allWait.text.includes("m-done") &&
+            allWait.text.includes("m-ask") &&
+            allWait.text.includes("m-failed") &&
+            allWait.text.includes("m-stopped") &&
+            allWait.text.includes("m-stale") &&
+            allWait.text.includes("m-merged"),
+        },
+        {
+          missingError: true,
+          doneHasStatus: true,
+          doneHasCommit: true,
+          doneHasFullResult: true,
+          askHasQuestion: true,
+          allHasAllSettled: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("blocks wait on running members until they finish with DONE, write FLEET_ASK.md, or exit unexpectedly", async () => {
+    const h = await createHarness();
+    try {
+      const asyncReport = "DONE: completed async work\n\nAll checks passed";
+      await h.runTool({
+        action: "spawn",
+        name: "worker-done",
+        task: `DELAY_DONE:120:${asyncReport}`,
+      });
+      const doneWait = await h.runTool({ action: "wait", name: "worker-done" });
+
+      await h.runTool({
+        action: "spawn",
+        name: "worker-ask",
+        task: "WRITE_ASK:80:Should we support legacy tokens?",
+      });
+      const askWait = await h.runTool({ action: "wait", name: "worker-ask" });
+
+      await h.runTool({
+        action: "spawn",
+        name: "worker-crash",
+        task: "EXIT_AFTER:80:1",
+      });
+      const crashWait = await h.runTool({ action: "wait", name: "worker-crash" });
+
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          doneResolved: doneWait.text.includes("status=done") && doneWait.text.includes(asyncReport),
+          askResolved: askWait.text.includes("ASK: Should we support legacy tokens?"),
+          crashResolved: crashWait.text.includes("status=failed"),
+        },
+        {
+          doneResolved: true,
+          askResolved: true,
+          crashResolved: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("supports wait mode=any, wait --all, and reports settled vs running members on timeout", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "fast",
+        task: "DELAY_DONE:100:DONE: fast member finished",
+      });
+      await h.runTool({
+        action: "spawn",
+        name: "slow",
+        task: "Stay running until prompted",
+      });
+
+      const anyRes = await h.runTool({
+        action: "wait",
+        names: ["fast", "slow"],
+        mode: "any",
+      });
+      const manAfterAny = await loadManifest(h.root);
+
+      const timeoutRes = await h.runTool({
+        action: "wait",
+        timeout: 0.15,
+      });
+
+      await h.runTool({
+        action: "send",
+        name: "slow",
+        message: "FINISH_NOW:DONE: slow member finished",
+      });
+      const allRes = await h.runTool({ action: "wait", name: "--all" });
+
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          fastDoneAfterAny: manAfterAny.members.fast.status,
+          slowStillRunningAfterAny: manAfterAny.members.slow.status,
+          anyHasFastResult: anyRes.text.includes("DONE: fast member finished"),
+          timeoutIndicatesTimeout: /timed out/i.test(timeoutRes.text),
+          timeoutShowsSettled: timeoutRes.text.includes("settled: fast"),
+          timeoutShowsRunning: timeoutRes.text.includes("running: slow"),
+          allHasBothResults:
+            allRes.text.includes("DONE: fast member finished") &&
+            allRes.text.includes("DONE: slow member finished"),
+        },
+        {
+          fastDoneAfterAny: "done",
+          slowStillRunningAfterAny: "running",
+          anyHasFastResult: true,
+          timeoutIndicatesTimeout: true,
+          timeoutShowsSettled: true,
+          timeoutShowsRunning: true,
+          allHasBothResults: true,
         },
       );
     } finally {
