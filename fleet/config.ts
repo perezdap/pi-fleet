@@ -9,7 +9,7 @@ export const BUILTIN_ROLES: Record<RoleName, RoleSpec> = {
   coder: {},
   tester: {},
   // Enforced read-only: no write/edit/bash tools.
-  reviewer: { tools: "read,grep,find,ls" },
+  reviewer: { tools: "read,grep,find,ls", autoClean: true },
   integrator: {},
 };
 
