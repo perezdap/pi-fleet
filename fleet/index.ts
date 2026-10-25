@@ -181,6 +181,11 @@ export default function (pi: ExtensionAPI) {
           description: "Base branch/ref the worktree starts from (spawn only)",
         }),
       ),
+      transient: Type.Optional(
+        Type.Boolean({
+          description: "Automatically clean the member after a clean finish (spawn only)",
+        }),
+      ),
       members: Type.Optional(
         Type.Array(
           Type.Object({
@@ -201,6 +206,11 @@ export default function (pi: ExtensionAPI) {
             over: Type.Optional(
               Type.String({
                 description: "Base branch/ref the worktree starts from",
+              }),
+            ),
+            transient: Type.Optional(
+              Type.Boolean({
+                description: "Automatically clean the member after a clean finish",
               }),
             ),
           }),

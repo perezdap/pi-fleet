@@ -71,7 +71,12 @@ export async function removeWorktree(
   worktreePath: string,
   force = false,
 ): Promise<{ ok: boolean; out: string }> {
-  return tryGit(root, "worktree", "remove", ...(force ? ["--force"] : []), worktreePath);
+  let r = await tryGit(root, "worktree", "remove", ...(force ? ["--force"] : []), worktreePath);
+  for (let i = 0; !r.ok && i < 4; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    r = await tryGit(root, "worktree", "remove", ...(force ? ["--force"] : []), worktreePath);
+  }
+  return r;
 }
 
 export async function deleteBranch(root: string, branch: string, force = false): Promise<{ ok: boolean; out: string }> {
