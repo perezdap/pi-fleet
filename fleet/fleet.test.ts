@@ -9,6 +9,7 @@ import { parseFleetCommand, toolParamsToCommand } from "./fleet.ts";
 import { addWorktree, branchExists, git, headRev, mergeBranch } from "./gitw.ts";
 import registerFleet from "./index.ts";
 import { isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
+import { roleAppend } from "./roles.ts";
 import type { Member, MemberStatus, NotifyLevel } from "./types.ts";
 
 const FAKE_PI_SCRIPT = `#!/usr/bin/env node
@@ -765,6 +766,52 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     }
   });
 
+  it("transitions a member emitting FAILED: to failed status, stores full result, notifies error, resolves wait, and skips it on merge --done", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("passing-coder", "done", { unmergedCommit: true });
+
+      const fullFailed = "FAILED: 2 blocker defects found\n\n- auth.ts:42 missing signature check\n- session.ts:18 token leak";
+      await h.runTool({
+        action: "spawn",
+        name: "failing-rev",
+        role: "reviewer",
+        task: `DELAY_DONE:80:  ${fullFailed}  \n`,
+      });
+      const waitRes = await h.runTool({ action: "wait", name: "failing-rev", timeout: 1 });
+      const afterFailed = await loadManifest(h.root);
+
+      await h.runCommand("merge --done");
+      const afterMerge = await loadManifest(h.root);
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          failedStatus: afterFailed.members["failing-rev"].status,
+          failedResult: afterFailed.members["failing-rev"].result,
+          errorNotified: h.notifications.some(
+            (n) => n.level === "error" && n.text === "fleet member 'failing-rev' reports FAILED",
+          ),
+          waitHasFailedStatus: waitRes.text.includes("status=failed"),
+          waitHasFullResult: waitRes.text.includes(fullFailed),
+          failedSkippedOnMergeDone: afterMerge.members["failing-rev"].status,
+          doneMergedOnMergeDone: afterMerge.members["passing-coder"].status,
+        },
+        {
+          failedStatus: "failed",
+          failedResult: fullFailed,
+          errorNotified: true,
+          waitHasFailedStatus: true,
+          waitHasFullResult: true,
+          failedSkippedOnMergeDone: "failed",
+          doneMergedOnMergeDone: "merged",
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("keeps the final DONE message untruncated in log while truncating earlier assistant messages", async () => {
     const h = await createHarness();
     try {
@@ -798,16 +845,52 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
 
       const logRes = await h.runTool({ action: "log", name: "logger", n: 10 });
 
+      await h.seedMember("fail-logger", "failed");
+      const failLogPath = path.join(h.root, ".pi", "fleet", "logs", "fail-logger.jsonl");
+      const earlierFailed = `FAILED: initial failure\n${"d".repeat(260)}`;
+      const finalFailed = `FAILED: final blocker report\n\nSection 1:\n${"e".repeat(260)}\n\nSection 2: unresolved`;
+
+      await writeFile(
+        failLogPath,
+        [
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: earlierDone },
+          }),
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: earlierFailed },
+          }),
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: finalFailed },
+          }),
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      const failLogRes = await h.runTool({ action: "log", name: "fail-logger", n: 10 });
+
       assert.deepEqual(
         {
           progressTruncated: !logRes.text.includes("a".repeat(240)) && logRes.text.includes("assistant: Investigating module "),
           earlierDoneTruncated: !logRes.text.includes("b".repeat(240)) && logRes.text.includes("assistant: DONE: first attempt "),
           finalDoneUntruncated: logRes.text.includes(`assistant: ${finalDone}`),
+          earlierDoneBeforeFailedTruncated:
+            !failLogRes.text.includes("b".repeat(240)) &&
+            failLogRes.text.includes("assistant: DONE: first attempt "),
+          earlierFailedTruncated:
+            !failLogRes.text.includes("d".repeat(240)) &&
+            failLogRes.text.includes("assistant: FAILED: initial failure "),
+          finalFailedUntruncated: failLogRes.text.includes(`assistant: ${finalFailed}`),
         },
         {
           progressTruncated: true,
           earlierDoneTruncated: true,
           finalDoneUntruncated: true,
+          earlierDoneBeforeFailedTruncated: true,
+          earlierFailedTruncated: true,
+          finalFailedUntruncated: true,
         },
       );
     } finally {
@@ -1194,5 +1277,30 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     } finally {
       await h.cleanup();
     }
+  });
+});
+
+describe("roleAppend", () => {
+  it("instructs coder, tester, reviewer, and integrator when to emit DONE: versus FAILED:", () => {
+    const coder = roleAppend("coder");
+    const tester = roleAppend("tester");
+    const reviewer = roleAppend("reviewer");
+    const integrator = roleAppend("integrator");
+
+    assert.deepEqual(
+      {
+        coderHasDoneAndFailed: coder.includes("DONE:") && coder.includes("FAILED:"),
+        testerHasDoneAndFailed: tester.includes("DONE:") && tester.includes("FAILED:"),
+        reviewerHasDoneAndFailed:
+          reviewer.includes("DONE:") && reviewer.includes("FAILED:") && /blocker/i.test(reviewer),
+        integratorHasDoneAndFailed: integrator.includes("DONE:") && integrator.includes("FAILED:"),
+      },
+      {
+        coderHasDoneAndFailed: true,
+        testerHasDoneAndFailed: true,
+        reviewerHasDoneAndFailed: true,
+        integratorHasDoneAndFailed: true,
+      },
+    );
   });
 });
