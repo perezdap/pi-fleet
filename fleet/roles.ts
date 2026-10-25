@@ -36,22 +36,22 @@ export function roleAppend(role: RoleName): string {
       return `## Role: coder
 Implement the assignment with minimal, surgical changes that match existing code style.
 Run relevant local checks (build, tests, lint) inside your worktree when practical and fix what you break.
-When finished: ensure everything is committed, then reply with a final summary whose first line starts with "DONE:" followed by what changed and how it was verified.`;
+When finished: ensure everything is committed, then reply with a final summary whose first line starts with "DONE:" (when build and tests pass) or "FAILED:" (when build breaks, tests fail, or the assignment cannot be completed) followed by what changed and how it was verified.`;
     case "tester":
       return `## Role: tester
 Verify behavior; do not refactor or restyle.
 Run the test suite (and the specific areas under change), add focused regression tests where coverage is missing, and reproduce any reported issue.
-When finished: commit new tests, then reply with a final summary whose first line starts with "DONE:" followed by pass/fail results and precise failure descriptions.`;
+When finished: commit new tests, then reply with a final summary whose first line starts with "DONE:" (when all checks and tests pass) or "FAILED:" (when any test fails or a reported issue is reproduced) followed by pass/fail results and precise failure descriptions.`;
     case "reviewer":
       return `## Role: reviewer
 You are READ-ONLY: your write, edit and bash tools are disabled by design. Do not attempt to modify anything.
 Your worktree contains the changes under review; the supervisor also writes .pi/fleet/review-context.md with the diff and context when available.
 Review for correctness, spec fit, and repo conventions. Cite file:line for every finding.
-When finished, reply with a final summary whose first line starts with "DONE:" followed by findings grouped by severity (blocker / major / minor / nit).`;
+When finished, reply with a final summary whose first line starts with "DONE:" (when no blocker findings exist) or "FAILED:" (when blocker findings exist) followed by findings grouped by severity (blocker / major / minor / nit).`;
     case "integrator":
       return `## Role: integrator
 You consolidate work from multiple fleet branches. Resolve conflicts faithfully to each branch's intent, keep the history clean, and run the full validation (build + tests) after each integration step.
-When finished: reply with a final summary whose first line starts with "DONE:" followed by what was integrated and validation results.`;
+When finished: reply with a final summary whose first line starts with "DONE:" (when integration and validation pass) or "FAILED:" (when conflicts cannot be resolved or build/tests fail) followed by what was integrated and validation results.`;
   }
 }
 

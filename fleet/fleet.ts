@@ -722,7 +722,7 @@ export class Fleet {
       | { kind: "assistant"; text: string }
       | { kind: "tool"; toolName: string }
     > = [];
-    let lastDoneIdx = -1;
+    let lastTerminalIdx = -1;
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       let ev: any;
@@ -734,7 +734,7 @@ export class Fleet {
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const text = extractText(ev.message).trim();
         if (text) {
-          if (isDoneText(text)) lastDoneIdx = items.length;
+          if (isDoneText(text) || isFailedText(text)) lastTerminalIdx = items.length;
           items.push({ kind: "assistant", text });
         }
       } else if (ev.type === "tool_execution_start") {
@@ -743,7 +743,7 @@ export class Fleet {
     }
     const entries = items.map((item, idx) => {
       if (item.kind === "tool") return `tool: ${item.toolName}`;
-      if (idx === lastDoneIdx) return `assistant: ${item.text}`;
+      if (idx === lastTerminalIdx) return `assistant: ${item.text}`;
       return `assistant: ${truncate(item.text.replace(/\s+/g, " "), 220)}`;
     });
     const tail = entries.slice(-n);
@@ -812,6 +812,12 @@ export class Fleet {
         member.updatedAt = Date.now();
         await this.save();
         this.ui.notify(`fleet member '${name}' reports DONE`, "info");
+      } else if (isFailedText(text)) {
+        member.status = "failed";
+        member.result = text.trim();
+        member.updatedAt = Date.now();
+        await this.save();
+        this.ui.notify(`fleet member '${name}' reports FAILED`, "error");
       }
     }
   }
@@ -877,6 +883,10 @@ export class Fleet {
 
 function isDoneText(text: string): boolean {
   return /^\s*DONE:/im.test(text.slice(0, 500));
+}
+
+function isFailedText(text: string): boolean {
+  return /^\s*FAILED:/im.test(text.slice(0, 500));
 }
 
 function truncate(s: string, n: number): string {
