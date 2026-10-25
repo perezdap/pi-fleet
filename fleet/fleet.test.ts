@@ -741,8 +741,8 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       });
       await new Promise((r) => setTimeout(r, 150));
       const afterDone = await loadManifest(h.root);
+      const firstPid = afterDone.members.finisher.pid;
 
-      await h.runCommand("stop finisher");
       await h.runCommand('resume finisher "Continue with edge cases"');
       const afterResume = await loadManifest(h.root);
       await h.runCommand("stop finisher");
@@ -751,11 +751,13 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         {
           doneStatus: afterDone.members.finisher.status,
           doneResult: afterDone.members.finisher.result,
+          firstPidStoppedOnResume: !isPidAlive(firstPid),
           resumedResult: afterResume.members.finisher.result,
         },
         {
           doneStatus: "done",
           doneResult: fullDone,
+          firstPidStoppedOnResume: true,
           resumedResult: undefined,
         },
       );

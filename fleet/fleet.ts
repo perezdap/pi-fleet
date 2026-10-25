@@ -302,6 +302,9 @@ export class Fleet {
     let baseRef: string;
 
     if (resume) {
+      if (this.clients.has(o.name)) {
+        await this.stop(o.name);
+      }
       if (!existsSync(wt)) {
         if (await branchExists(this.root, branch)) await attachWorktree(this.root, wt, branch);
         else throw new Error(`cannot resume '${o.name}': worktree and branch are gone; run /fleet clean ${o.name} first`);
@@ -567,6 +570,7 @@ export class Fleet {
       if (!force) throw new Error(`member '${name}' is still attached; run /fleet stop ${name} first`);
       await this.stop(name);
     }
+    this.unwatchAsk(name);
     if (existsSync(member.worktree)) {
       const r = await removeWorktree(this.root, member.worktree, force);
       if (!r.ok) throw new Error(`worktree remove failed: ${r.out}`);
