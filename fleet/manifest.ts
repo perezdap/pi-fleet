@@ -1,6 +1,6 @@
 /** Manifest persistence: the disk-truth registry of fleet members. */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { Manifest } from "./types.ts";
 
@@ -11,6 +11,8 @@ export function fleetDir(repoRoot: string): string {
 export function manifestPath(repoRoot: string): string {
   return path.join(fleetDir(repoRoot), "manifest.json");
 }
+
+let tmpSeq = 0;
 
 export async function loadManifest(repoRoot: string): Promise<Manifest> {
   try {
@@ -27,9 +29,20 @@ export async function saveManifest(manifest: Manifest): Promise<void> {
   const dir = fleetDir(manifest.repoRoot);
   await mkdir(dir, { recursive: true });
   const target = manifestPath(manifest.repoRoot);
-  const tmp = `${target}.${process.pid}.tmp`;
+  const tmp = `${target}.${process.pid}.${++tmpSeq}.tmp`;
   await writeFile(tmp, JSON.stringify(manifest, null, 2), "utf8");
-  await rename(tmp, target);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(tmp, target);
+      return;
+    } catch (err: any) {
+      if (!["EPERM", "EACCES", "EBUSY"].includes(err?.code) || attempt >= 4) {
+        await rm(tmp, { force: true }).catch(() => undefined);
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, 15 * (attempt + 1)));
+    }
+  }
 }
 
 export function isPidAlive(pid: number | undefined): boolean {

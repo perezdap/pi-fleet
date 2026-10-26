@@ -14,6 +14,8 @@ export interface RoleSpec {
   tools?: string;
   /** Extra role-specific instructions appended to the fleet contract. */
   systemAppend?: string;
+  /** Automatically clean members of this role after a clean finish. */
+  autoClean?: boolean;
 }
 
 export interface FleetConfig {
@@ -63,8 +65,10 @@ export interface Member {
   status: MemberStatus;
   /** First line of FLEET_ASK.md if the member raised a question. */
   needsAttention?: string;
-  /** Full DONE: completion message emitted by the member. */
+  /** Full DONE: or FAILED: message emitted by the member. */
   result?: string;
+  /** Whether the member is automatically cleaned after a clean finish. */
+  transient?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -98,16 +102,22 @@ export type WaitTarget =
   | { kind: "all" }
   | { kind: "members"; names: string[] };
 
+export interface SpawnMemberInput {
+  name: string;
+  task: string;
+  role?: RoleName;
+  model?: string;
+  over?: string;
+  transient?: boolean;
+}
+
 export type FleetCommand =
   | { action: "help" }
   | { action: "status" }
+  | ({ action: "spawn" } & SpawnMemberInput)
   | {
       action: "spawn";
-      name: string;
-      task: string;
-      role?: RoleName;
-      model?: string;
-      over?: string;
+      members: SpawnMemberInput[];
     }
   | {
       action: "resume";

@@ -9,11 +9,16 @@ import { parseFleetCommand, toolParamsToCommand } from "./fleet.ts";
 import { addWorktree, branchExists, git, headRev, mergeBranch } from "./gitw.ts";
 import registerFleet from "./index.ts";
 import { isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
+import { roleAppend } from "./roles.ts";
 import type { Member, MemberStatus, NotifyLevel } from "./types.ts";
 
 const FAKE_PI_SCRIPT = `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
+
+if (process.argv.some((a) => a.startsWith("fleet:spawn-fail"))) {
+  process.exit(0);
+}
 
 let buf = "";
 process.stdin.setEncoding("utf8");
@@ -116,6 +121,11 @@ async function createHarness(): Promise<TestHarness> {
   await writeFile(path.join(rawRoot, "README.md"), "initial\n", "utf8");
   await git(rawRoot, "add", "README.md");
   await git(rawRoot, "commit", "-m", "initial");
+  await writeFile(
+    path.join(rawRoot, ".git", "info", "exclude"),
+    ".rpc-received.jsonl\nsession.json\n",
+    "utf8",
+  );
 
   const root = await git(rawRoot, "rev-parse", "--show-toplevel");
   const baseRef = await headRev(root);
@@ -272,14 +282,35 @@ describe("parseFleetCommand", () => {
 
   it("parses spawn with flags and strips outer quotes from task", () => {
     assert.deepEqual(
-      parseFleetCommand('spawn --role reviewer --model openai/gpt-5 --over fleet/api r1 "Review the auth work"'),
       {
-        action: "spawn",
-        name: "r1",
-        task: "Review the auth work",
-        role: "reviewer",
-        model: "openai/gpt-5",
-        over: "fleet/api",
+        defaultTransient: parseFleetCommand(
+          'spawn --role reviewer --model openai/gpt-5 --over fleet/api r1 "Review the auth work"',
+        ),
+        explicitTransient: parseFleetCommand('spawn --transient c1 "One-shot coder task"'),
+        explicitNoTransient: parseFleetCommand('spawn --role reviewer --no-transient r2 "Keep reviewer around"'),
+      },
+      {
+        defaultTransient: {
+          action: "spawn",
+          name: "r1",
+          task: "Review the auth work",
+          role: "reviewer",
+          model: "openai/gpt-5",
+          over: "fleet/api",
+        },
+        explicitTransient: {
+          action: "spawn",
+          name: "c1",
+          task: "One-shot coder task",
+          transient: true,
+        },
+        explicitNoTransient: {
+          action: "spawn",
+          name: "r2",
+          task: "Keep reviewer around",
+          role: "reviewer",
+          transient: false,
+        },
       },
     );
   });
@@ -343,22 +374,98 @@ describe("parseFleetCommand", () => {
 });
 
 describe("toolParamsToCommand", () => {
-  it("maps spawn parameters including over to a spawn command", () => {
+  it("maps spawn parameters including over and transient to a spawn command", () => {
+    assert.deepEqual(
+      {
+        withTransientTrue: toolParamsToCommand({
+          action: "spawn",
+          name: "rev1",
+          task: "Review PR",
+          role: "reviewer",
+          over: "fleet/api",
+          transient: true,
+        }),
+        withTransientFalse: toolParamsToCommand({
+          action: "spawn",
+          name: "rev2",
+          task: "Persistent review",
+          role: "reviewer",
+          transient: false,
+        }),
+      },
+      {
+        withTransientTrue: {
+          action: "spawn",
+          name: "rev1",
+          task: "Review PR",
+          role: "reviewer",
+          over: "fleet/api",
+          transient: true,
+        },
+        withTransientFalse: {
+          action: "spawn",
+          name: "rev2",
+          task: "Persistent review",
+          role: "reviewer",
+          transient: false,
+        },
+      },
+    );
+  });
+
+  it("maps batch spawn members and rejects empty, mixed, or invalid member entries", () => {
     assert.deepEqual(
       toolParamsToCommand({
         action: "spawn",
-        name: "rev1",
-        task: "Review PR",
-        role: "reviewer",
-        over: "fleet/api",
+        members: [
+          { name: "rev-std", task: "Standards review", role: "reviewer", over: "main..HEAD", transient: false },
+          { name: "coder-1", task: "Implement feature", model: "openai/gpt-5", transient: true },
+        ],
       }),
       {
         action: "spawn",
-        name: "rev1",
-        task: "Review PR",
-        role: "reviewer",
-        over: "fleet/api",
+        members: [
+          { name: "rev-std", task: "Standards review", role: "reviewer", over: "main..HEAD", transient: false },
+          { name: "coder-1", task: "Implement feature", model: "openai/gpt-5", transient: true },
+        ],
       },
+    );
+
+    assert.throws(() => toolParamsToCommand({ action: "spawn", members: [] }), /non-empty/);
+    assert.throws(
+      () =>
+        toolParamsToCommand({
+          action: "spawn",
+          name: "single",
+          task: "Single task",
+          members: [{ name: "m1", task: "Task 1" }],
+        }),
+      /cannot mix|requires/i,
+    );
+    assert.throws(
+      () =>
+        toolParamsToCommand({
+          action: "spawn",
+          transient: true,
+          members: [{ name: "m1", task: "Task 1" }],
+        } as any),
+      /cannot mix|requires/i,
+    );
+    assert.throws(
+      () =>
+        toolParamsToCommand({
+          action: "spawn",
+          members: [{ name: "m1", task: "" }],
+        }),
+      /name and task/i,
+    );
+    assert.throws(
+      () =>
+        toolParamsToCommand({
+          action: "spawn",
+          members: [{ name: "m1", task: "Task 1", role: "bogus" as any }],
+        }),
+      /role/i,
     );
   });
 
@@ -582,11 +689,15 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     }
   });
 
-  it("cleans finished members on clean --done while leaving active and detached members intact", async () => {
+  it("cleans finished and detached members (stopping live detached PIDs) on clean --done while leaving active members intact", async () => {
     const h = await createHarness();
+    const sleeper = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
     try {
-      const finished: MemberStatus[] = ["done", "merged", "failed", "stopped", "stale"];
-      const untouched: MemberStatus[] = ["starting", "running", "idle", "detached"];
+      const finished: MemberStatus[] = ["done", "merged", "failed", "stopped", "stale", "detached"];
+      const untouched: MemberStatus[] = ["starting", "running", "idle"];
 
       for (const status of finished) {
         await h.seedMember(`fin-${status}`, status, {
@@ -594,30 +705,56 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           unmergedCommit: status !== "merged",
         });
       }
+      const manBefore = await loadManifest(h.root);
+      manBefore.members["fin-detached"].pid = sleeper.pid;
+      await saveManifest(manBefore);
+
       for (const status of untouched) {
         await h.seedMember(`keep-${status}`, status);
       }
+
+      await h.seedMember("direct-detached", "detached");
+      const directDetachedClean = await h.runTool({ action: "clean", name: "direct-detached" });
+      await h.seedMember("dirty-stopped", "stopped");
+      await writeFile(path.join(h.root, ".pi", "fleet", "wt", "dirty-stopped", "uncommitted.txt"), "dirty\n", "utf8");
+      const dirtyCleanWithoutForce = await h.runTool({ action: "clean", name: "dirty-stopped" });
+      await h.runTool({ action: "clean", name: "dirty-stopped", force: true });
 
       await h.runCommand("clean --done");
       const man = await loadManifest(h.root);
 
       assert.deepEqual(
         {
+          directDetachedCleanOk: !directDetachedClean.isError,
+          dirtyCleanRejectedWithoutForce: dirtyCleanWithoutForce.isError,
           remaining: Object.keys(man.members).sort(),
           mergedBranchGone: !(await branchExists(h.root, "fleet/fin-merged")),
           unmergedDoneBranchKept: await branchExists(h.root, "fleet/fin-done"),
           doneWorktreeGone: !existsSync(path.join(h.root, ".pi", "fleet", "wt", "fin-done")),
+          detachedPidAlive: isPidAlive(sleeper.pid),
+          detachedWorktreeGone: !existsSync(path.join(h.root, ".pi", "fleet", "wt", "fin-detached")),
+          unmergedDetachedBranchKept: await branchExists(h.root, "fleet/fin-detached"),
           errors: h.errors(),
         },
         {
-          remaining: ["keep-detached", "keep-idle", "keep-running", "keep-starting"],
+          directDetachedCleanOk: true,
+          dirtyCleanRejectedWithoutForce: true,
+          remaining: ["keep-idle", "keep-running", "keep-starting"],
           mergedBranchGone: true,
           unmergedDoneBranchKept: true,
           doneWorktreeGone: true,
+          detachedPidAlive: false,
+          detachedWorktreeGone: true,
+          unmergedDetachedBranchKept: true,
           errors: [],
         },
       );
     } finally {
+      try {
+        sleeper.kill();
+      } catch {
+        // already killed
+      }
       await h.cleanup();
     }
   });
@@ -765,6 +902,53 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     }
   });
 
+  it("transitions a member emitting FAILED: to failed status, stores full result, notifies error, resolves wait, and skips it on merge --done", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("passing-coder", "done", { unmergedCommit: true });
+
+      const fullFailed =
+        "FAILED: 2 blocker defects found\nDONE: parser step passed\n- auth.ts:42 missing signature check\n- session.ts:18 token leak";
+      await h.runTool({
+        action: "spawn",
+        name: "failing-rev",
+        role: "reviewer",
+        task: `DELAY_DONE:80:  ${fullFailed}  \n`,
+      });
+      const waitRes = await h.runTool({ action: "wait", name: "failing-rev", timeout: 1 });
+      const afterFailed = await loadManifest(h.root);
+
+      await h.runCommand("merge --done");
+      const afterMerge = await loadManifest(h.root);
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          failedStatus: afterFailed.members["failing-rev"].status,
+          failedResult: afterFailed.members["failing-rev"].result,
+          errorNotified: h.notifications.some(
+            (n) => n.level === "error" && n.text === "fleet member 'failing-rev' reports FAILED",
+          ),
+          waitHasFailedStatus: waitRes.text.includes("status=failed"),
+          waitHasFullResult: waitRes.text.includes(fullFailed),
+          failedSkippedOnMergeDone: afterMerge.members["failing-rev"].status,
+          doneMergedOnMergeDone: afterMerge.members["passing-coder"].status,
+        },
+        {
+          failedStatus: "failed",
+          failedResult: fullFailed,
+          errorNotified: true,
+          waitHasFailedStatus: true,
+          waitHasFullResult: true,
+          failedSkippedOnMergeDone: "failed",
+          doneMergedOnMergeDone: "merged",
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("keeps the final DONE message untruncated in log while truncating earlier assistant messages", async () => {
     const h = await createHarness();
     try {
@@ -798,16 +982,52 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
 
       const logRes = await h.runTool({ action: "log", name: "logger", n: 10 });
 
+      await h.seedMember("fail-logger", "failed");
+      const failLogPath = path.join(h.root, ".pi", "fleet", "logs", "fail-logger.jsonl");
+      const earlierFailed = `FAILED: initial failure\n${"d".repeat(260)}`;
+      const finalFailed = `FAILED: final blocker report\n\nSection 1:\n${"e".repeat(260)}\n\nSection 2: unresolved`;
+
+      await writeFile(
+        failLogPath,
+        [
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: earlierDone },
+          }),
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: earlierFailed },
+          }),
+          JSON.stringify({
+            type: "message_end",
+            message: { role: "assistant", content: finalFailed },
+          }),
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      const failLogRes = await h.runTool({ action: "log", name: "fail-logger", n: 10 });
+
       assert.deepEqual(
         {
           progressTruncated: !logRes.text.includes("a".repeat(240)) && logRes.text.includes("assistant: Investigating module "),
           earlierDoneTruncated: !logRes.text.includes("b".repeat(240)) && logRes.text.includes("assistant: DONE: first attempt "),
           finalDoneUntruncated: logRes.text.includes(`assistant: ${finalDone}`),
+          earlierDoneBeforeFailedTruncated:
+            !failLogRes.text.includes("b".repeat(240)) &&
+            failLogRes.text.includes("assistant: DONE: first attempt "),
+          earlierFailedTruncated:
+            !failLogRes.text.includes("d".repeat(240)) &&
+            failLogRes.text.includes("assistant: FAILED: initial failure "),
+          finalFailedUntruncated: failLogRes.text.includes(`assistant: ${finalFailed}`),
         },
         {
           progressTruncated: true,
           earlierDoneTruncated: true,
           finalDoneUntruncated: true,
+          earlierDoneBeforeFailedTruncated: true,
+          earlierFailedTruncated: true,
+          finalFailedUntruncated: true,
         },
       );
     } finally {
@@ -1194,5 +1414,574 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     } finally {
       await h.cleanup();
     }
+  });
+
+  it("spawns a batch of members concurrently via members array and registers all in manifest.json", async () => {
+    const h = await createHarness();
+    try {
+      const res = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "rev-standards", role: "reviewer", task: "DELAY_DONE:80:DONE: standards ok" },
+          { name: "rev-spec", role: "reviewer", task: "DELAY_DONE:80:DONE: spec ok" },
+          { name: "coder-fix", role: "coder", task: "DELAY_DONE:80:DONE: fix applied" },
+        ],
+      });
+      const manAfterSpawn = await loadManifest(h.root);
+      const waitRes = await h.runTool({ action: "wait", name: "--all" });
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          isError: res.isError,
+          lines: res.text.split("\n"),
+          manifestNames: Object.keys(manAfterSpawn.members).sort(),
+          roles: {
+            standards: manAfterSpawn.members["rev-standards"]?.role,
+            spec: manAfterSpawn.members["rev-spec"]?.role,
+            coder: manAfterSpawn.members["coder-fix"]?.role,
+          },
+          allSettledInWait:
+            waitRes.text.includes("DONE: standards ok") &&
+            waitRes.text.includes("DONE: spec ok") &&
+            waitRes.text.includes("DONE: fix applied"),
+        },
+        {
+          isError: false,
+          lines: [
+            "fleet: spawned 'rev-standards' (reviewer) on fleet/rev-standards",
+            "fleet: spawned 'rev-spec' (reviewer) on fleet/rev-spec",
+            "fleet: spawned 'coder-fix' (coder) on fleet/coder-fix",
+          ],
+          manifestNames: ["coder-fix", "rev-spec", "rev-standards"],
+          roles: {
+            standards: "reviewer",
+            spec: "reviewer",
+            coder: "coder",
+          },
+          allSettledInWait: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("validates the entire spawn batch upfront and rejects without partial spawns when exceeding maxMembers or invalid", async () => {
+    const h = await createHarness();
+    try {
+      const cfgPath = path.join(h.root, ".pi", "fleet", "config.json");
+      const cfg = JSON.parse(await readFile(cfgPath, "utf8"));
+      await writeFile(cfgPath, JSON.stringify({ ...cfg, maxMembers: 2 }), "utf8");
+
+      const dupRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "m-dup", task: "First" },
+          { name: "m-dup", task: "Duplicate" },
+        ],
+      });
+
+      const invalidSecondRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "valid-first", task: "Should not be created" },
+          { name: "INVALID_NAME", task: "Bad name" },
+        ],
+      });
+
+      const overLimitRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "m1", task: "Task 1" },
+          { name: "m2", task: "Task 2" },
+          { name: "m3", task: "Task 3 exceeds maxMembers=2" },
+        ],
+      });
+
+      const badSecondRefRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "rollback-first", task: "Created then rolled back" },
+          { name: "bad-second", over: "nonexistent-ref", task: "Fails headRev" },
+        ],
+      });
+
+      const manAfterRejected = await loadManifest(h.root);
+      const validFirstWtExists = existsSync(path.join(h.root, ".pi", "fleet", "wt", "valid-first"));
+      const m1WtExists = existsSync(path.join(h.root, ".pi", "fleet", "wt", "m1"));
+      const rollbackFirstWtExists = existsSync(path.join(h.root, ".pi", "fleet", "wt", "rollback-first"));
+      const rollbackFirstBranchExists = await branchExists(h.root, "fleet/rollback-first");
+
+      await h.seedMember("resumable-done", "done", { result: "DONE: prior result" });
+      const resumeThenBadSecondRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "resumable-done", task: "Would re-spawn if batch succeeded" },
+          { name: "bad-second-2", over: "nonexistent-ref", task: "Fails validation" },
+        ],
+      });
+      const manAfterResumeRejected = await loadManifest(h.root);
+      await h.runTool({ action: "clean", name: "resumable-done", force: true });
+
+      await h.seedMember("existing-active", "running");
+      const conflictExistingRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "uncreated-peer", task: "Should not be created" },
+          { name: "existing-active", task: "Already running" },
+        ],
+      });
+      const overLimitWithActiveRes = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "batch-a", task: "Task A" },
+          { name: "batch-b", task: "Task B pushes live 1 + 2 > 2" },
+        ],
+      });
+      const manAfterActiveChecks = await loadManifest(h.root);
+
+      assert.deepEqual(
+        {
+          dupError: dupRes.isError,
+          invalidSecondError: invalidSecondRes.isError,
+          overLimitError: overLimitRes.isError && overLimitRes.text.includes("fleet is at max members (2)"),
+          badSecondRefError: badSecondRefRes.isError,
+          resumeThenBadSecondError: resumeThenBadSecondRes.isError,
+          resumablePreservedStatus: manAfterResumeRejected.members["resumable-done"]?.status,
+          resumablePreservedResult: manAfterResumeRejected.members["resumable-done"]?.result,
+          membersAfterRejected: Object.keys(manAfterRejected.members),
+          validFirstWtExists,
+          m1WtExists,
+          rollbackFirstWtExists,
+          rollbackFirstBranchExists,
+          conflictExistingError:
+            conflictExistingRes.isError &&
+            conflictExistingRes.text.includes("member 'existing-active' already exists with status 'running'"),
+          overLimitWithActiveError:
+            overLimitWithActiveRes.isError &&
+            overLimitWithActiveRes.text.includes("fleet is at max members (2)"),
+          membersAfterActiveChecks: Object.keys(manAfterActiveChecks.members),
+        },
+        {
+          dupError: true,
+          invalidSecondError: true,
+          overLimitError: true,
+          badSecondRefError: true,
+          resumeThenBadSecondError: true,
+          resumablePreservedStatus: "done",
+          resumablePreservedResult: "DONE: prior result",
+          membersAfterRejected: [],
+          validFirstWtExists: false,
+          m1WtExists: false,
+          rollbackFirstWtExists: false,
+          rollbackFirstBranchExists: false,
+          conflictExistingError: true,
+          overLimitWithActiveError: true,
+          membersAfterActiveChecks: ["existing-active"],
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("leaves resumed members untouched and removes re-attached worktrees when a batch fails during worktree creation", async () => {
+    const h = await createHarness();
+    try {
+      const goneWt = (await h.seedMember("gone-wt", "stopped")).worktree;
+      await git(h.root, "worktree", "remove", "--force", goneWt);
+
+      await h.runTool({ action: "spawn", name: "live-done", task: "FINISH_NOW:DONE: first run" });
+      await h.runTool({ action: "wait", name: "live-done" });
+      const livePid = (await loadManifest(h.root)).members["live-done"]?.pid;
+
+      await git(h.root, "branch", "fleet/collide");
+      const res = await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "live-done", task: "Second run" },
+          { name: "gone-wt", task: "Re-attached, then rolled back" },
+          { name: "collide", task: "addWorktree fails because the branch exists" },
+        ],
+      });
+      const after = (await loadManifest(h.root)).members;
+      const actual = {
+        error: res.isError,
+        liveStatus: after["live-done"]?.status,
+        liveResult: after["live-done"]?.result,
+        livePidAlive: !!livePid && isPidAlive(livePid),
+        goneWtStatus: after["gone-wt"]?.status,
+        goneWtReattached: existsSync(goneWt),
+        collideInManifest: "collide" in after,
+      };
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(actual, {
+        error: true,
+        liveStatus: "done",
+        liveResult: "DONE: first run",
+        livePidAlive: true,
+        goneWtStatus: "stopped",
+        goneWtReattached: false,
+        collideInManifest: false,
+      });
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("serializes manifest writes and preserves all members across concurrent spawn calls and status updates", async () => {
+    const h = await createHarness();
+    try {
+      const m1 = await loadManifest(h.root);
+      const m2 = await loadManifest(h.root);
+      await Promise.all([
+        saveManifest(m1),
+        saveManifest(m2),
+        saveManifest(m1),
+        saveManifest(m2),
+      ]);
+
+      const spawnResults = await Promise.all([
+        h.runTool({
+          action: "spawn",
+          name: "c1",
+          task: "FINISH_NOW:DONE: c1 finished",
+        }),
+        h.runTool({
+          action: "spawn",
+          name: "c2",
+          task: "FINISH_NOW:DONE: c2 finished",
+        }),
+        h.runTool({
+          action: "spawn",
+          name: "c3",
+          task: "FINISH_NOW:DONE: c3 finished",
+        }),
+      ]);
+
+      const waitRes = await h.runTool({ action: "wait", name: "--all" });
+      await h.runCommand("stop --all");
+      const finalMan = await loadManifest(h.root);
+
+      assert.deepEqual(
+        {
+          anySpawnError: spawnResults.some((r) => r.isError),
+          waitError: waitRes.isError,
+          manifestMembers: Object.keys(finalMan.members).sort(),
+          results: {
+            c1: finalMan.members.c1?.result,
+            c2: finalMan.members.c2?.result,
+            c3: finalMan.members.c3?.result,
+          },
+        },
+        {
+          anySpawnError: false,
+          waitError: false,
+          manifestMembers: ["c1", "c2", "c3"],
+          results: {
+            c1: "DONE: c1 finished",
+            c2: "DONE: c2 finished",
+            c3: "DONE: c3 finished",
+          },
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("auto-cleans transient members on DONE (keeping unmerged branch, deleting merged branch), resolves wait, keeps non-transient members, and keeps a transient member with uncommitted work", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "trans-unmerged",
+        transient: true,
+        task: "Hold for unmerged commit",
+      });
+      const unmergedWt = path.join(h.root, ".pi", "fleet", "wt", "trans-unmerged");
+      await writeFile(path.join(unmergedWt, "feature.txt"), "feature\n", "utf8");
+      await git(unmergedWt, "add", "feature.txt");
+      await git(unmergedWt, "commit", "-m", "work by trans-unmerged");
+
+      await h.runTool({
+        action: "send",
+        name: "trans-unmerged",
+        message: "DELAY_DONE:60:DONE: unmerged transient finished",
+      });
+      const inFlightWait = await h.runTool({ action: "wait", name: "trans-unmerged" });
+      const postCleanWait = await h.runTool({ action: "wait", name: "trans-unmerged" });
+
+      await h.runCommand('spawn --transient trans-merged "FINISH_NOW:DONE: merged transient finished"');
+      const mergedWait = await h.runTool({ action: "wait", name: "trans-merged" });
+
+      await h.runTool({
+        action: "spawn",
+        name: "persistent-coder",
+        task: "FINISH_NOW:DONE: persistent finished",
+      });
+      const persistentWait = await h.runTool({ action: "wait", name: "persistent-coder" });
+
+      await h.runTool({ action: "spawn", name: "trans-dirty", transient: true, task: "Hold for uncommitted work" });
+      const dirtyWt = path.join(h.root, ".pi", "fleet", "wt", "trans-dirty");
+      await writeFile(path.join(dirtyWt, "uncommitted.txt"), "work in progress\n", "utf8");
+      await h.runTool({
+        action: "send",
+        name: "trans-dirty",
+        message: "DELAY_DONE:60:DONE: dirty transient finished",
+      });
+      const dirtyWait = await h.runTool({ action: "wait", name: "trans-dirty" });
+      await h.runCommand("stop --all");
+
+      const man = await loadManifest(h.root);
+
+      assert.deepEqual(
+        {
+          unmergedInManifest: "trans-unmerged" in man.members,
+          unmergedWorktreeExists: existsSync(unmergedWt),
+          unmergedBranchKept: await branchExists(h.root, "fleet/trans-unmerged"),
+          inFlightWaitOk:
+            !inFlightWait.isError &&
+            inFlightWait.text.includes("status=done") &&
+            inFlightWait.text.includes("work by trans-unmerged") &&
+            inFlightWait.text.includes("DONE: unmerged transient finished"),
+          postCleanWaitOk:
+            !postCleanWait.isError &&
+            postCleanWait.text.includes("status=done") &&
+            postCleanWait.text.includes("work by trans-unmerged") &&
+            postCleanWait.text.includes("DONE: unmerged transient finished"),
+          mergedInManifest: "trans-merged" in man.members,
+          mergedWorktreeExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "trans-merged")),
+          mergedBranchGone: !(await branchExists(h.root, "fleet/trans-merged")),
+          mergedWaitOk:
+            !mergedWait.isError &&
+            mergedWait.text.includes("status=done") &&
+            mergedWait.text.includes("DONE: merged transient finished"),
+          persistentInManifest: "persistent-coder" in man.members,
+          persistentWorktreeExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "persistent-coder")),
+          persistentWaitOk: !persistentWait.isError && persistentWait.text.includes("DONE: persistent finished"),
+          dirtyStatus: man.members["trans-dirty"]?.status,
+          dirtyWorkKept: existsSync(path.join(dirtyWt, "uncommitted.txt")),
+          dirtyWaitOk: !dirtyWait.isError && dirtyWait.text.includes("DONE: dirty transient finished"),
+          dirtyCleanFailureNotified: h.errors().some((e) => e.includes("kept transient member 'trans-dirty'")),
+        },
+        {
+          unmergedInManifest: false,
+          unmergedWorktreeExists: false,
+          unmergedBranchKept: true,
+          inFlightWaitOk: true,
+          postCleanWaitOk: true,
+          mergedInManifest: false,
+          mergedWorktreeExists: false,
+          mergedBranchGone: true,
+          mergedWaitOk: true,
+          persistentInManifest: true,
+          persistentWorktreeExists: true,
+          persistentWaitOk: true,
+          dirtyStatus: "done",
+          dirtyWorkKept: true,
+          dirtyWaitOk: true,
+          dirtyCleanFailureNotified: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("preserves transient members when spawn fails, process exits without DONE (code 0 or non-zero), or member reports FAILED", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "trans-exit-0",
+        transient: true,
+        task: "EXIT_AFTER:60:0",
+      });
+      const exit0Wait = await h.runTool({ action: "wait", name: "trans-exit-0" });
+
+      const spawnFailRes = await h.runTool({
+        action: "spawn",
+        name: "spawn-fail-trans",
+        transient: true,
+        task: "Should fail during startup",
+      });
+
+      await h.runTool({
+        action: "spawn",
+        name: "trans-exit-1",
+        transient: true,
+        task: "EXIT_AFTER:60:1",
+      });
+      await h.runTool({ action: "wait", name: "trans-exit-1" });
+
+      await h.runTool({
+        action: "spawn",
+        name: "trans-failed-msg",
+        transient: true,
+        task: "DELAY_DONE:60:FAILED: blocker defect found",
+      });
+      await h.runTool({ action: "wait", name: "trans-failed-msg" });
+
+      const man = await loadManifest(h.root);
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          exit0WaitStatusFailed: !exit0Wait.isError && exit0Wait.text.includes("status=failed"),
+          exit0Status: man.members["trans-exit-0"]?.status,
+          exit0WorktreeExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "trans-exit-0")),
+          exit0BranchExists: await branchExists(h.root, "fleet/trans-exit-0"),
+          spawnFailError: spawnFailRes.isError,
+          spawnFailStatus: man.members["spawn-fail-trans"]?.status,
+          spawnFailWorktreeExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "spawn-fail-trans")),
+          spawnFailBranchExists: await branchExists(h.root, "fleet/spawn-fail-trans"),
+          exit1Status: man.members["trans-exit-1"]?.status,
+          exit1WorktreeExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "trans-exit-1")),
+          exit1BranchExists: await branchExists(h.root, "fleet/trans-exit-1"),
+          failedMsgStatus: man.members["trans-failed-msg"]?.status,
+          failedMsgWorktreeExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "trans-failed-msg")),
+          failedMsgBranchExists: await branchExists(h.root, "fleet/trans-failed-msg"),
+        },
+        {
+          exit0WaitStatusFailed: true,
+          exit0Status: "failed",
+          exit0WorktreeExists: true,
+          exit0BranchExists: true,
+          spawnFailError: true,
+          spawnFailStatus: "failed",
+          spawnFailWorktreeExists: true,
+          spawnFailBranchExists: true,
+          exit1Status: "failed",
+          exit1WorktreeExists: true,
+          exit1BranchExists: true,
+          failedMsgStatus: "failed",
+          failedMsgWorktreeExists: true,
+          failedMsgBranchExists: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("applies reviewer autoClean=true by default and allows role config and spawn transient flags to override in both directions", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "rev-auto", role: "reviewer", task: "FINISH_NOW:DONE: rev auto" },
+          { name: "tester-keep", role: "tester", task: "FINISH_NOW:DONE: tester keep" },
+        ],
+      });
+      await h.runCommand('spawn --role reviewer --no-transient rev-keep "FINISH_NOW:DONE: rev keep"');
+      await h.runTool({ action: "wait", name: "--all" });
+      const manDefault = await loadManifest(h.root);
+      await h.runCommand("stop --all");
+
+      const hCfg = await createHarness();
+      try {
+        const cfgPath = path.join(hCfg.root, ".pi", "fleet", "config.json");
+        const baseCfg = JSON.parse(await readFile(cfgPath, "utf8"));
+        await writeFile(
+          cfgPath,
+          JSON.stringify({
+            ...baseCfg,
+            roles: {
+              reviewer: { autoClean: false },
+              coder: { autoClean: true },
+            },
+          }),
+          "utf8",
+        );
+
+        await hCfg.runTool({
+          action: "spawn",
+          members: [
+            { name: "rev-cfg-keep", role: "reviewer", task: "FINISH_NOW:DONE: rev cfg keep" },
+            { name: "coder-cfg-auto", role: "coder", task: "FINISH_NOW:DONE: coder cfg auto" },
+            {
+              name: "coder-cfg-keep",
+              role: "coder",
+              transient: false,
+              task: "FINISH_NOW:DONE: coder cfg keep",
+            },
+          ],
+        });
+        await hCfg.runCommand(
+          'spawn --role reviewer --transient rev-cfg-trans "FINISH_NOW:DONE: rev cfg trans"',
+        );
+        await hCfg.runTool({ action: "wait", name: "--all" });
+        const manCfg = await loadManifest(hCfg.root);
+        await hCfg.runCommand("stop --all");
+
+        assert.deepEqual(
+          {
+            defaultRevAutoCleaned:
+              !("rev-auto" in manDefault.members) &&
+              !existsSync(path.join(h.root, ".pi", "fleet", "wt", "rev-auto")),
+            defaultTesterKept:
+              "tester-keep" in manDefault.members &&
+              existsSync(path.join(h.root, ".pi", "fleet", "wt", "tester-keep")),
+            defaultRevOptOutKept:
+              "rev-keep" in manDefault.members &&
+              existsSync(path.join(h.root, ".pi", "fleet", "wt", "rev-keep")),
+            cfgRevKeptByDefault:
+              "rev-cfg-keep" in manCfg.members &&
+              existsSync(path.join(hCfg.root, ".pi", "fleet", "wt", "rev-cfg-keep")),
+            cfgRevTransientOverrideCleaned:
+              !("rev-cfg-trans" in manCfg.members) &&
+              !existsSync(path.join(hCfg.root, ".pi", "fleet", "wt", "rev-cfg-trans")),
+            cfgCoderAutoCleanedByDefault:
+              !("coder-cfg-auto" in manCfg.members) &&
+              !existsSync(path.join(hCfg.root, ".pi", "fleet", "wt", "coder-cfg-auto")),
+            cfgCoderOptOutKept:
+              "coder-cfg-keep" in manCfg.members &&
+              existsSync(path.join(hCfg.root, ".pi", "fleet", "wt", "coder-cfg-keep")),
+          },
+          {
+            defaultRevAutoCleaned: true,
+            defaultTesterKept: true,
+            defaultRevOptOutKept: true,
+            cfgRevKeptByDefault: true,
+            cfgRevTransientOverrideCleaned: true,
+            cfgCoderAutoCleanedByDefault: true,
+            cfgCoderOptOutKept: true,
+          },
+        );
+      } finally {
+        await hCfg.cleanup();
+      }
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("roleAppend", () => {
+  it("instructs coder, tester, reviewer, and integrator when to emit DONE: versus FAILED:", () => {
+    const coder = roleAppend("coder");
+    const tester = roleAppend("tester");
+    const reviewer = roleAppend("reviewer");
+    const integrator = roleAppend("integrator");
+
+    assert.deepEqual(
+      {
+        coderHasDoneAndFailed: coder.includes("DONE:") && coder.includes("FAILED:"),
+        testerHasDoneAndFailed: tester.includes("DONE:") && tester.includes("FAILED:"),
+        reviewerHasDoneAndFailed:
+          reviewer.includes("DONE:") && reviewer.includes("FAILED:") && /blocker/i.test(reviewer),
+        integratorHasDoneAndFailed: integrator.includes("DONE:") && integrator.includes("FAILED:"),
+      },
+      {
+        coderHasDoneAndFailed: true,
+        testerHasDoneAndFailed: true,
+        reviewerHasDoneAndFailed: true,
+        integratorHasDoneAndFailed: true,
+      },
+    );
   });
 });
