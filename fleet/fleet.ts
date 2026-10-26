@@ -1043,7 +1043,7 @@ export class Fleet {
         await this.save();
         const msg = err instanceof Error ? err.message : String(err);
         this.ui.notify(
-          `fleet: kept transient member '${name}' because clean failed (${msg}); merge it or run /fleet clean ${name} --force`,
+          `fleet: kept transient member '${name}' because clean failed (${msg}); commit or discard its changes, then run /fleet clean ${name}`,
           "error",
         );
       }
