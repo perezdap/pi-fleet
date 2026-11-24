@@ -219,11 +219,11 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params: any, _signal, _onUpdate, ctx: any) {
+    async execute(_toolCallId, params: any, signal, _onUpdate, ctx: any) {
       try {
         const cmd = toolParamsToCommand(params);
         const fleet = await getFleet(ctx);
-        const { messages } = await fleet.execute(cmd);
+        const { messages } = await fleet.execute(cmd, signal);
         return {
           content: [{ type: "text", text: messages.map((m) => m.text).join("\n") }],
           details: {},

@@ -21,12 +21,23 @@ export function parseCommitRange(over?: string): CommitRange | undefined {
 
 const pExecFile = promisify(execFile);
 
-export async function git(cwd: string, ...args: string[]): Promise<string> {
+async function gitRaw(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await pExecFile("git", args, {
     cwd,
     maxBuffer: 32 * 1024 * 1024,
   });
-  return stdout.trim();
+  return stdout.replace(/[\r\n]+$/, "");
+}
+
+export async function git(cwd: string, ...args: string[]): Promise<string> {
+  return (await gitRaw(cwd, ...args)).trim();
+}
+
+function extractGitError(err: any): string {
+  for (const candidate of [err?.stderr, err?.stdout, err?.message]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return String(err);
 }
 
 export async function tryGit(
@@ -36,7 +47,18 @@ export async function tryGit(
   try {
     return { ok: true, out: await git(cwd, ...args) };
   } catch (err: any) {
-    return { ok: false, out: String(err?.stderr ?? err?.message ?? err) };
+    return { ok: false, out: extractGitError(err) };
+  }
+}
+
+async function tryGitRaw(
+  cwd: string,
+  ...args: string[]
+): Promise<{ ok: boolean; out: string }> {
+  try {
+    return { ok: true, out: await gitRaw(cwd, ...args) };
+  } catch (err: any) {
+    return { ok: false, out: extractGitError(err) };
   }
 }
 
@@ -45,7 +67,10 @@ export async function repoRoot(cwd: string): Promise<string> {
 }
 
 export async function headRev(cwd: string, ref = "HEAD"): Promise<string> {
-  return git(cwd, "rev-parse", ref);
+  if (ref.startsWith("-")) {
+    throw new Error(`invalid git ref '${ref}'`);
+  }
+  return git(cwd, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`);
 }
 
 export async function addWorktree(
@@ -103,11 +128,16 @@ export interface MergeResult {
 
 /** Merge `branch` into the current HEAD of `root`. Aborts on conflict and reports files. */
 export async function mergeBranch(root: string, branch: string, message: string): Promise<MergeResult> {
+  const alreadyMerging = (await tryGit(root, "rev-parse", "--verify", "-q", "MERGE_HEAD")).ok;
   const r = await tryGit(root, "merge", "--no-ff", branch, "-m", message);
   if (r.ok) return { ok: true, conflicts: [], output: r.out };
-  const u = await tryGit(root, "diff", "--name-only", "--diff-filter=U");
-  const conflicts = u.ok ? u.out.split("\n").filter(Boolean) : [];
-  await tryGit(root, "merge", "--abort");
+  const nowMerging = (await tryGit(root, "rev-parse", "--verify", "-q", "MERGE_HEAD")).ok;
+  let conflicts: string[] = [];
+  if (!alreadyMerging && nowMerging) {
+    const u = await tryGit(root, "diff", "--name-only", "--diff-filter=U");
+    conflicts = u.ok ? u.out.split("\n").filter(Boolean) : [];
+    await tryGit(root, "merge", "--abort");
+  }
   return { ok: false, conflicts, output: r.out };
 }
 
@@ -119,7 +149,7 @@ export async function diffForReview(
   dots: RangeDots = "...",
 ): Promise<string> {
   const range = `${baseRef}${dots}${branch}`;
-  const stat = await tryGit(root, "diff", "--stat", range);
-  const diff = await tryGit(root, "diff", range);
+  const stat = await tryGitRaw(root, "diff", "--stat", range);
+  const diff = await tryGitRaw(root, "diff", range);
   return [stat.ok ? stat.out : "", diff.ok ? diff.out : ""].filter(Boolean).join("\n\n");
 }

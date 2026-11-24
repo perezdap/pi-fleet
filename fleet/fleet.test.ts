@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn as spawnChild } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { loadFleetConfig } from "./config.ts";
 import { parseFleetCommand, planOpenLaunch, toolParamsToCommand } from "./fleet.ts";
-import { addWorktree, branchExists, git, headRev, mergeBranch } from "./gitw.ts";
+import { addWorktree, branchExists, diffForReview, git, headRev, mergeBranch } from "./gitw.ts";
 import registerFleet from "./index.ts";
 import { isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import { roleAppend } from "./roles.ts";
@@ -85,6 +86,17 @@ process.stdin.on("data", (chunk) => {
         setTimeout(() => {
           process.exit(Number(payload));
         }, ms);
+      } else if (msg.type === "prompt" && activeMsg.startsWith("DONE_AND_EXIT:")) {
+        const { ms, payload } = parseTimedPayload("DONE_AND_EXIT:");
+        process.stdout.write(JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", content: payload },
+        }) + "\\n");
+        setTimeout(() => {
+          process.exit(0);
+        }, ms);
+      } else if (msg.type === "prompt" && activeMsg.startsWith("BUSY_NOW")) {
+        process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
       }
     }
   }
@@ -98,7 +110,7 @@ interface TestHarness {
   errors: () => string[];
   reconcileSession: () => Promise<void>;
   runCommand: (args: string) => Promise<void>;
-  runTool: (params: Record<string, unknown>) => Promise<{ text: string; isError: boolean }>;
+  runTool: (params: Record<string, unknown>, signal?: AbortSignal) => Promise<{ text: string; isError: boolean }>;
   seedMember: (
     name: string,
     status: MemberStatus,
@@ -257,9 +269,9 @@ async function createHarness(): Promise<TestHarness> {
       assert.ok(commandHandler);
       await commandHandler(args, ctx);
     },
-    runTool: async (params: Record<string, unknown>) => {
+    runTool: async (params: Record<string, unknown>, signal?: AbortSignal) => {
       assert.ok(toolExecutor);
-      const res = await toolExecutor("call-1", params, undefined, undefined, ctx);
+      const res = await toolExecutor("call-1", params, signal, undefined, ctx);
       return {
         text: res.content.map((c: any) => c.text).join("\n"),
         isError: !!res.isError,
@@ -2468,6 +2480,364 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       await h.cleanup();
     }
   });
+
+  it("reports actual git error on non-conflict merge failure and rejects flag injection in headRev", async () => {
+    const h = await createHarness();
+    try {
+      const m1 = await h.seedMember("dirty-merge", "done");
+      await writeFile(path.join(m1.worktree, "README.md"), "branch edit\n", "utf8");
+      await git(m1.worktree, "add", "README.md");
+      await git(m1.worktree, "commit", "-m", "edit readme on branch");
+
+      await writeFile(path.join(h.root, "README.md"), "dirty supervisor edit\n", "utf8");
+      await h.runCommand("merge dirty-merge");
+      const mergeErrors = h.errors();
+
+      await assert.rejects(() => headRev(h.root, "--all"), /invalid git ref/);
+      const badOverRes = await h.runTool({
+        action: "spawn",
+        name: "flag-over",
+        over: "--all",
+        task: "Should reject flag injection",
+      });
+
+      assert.deepEqual(
+        {
+          hasFailedDetail: mergeErrors.some(
+            (e) =>
+              e.includes("fleet: merge dirty-merge failed:") &&
+              !e.includes("CONFLICTS in:") &&
+              /local changes|overwritten/i.test(e),
+          ),
+          badOverRejected: badOverRes.isError && badOverRes.text.includes("invalid git ref"),
+        },
+        {
+          hasFailedDetail: true,
+          badOverRejected: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("reports accurate clean --force branch outcomes and tolerates externally deleted branches", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("unmerged-force", "done", { unmergedCommit: true });
+      const forceRes = await h.runTool({ action: "clean", name: "unmerged-force", force: true });
+
+      const absent = await h.seedMember("absent-branch", "stopped");
+      await git(absent.worktree, "checkout", "--detach");
+      await git(h.root, "branch", "-D", "fleet/absent-branch");
+      const absentRes = await h.runTool({ action: "clean", name: "absent-branch", force: true });
+
+      assert.deepEqual(
+        {
+          forceMsg: forceRes.text,
+          absentOk: !absentRes.isError,
+          absentMsg: absentRes.text,
+        },
+        {
+          forceMsg: "fleet: cleaned 'unmerged-force' (worktree removed, unmerged branch force-deleted)",
+          absentOk: true,
+          absentMsg: "fleet: cleaned 'absent-branch' (worktree removed, branch already absent)",
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("preserves model CLI flag across resume and clears stale pid before resume startup", async () => {
+    const h = await createHarness();
+    const sleeper = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "res-model",
+        model: "custom/keep-model",
+        task: "Initial work",
+      });
+      await h.runCommand("stop res-model");
+      const argvPath = path.join(h.root, ".pi", "fleet", "wt", "res-model", ".rpc-argv.json");
+      await rm(argvPath, { force: true });
+
+      await h.runCommand("resume res-model");
+      await h.runCommand("stop res-model");
+      const resumedArgv: string[] = JSON.parse(await readFile(argvPath, "utf8"));
+      const modelIdx = resumedArgv.indexOf("--model");
+
+      await h.seedMember("spawn-fail-pid", "stopped");
+      const manSeed = await loadManifest(h.root);
+      manSeed.members["spawn-fail-pid"].pid = sleeper.pid;
+      await saveManifest(manSeed);
+
+      await h.runCommand("resume spawn-fail-pid");
+      const afterFailMan = await loadManifest(h.root);
+
+      assert.deepEqual(
+        {
+          resumedModelFlag: modelIdx >= 0 ? resumedArgv[modelIdx + 1] : undefined,
+          manifestModel: afterFailMan.members["res-model"]?.model,
+          stalePidNotKilled: isPidAlive(sleeper.pid),
+          failedStatus: afterFailMan.members["spawn-fail-pid"]?.status,
+          failedPidCleared: afterFailMan.members["spawn-fail-pid"]?.pid,
+        },
+        {
+          resumedModelFlag: "custom/keep-model",
+          manifestModel: "custom/keep-model",
+          stalePidNotKilled: true,
+          failedStatus: "failed",
+          failedPidCleared: undefined,
+        },
+      );
+    } finally {
+      try {
+        sleeper.kill();
+      } catch {
+        // already killed
+      }
+      await h.cleanup();
+    }
+  });
+
+  it("aborts wait promptly when AbortSignal fires", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "slow-abort",
+        task: "Stay running until prompted",
+      });
+
+      const preAborted = await h.runTool(
+        { action: "wait", name: "slow-abort" },
+        AbortSignal.abort(),
+      );
+
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 80);
+      const start = Date.now();
+      const midAborted = await h.runTool({ action: "wait", name: "slow-abort" }, ac.signal);
+      const elapsed = Date.now() - start;
+
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          preAborted: preAborted.isError && preAborted.text.includes("wait aborted"),
+          midAborted: midAborted.isError && midAborted.text.includes("wait aborted"),
+          fastAbort: elapsed < 1_500,
+        },
+        {
+          preAborted: true,
+          midAborted: true,
+          fastAbort: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("rejects path traversal and fractional counts on log and unknown members on stop", async () => {
+    const h = await createHarness();
+    try {
+      const traversalRes = await h.runTool({ action: "log", name: "../secret" });
+      const fracRes = await h.runTool({ action: "log", name: "m1", n: 0.5 });
+      const stopUnknownRes = await h.runTool({ action: "stop", name: "unknown-member" });
+
+      assert.throws(() => parseFleetCommand('spawn a "   "'), /usage: \/fleet spawn/);
+      assert.throws(() => parseFleetCommand("spawn --model --role coder a task"), /usage: \/fleet spawn/);
+      assert.throws(() => parseFleetCommand("spawn --over --transient a task"), /usage: \/fleet spawn/);
+      assert.throws(() => parseFleetCommand('send a "   "'), /usage: \/fleet send/);
+      assert.throws(() => parseFleetCommand("log a 0.5"), /usage: \/fleet log/);
+      assert.throws(() => parseFleetCommand("log a 5 extra"), /usage: \/fleet log/);
+      assert.throws(() => toolParamsToCommand({ action: "spawn", name: "   ", task: "ok" }), /spawn requires/);
+      assert.throws(() => toolParamsToCommand({ action: "send", name: "a", message: "   " }), /send requires/);
+
+      assert.deepEqual(
+        {
+          traversalRejected: traversalRes.isError && traversalRes.text.includes("invalid member name"),
+          fracRejected: fracRes.isError && fracRes.text.includes("usage: /fleet log"),
+          stopUnknownRejected: stopUnknownRes.isError && stopUnknownRes.text.includes("no such member 'unknown-member'"),
+        },
+        {
+          traversalRejected: true,
+          fracRejected: true,
+          stopUnknownRejected: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("clears pid when an attached done member exits naturally and steers busy members on send", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "done-exit",
+        task: "DONE_AND_EXIT:60:DONE: finished cleanly",
+      });
+      await h.runTool({ action: "wait", name: "done-exit" });
+      await new Promise((r) => setTimeout(r, 150));
+      const manAfterExit = await loadManifest(h.root);
+
+      await h.runTool({
+        action: "spawn",
+        name: "busy-steer",
+        task: "BUSY_NOW",
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      const steerRes = await h.runTool({
+        action: "send",
+        name: "busy-steer",
+        message: "Adjust plan",
+      });
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          doneStatus: manAfterExit.members["done-exit"]?.status,
+          donePid: manAfterExit.members["done-exit"]?.pid,
+          steerText: steerRes.text,
+        },
+        {
+          doneStatus: "done",
+          donePid: undefined,
+          steerText: "fleet: sent to 'busy-steer' (steer)",
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("renders status glyphs for stopped, detached, stale, and merged members while keeping '·' for non-live done", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("g-stopped", "stopped", { createdAt: 1 });
+      await h.seedMember("g-detached", "detached", { createdAt: 2 });
+      await h.seedMember("g-stale", "stale", { createdAt: 3 });
+      await h.seedMember("g-merged", "merged", { createdAt: 4 });
+      await h.seedMember("g-done", "done", { createdAt: 5 });
+
+      const statusRes = await h.runTool({ action: "status" });
+      const lines = statusRes.text.split("\n");
+
+      assert.deepEqual(
+        {
+          stopped: lines.some((l) => l.startsWith(" ■ g-stopped ")),
+          detached: lines.some((l) => l.startsWith(" △ g-detached ")),
+          stale: lines.some((l) => l.startsWith(" ✗ g-stale ")),
+          merged: lines.some((l) => l.startsWith(" ✔ g-merged ")),
+          doneNonLive: lines.some((l) => l.startsWith(" · g-done ")),
+        },
+        {
+          stopped: true,
+          detached: true,
+          stale: true,
+          merged: true,
+          doneNonLive: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("uses dynamic backtick fence in review-context.md and preserves diff --stat leading alignment", async () => {
+    const h = await createHarness();
+    try {
+      const m = await h.seedMember("fence-src", "done");
+      await writeFile(
+        path.join(m.worktree, "doc.md"),
+        "example\n```ts\nconst x = 1;\n```\n",
+        "utf8",
+      );
+      await git(m.worktree, "add", "doc.md");
+      await git(m.worktree, "commit", "-m", "add fenced doc");
+
+      const rawDiff = await diffForReview(h.root, m.baseRef, m.branch);
+      await h.runTool({
+        action: "spawn",
+        name: "rev-fence",
+        role: "reviewer",
+        over: m.branch,
+        transient: false,
+        task: "Check fenced diff",
+      });
+      await h.runCommand("stop --all");
+
+      const ctx = await readFile(
+        path.join(h.root, ".pi", "fleet", "wt", "rev-fence", ".pi", "fleet", "review-context.md"),
+        "utf8",
+      );
+
+      assert.deepEqual(
+        {
+          statLeadingSpace: rawDiff.startsWith(" doc.md "),
+          usesFourBacktickFence: ctx.includes("````diff\n") && ctx.includes("\n````\n"),
+        },
+        {
+          statLeadingSpace: true,
+          usesFourBacktickFence: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("reconciles unattached active members into stale (dead pid) and detached (live pid)", async () => {
+    const h = await createHarness();
+    const sleeper = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    try {
+      await h.seedMember("rec-dead", "running");
+      await h.seedMember("rec-live", "idle");
+      const man = await loadManifest(h.root);
+      man.members["rec-live"].pid = sleeper.pid;
+      await saveManifest(man);
+
+      await h.reconcileSession();
+      const after = await loadManifest(h.root);
+
+      assert.deepEqual(
+        {
+          deadStatus: after.members["rec-dead"]?.status,
+          liveStatus: after.members["rec-live"]?.status,
+          warnedDead: h.notifications.some(
+            (n) => n.level === "warn" && n.text.includes("'rec-dead' is stale"),
+          ),
+          warnedLive: h.notifications.some(
+            (n) => n.level === "warn" && n.text.includes("'rec-live' is detached"),
+          ),
+        },
+        {
+          deadStatus: "stale",
+          liveStatus: "detached",
+          warnedDead: true,
+          warnedLive: true,
+        },
+      );
+    } finally {
+      try {
+        sleeper.kill();
+      } catch {
+        // already killed
+      }
+      await h.cleanup();
+    }
+  });
 });
 
 describe("roleAppend", () => {
@@ -2670,6 +3040,132 @@ describe("RpcMember", () => {
           exitCallbacks: 1,
           sendRejected: true,
           exitLogRemoved: true,
+        },
+      );
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("decodes split multi-byte UTF-8 sequences and flushes trailing lines without newline on stdout end", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-utf8-"));
+    try {
+      const mjsPath = path.join(tmpRoot, "split-utf8.mjs");
+      await writeFile(
+        mjsPath,
+        `
+const first = Buffer.from(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "OK ✓⚙" } }) + "\\n", "utf8");
+const splitAt = first.indexOf(0xe2) + 1;
+process.stdout.write(first.subarray(0, splitAt));
+setTimeout(() => {
+  process.stdout.write(first.subarray(splitAt));
+  process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "FINAL_NO_NL" } }));
+  process.exit(0);
+}, 20);
+`,
+        "utf8",
+      );
+      await chmod(mjsPath, 0o755);
+      let piBin = mjsPath;
+      if (process.platform === "win32") {
+        const cmdPath = path.join(tmpRoot, "split-utf8.cmd");
+        await writeFile(cmdPath, `@node "%~dp0split-utf8.mjs" %*\r\n`, "utf8");
+        piBin = cmdPath;
+      }
+
+      const logFile = path.join(tmpRoot, "utf8.jsonl");
+      const client = await RpcMember.create({
+        piBin,
+        cwd: tmpRoot,
+        args: [],
+        logFile,
+      });
+      const contents: string[] = [];
+      client.onEvent((ev) => {
+        if (ev.type === "message_end") contents.push(ev.message?.content);
+      });
+      await new Promise<void>((resolve) => {
+        client.onExit(() => resolve());
+      });
+
+      assert.deepEqual(contents, ["OK ✓⚙", "FINAL_NO_NL"]);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("loadFleetConfig and loadManifest", () => {
+  it("warns on malformed/null config values and backs up corrupt manifest while normalizing repoRoot", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-cfg-"));
+    try {
+      const noCfgWarnings: string[] = [];
+      const defaultCfg = await loadFleetConfig(tmpRoot, (w) => noCfgWarnings.push(w));
+
+      await mkdir(path.join(tmpRoot, ".pi", "fleet"), { recursive: true });
+      const cfgPath = path.join(tmpRoot, ".pi", "fleet", "config.json");
+
+      await writeFile(cfgPath, "null\n", "utf8");
+      const nullWarnings: string[] = [];
+      const nullCfg = await loadFleetConfig(tmpRoot, (w) => nullWarnings.push(w));
+
+      await writeFile(cfgPath, "{ bad json", "utf8");
+      const syntaxWarnings: string[] = [];
+      const syntaxCfg = await loadFleetConfig(tmpRoot, (w) => syntaxWarnings.push(w));
+
+      await writeFile(
+        cfgPath,
+        JSON.stringify({ maxMembers: 0, defaultRole: "invalid", worktreeRoot: 42 }),
+        "utf8",
+      );
+      const fieldWarnings: string[] = [];
+      const fieldCfg = await loadFleetConfig(tmpRoot, (w) => fieldWarnings.push(w));
+
+      const manPath = path.join(tmpRoot, ".pi", "fleet", "manifest.json");
+      await writeFile(
+        manPath,
+        JSON.stringify({ version: 1, repoRoot: "/wrong/root", members: {} }),
+        "utf8",
+      );
+      const normMan = await loadManifest(tmpRoot);
+
+      await writeFile(manPath, "{ corrupt manifest", "utf8");
+      const manWarnings: string[] = [];
+      const freshMan = await loadManifest(tmpRoot, (w) => manWarnings.push(w));
+      const fleetFiles = await readdir(path.join(tmpRoot, ".pi", "fleet"));
+
+      assert.deepEqual(
+        {
+          noCfgWarnings,
+          defaultRole: defaultCfg.defaultRole,
+          nullCfgMax: nullCfg.maxMembers,
+          nullWarned: nullWarnings.length === 1,
+          syntaxWarned: syntaxWarnings.length === 1,
+          syntaxCfgMax: syntaxCfg.maxMembers,
+          fieldMax: fieldCfg.maxMembers,
+          fieldRole: fieldCfg.defaultRole,
+          fieldWtRoot: fieldCfg.worktreeRoot,
+          fieldWarnCount: fieldWarnings.length,
+          normalizedRepoRoot: normMan.repoRoot,
+          freshMembers: freshMan.members,
+          manWarned: manWarnings.length === 1,
+          hasBackupFile: fleetFiles.some((f) => f.startsWith("manifest.json.corrupt.")),
+        },
+        {
+          noCfgWarnings: [],
+          defaultRole: "coder",
+          nullCfgMax: 6,
+          nullWarned: true,
+          syntaxWarned: true,
+          syntaxCfgMax: 6,
+          fieldMax: 6,
+          fieldRole: "coder",
+          fieldWtRoot: ".pi/fleet/wt",
+          fieldWarnCount: 2,
+          normalizedRepoRoot: tmpRoot,
+          freshMembers: {},
+          manWarned: true,
+          hasBackupFile: true,
         },
       );
     } finally {

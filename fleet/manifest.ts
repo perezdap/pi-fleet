@@ -1,6 +1,6 @@
 /** Manifest persistence: the disk-truth registry of fleet members. */
 
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { Manifest } from "./types.ts";
 
@@ -14,13 +14,37 @@ export function manifestPath(repoRoot: string): string {
 
 let tmpSeq = 0;
 
-export async function loadManifest(repoRoot: string): Promise<Manifest> {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export async function loadManifest(
+  repoRoot: string,
+  onWarn?: (msg: string) => void,
+): Promise<Manifest> {
+  const file = manifestPath(repoRoot);
+  let raw: string | undefined;
   try {
-    const parsed = JSON.parse(await readFile(manifestPath(repoRoot), "utf8"));
-    if (parsed?.version === 1 && parsed.members) return parsed as Manifest;
-  } catch {
-    // Missing or corrupt: fall through to a fresh manifest.
+    raw = await readFile(file, "utf8");
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") {
+      onWarn?.(`fleet: failed to read manifest.json (${err?.message ?? err}); starting fresh`);
+    }
+    return { version: 1, repoRoot, members: {} };
   }
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (isPlainObject(parsed) && parsed.version === 1 && isPlainObject(parsed.members)) {
+      return { ...(parsed as unknown as Manifest), repoRoot };
+    }
+  } catch {
+    // Invalid JSON falls through to backup and fresh manifest.
+  }
+
+  const backup = `${file}.corrupt.${Date.now()}`;
+  await copyFile(file, backup).catch(() => undefined);
+  onWarn?.(`fleet: invalid manifest.json; backed up to ${path.basename(backup)} and starting fresh`);
   return { version: 1, repoRoot, members: {} };
 }
 

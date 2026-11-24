@@ -6,7 +6,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { loadFleetConfig, piBinary, resolveRoleSpec } from "./config.ts";
 import {
@@ -127,6 +127,7 @@ export class Fleet {
 
   private clients = new Map<string, RpcMember>();
   private askWatchers = new Map<string, FSWatcher>();
+  private askTimers = new Map<string, NodeJS.Timeout>();
   private stateListeners = new Set<() => void>();
   private spawning = new Map<string, Promise<void>>();
   private cleaningTransient = new Set<string>();
@@ -145,12 +146,24 @@ export class Fleet {
   // ── state ────────────────────────────────────────────────────────────────
 
   private async config(): Promise<FleetConfig> {
-    this.cfgPromise ??= loadFleetConfig(this.root);
+    if (!this.cfgPromise) {
+      this.cfgPromise = loadFleetConfig(this.root, (msg) => this.ui.notify(msg, "warn")).catch((err) => {
+        this.cfgPromise = undefined;
+        throw err;
+      });
+    }
     return this.cfgPromise;
   }
 
   private async manifest(): Promise<Manifest> {
-    this.manPromise ??= loadManifest(this.root).then((man) => (this.man = man));
+    if (!this.manPromise) {
+      this.manPromise = loadManifest(this.root, (msg) => this.ui.notify(msg, "warn"))
+        .then((man) => (this.man = man))
+        .catch((err) => {
+          this.manPromise = undefined;
+          throw err;
+        });
+    }
     return this.manPromise;
   }
 
@@ -183,7 +196,7 @@ export class Fleet {
 
   // ── command dispatch ─────────────────────────────────────────────────────
 
-  async execute(cmd: FleetCommand): Promise<FleetResult> {
+  async execute(cmd: FleetCommand, signal?: AbortSignal): Promise<FleetResult> {
     switch (cmd.action) {
       case "help":
         return info([USAGE]);
@@ -215,8 +228,8 @@ export class Fleet {
       }
 
       case "resume": {
-        const resumed = await this.resume(cmd.name, cmd.extra);
-        return info([`fleet: resumed '${resumed.name}'`]);
+        await this.resume(cmd.name, cmd.extra);
+        return info([`fleet: resumed '${cmd.name}'`]);
       }
 
       case "send": {
@@ -225,7 +238,7 @@ export class Fleet {
       }
 
       case "wait": {
-        return this.waitForMembers(cmd.target, cmd.mode ?? "all", cmd.timeout);
+        return this.waitForMembers(cmd.target, cmd.mode ?? "all", cmd.timeout, signal);
       }
 
       case "log": {
@@ -250,8 +263,12 @@ export class Fleet {
           if (result.ok) {
             messages.push({ text: `fleet: merged ${name}`, level: "info" });
           } else {
+            const detail =
+              result.conflicts.length > 0
+                ? `CONFLICTS in: ${result.conflicts.join(", ")}`
+                : `failed: ${result.output || "(unknown error)"}`;
             messages.push({
-              text: `fleet: merge ${name} CONFLICTS in: ${result.conflicts.join(", ") || "(unknown)"}`,
+              text: `fleet: merge ${name} ${detail}`,
               level: "error",
             });
           }
@@ -261,6 +278,9 @@ export class Fleet {
 
       case "stop": {
         const man = await this.manifest();
+        if (cmd.target.kind === "member" && !man.members[cmd.target.name]) {
+          throw new Error(`no such member '${cmd.target.name}'`);
+        }
         const names =
           cmd.target.kind === "all"
             ? Object.values(man.members)
@@ -345,7 +365,7 @@ export class Fleet {
         candidates.map(async ({ input, existing, resume }) => {
           const role: RoleName = input.role ?? (resume ? existing!.role : (cfg.defaultRole ?? "coder"));
           const spec = resolveRoleSpec(cfg, role);
-          const model = input.model ?? spec.model;
+          const model = input.model ?? (resume ? existing!.model : undefined) ?? spec.model;
 
           const branch = `fleet/${input.name}`;
           const wt = path.join(this.root, cfg.worktreeRoot ?? ".pi/fleet/wt", input.name);
@@ -429,15 +449,14 @@ export class Fleet {
           };
           if (resume) {
             if (!input.preserveTask && input.task) member.task = input.task;
-            member.model = model ?? member.model;
-          } else {
-            member.model = model;
           }
+          member.model = model;
           member.role = role;
           member.baseRef = baseRef;
           member.over = effectiveOver;
           member.transient = transient;
           member.status = "starting";
+          member.pid = undefined;
           member.needsAttention = undefined;
           member.result = undefined;
           member.updatedAt = now;
@@ -567,7 +586,7 @@ export class Fleet {
     return { messages };
   }
 
-  private async resume(name: string, extra?: string): Promise<Member> {
+  private async resume(name: string, extra?: string): Promise<void> {
     const man = await this.manifest();
     const member = man.members[name];
     if (!member) throw new Error(`no such member '${name}'`);
@@ -581,7 +600,6 @@ export class Fleet {
         preserveTask: true,
       },
     ]);
-    return (await this.manifest()).members[name];
   }
 
   private async writeReviewContext(
@@ -600,9 +618,10 @@ export class Fleet {
     const file = reviewContextPath(member.worktree);
     await mkdir(path.dirname(file), { recursive: true });
     const commitList = commits.length ? commits.map((c) => `- ${c}`).join("\n") : "(no commits)";
+    const fence = markdownFence(diff);
     await writeFile(
       file,
-      `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Assignment\n\n${member.task}\n\n## Commits\n\n${commitList}\n\n## Diff\n\n\`\`\`diff\n${diff}\n\`\`\`\n`,
+      `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Assignment\n\n${member.task}\n\n## Commits\n\n${commitList}\n\n## Diff\n\n${fence}diff\n${diff}\n${fence}\n`,
       "utf8",
     );
   }
@@ -652,7 +671,9 @@ export class Fleet {
     target: WaitTarget,
     mode: WaitMode,
     timeoutSec?: number,
+    signal?: AbortSignal,
   ): Promise<FleetResult> {
+    if (signal?.aborted) throw new Error("wait aborted");
     const man = await this.manifest();
     let names: string[];
     if (target.kind === "all") {
@@ -686,11 +707,24 @@ export class Fleet {
     const isSatisfied = (): boolean =>
       mode === "any" ? names.some(isSettled) : names.every(isSettled);
 
+    const askMtimes = new Map<string, number>();
     const syncAsks = async (): Promise<void> => {
       for (const name of names) {
         const member = man.members[name];
-        if (member && existsSync(path.join(member.worktree, "FLEET_ASK.md"))) {
-          await this.readAsk(name);
+        if (!member) continue;
+        const askFile = path.join(member.worktree, "FLEET_ASK.md");
+        try {
+          const st = await stat(askFile);
+          if (askMtimes.get(name) !== st.mtimeMs) {
+            askMtimes.set(name, st.mtimeMs);
+            await this.readAsk(name);
+          }
+        } catch (err: any) {
+          if (err?.code === "ENOENT") {
+            if (askMtimes.delete(name)) {
+              await this.readAsk(name);
+            }
+          }
         }
       }
     };
@@ -698,20 +732,44 @@ export class Fleet {
     let timedOut = false;
     await syncAsks();
     if (!isSatisfied()) {
-      await new Promise<void>((resolve) => {
+      await new Promise<void>((resolve, reject) => {
         let timer: NodeJS.Timeout | undefined;
-        const done = () => {
+        let syncing = false;
+        let settled = false;
+        const cleanup = () => {
+          if (settled) return;
+          settled = true;
           this.stateListeners.delete(check);
           clearInterval(poll);
           if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
+        };
+        const done = () => {
+          cleanup();
           resolve();
+        };
+        const onAbort = () => {
+          cleanup();
+          reject(new Error("wait aborted"));
         };
         const check = () => {
           if (isSatisfied()) done();
         };
+        if (signal?.aborted) {
+          onAbort();
+          return;
+        }
+        signal?.addEventListener("abort", onAbort, { once: true });
         const poll = setInterval(() => {
-          void syncAsks().then(check);
-        }, 50);
+          if (syncing) return;
+          syncing = true;
+          void syncAsks()
+            .then(check)
+            .catch((err) => this.reportHandlerError("wait", err))
+            .finally(() => {
+              syncing = false;
+            });
+        }, 100);
         if (timeoutSec !== undefined) {
           timer = setTimeout(() => {
             if (!isSatisfied()) timedOut = true;
@@ -802,14 +860,25 @@ export class Fleet {
       const r = await removeWorktree(this.root, member.worktree, force);
       if (!r.ok) throw new Error(`worktree remove failed: ${r.out}`);
     }
-    const merged = await branchMerged(this.root, member.branch).catch(() => false);
-    if (merged || force) {
-      const r = await deleteBranch(this.root, member.branch, force);
-      if (!r.ok && force) throw new Error(`branch delete failed: ${r.out}`);
+    const hasBranch = await branchExists(this.root, member.branch).catch(() => false);
+    const merged = hasBranch ? await branchMerged(this.root, member.branch).catch(() => false) : false;
+    let branchOutcome = "branch already absent";
+    if (hasBranch) {
+      if (merged || force) {
+        const r = await deleteBranch(this.root, member.branch, force);
+        if (!r.ok) {
+          if (force) throw new Error(`branch delete failed: ${r.out}`);
+          branchOutcome = "branch kept (delete failed)";
+        } else {
+          branchOutcome = merged ? "merged branch deleted" : "unmerged branch force-deleted";
+        }
+      } else {
+        branchOutcome = "branch kept (unmerged)";
+      }
     }
     delete man.members[name];
     await this.save();
-    return merged ? "worktree removed, merged branch deleted" : "worktree removed, branch kept (unmerged)";
+    return `worktree removed, ${branchOutcome}`;
   }
 
   private async merge(name: string): Promise<MergeResult> {
@@ -876,7 +945,16 @@ export class Fleet {
   }
 
   private memberGlyph(member: Member, live: boolean): string {
-    return live ? GLYPH[member.status] : (member.status === "merged" ? "✔" : "·");
+    if (live) return GLYPH[member.status];
+    if (
+      member.status === "stopped" ||
+      member.status === "detached" ||
+      member.status === "stale" ||
+      member.status === "merged"
+    ) {
+      return GLYPH[member.status];
+    }
+    return "·";
   }
 
   private statusLines(rows: StatusRow[]): string[] {
@@ -914,6 +992,9 @@ export class Fleet {
   }
 
   private async logTail(name: string, n = 20): Promise<string> {
+    if (!NAME_RE.test(name)) {
+      throw new Error(`invalid member name '${name}'`);
+    }
     const cfg = await this.config();
     const logFile = path.join(this.root, cfg.logDir ?? ".pi/fleet/logs", `${name}.jsonl`);
     let raw: string;
@@ -1047,9 +1128,16 @@ export class Fleet {
       await this.completeAndCleanTransient(member);
       return;
     }
+    let dirty = false;
     if (isActiveStatus(member.status)) {
       member.status = "failed";
+      dirty = true;
+    }
+    if (member.pid !== undefined) {
       member.pid = undefined;
+      dirty = true;
+    }
+    if (dirty) {
       member.updatedAt = Date.now();
       await this.save();
     }
@@ -1081,6 +1169,7 @@ export class Fleet {
         await this.clean(name, false);
       } catch (err) {
         this.completedTransient.delete(name);
+        this.cleaningTransient.delete(name);
         await this.save();
         const msg = err instanceof Error ? err.message : String(err);
         this.ui.notify(
@@ -1101,12 +1190,17 @@ export class Fleet {
   private watchAsk(member: Member): void {
     this.unwatchAsk(member.name);
     try {
-      let timer: NodeJS.Timeout | undefined;
       const watcher = watch(member.worktree, (_event, filename) => {
         if (filename !== "FLEET_ASK.md") return;
-        clearTimeout(timer);
-        timer = setTimeout(() => void this.readAsk(member.name), 500);
+        const prev = this.askTimers.get(member.name);
+        if (prev) clearTimeout(prev);
+        const timer = setTimeout(() => {
+          this.askTimers.delete(member.name);
+          void this.readAsk(member.name).catch((err) => this.reportHandlerError(member.name, err));
+        }, 500);
+        this.askTimers.set(member.name, timer);
       });
+      watcher.on("error", () => this.unwatchAsk(member.name));
       this.askWatchers.set(member.name, watcher);
     } catch {
       // Watching is best-effort.
@@ -1114,6 +1208,11 @@ export class Fleet {
   }
 
   private unwatchAsk(name: string): void {
+    const timer = this.askTimers.get(name);
+    if (timer) {
+      clearTimeout(timer);
+      this.askTimers.delete(name);
+    }
     this.askWatchers.get(name)?.close();
     this.askWatchers.delete(name);
   }
@@ -1196,6 +1295,14 @@ function parseResultPrefix(text: string): "done" | "failed" | undefined {
   return match[1].toUpperCase() === "DONE" ? "done" : "failed";
 }
 
+function markdownFence(body: string): string {
+  let maxRun = 2;
+  for (const match of body.matchAll(/`+/g)) {
+    if (match[0].length > maxRun) maxRun = match[0].length;
+  }
+  return "`".repeat(maxRun + 1);
+}
+
 function reviewContextPath(worktree: string): string {
   return path.join(worktree, ".pi", "fleet", "review-context.md");
 }
@@ -1222,7 +1329,7 @@ function unquote(text: string): string {
     ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
       (trimmed.startsWith("'") && trimmed.endsWith("'")))
   ) {
-    return trimmed.slice(1, -1);
+    return trimmed.slice(1, -1).trim();
   }
   return trimmed;
 }
@@ -1253,9 +1360,18 @@ function parseCleanTarget(raw: string): CleanTarget {
   return { kind: "member", name: raw };
 }
 
+const LOG_USAGE = "usage: /fleet log <name> [n]";
+
 function parseLogCount(raw: unknown): number {
-  const n = typeof raw === "number" ? raw : raw ? Number(raw) : 20;
-  return Number.isFinite(n) && n > 0 ? n : 20;
+  if (raw === undefined || raw === "") return 20;
+  if (typeof raw === "string" && !/^\d+$/.test(raw.trim())) {
+    throw new Error(LOG_USAGE);
+  }
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(LOG_USAGE);
+  }
+  return n;
 }
 
 const WAIT_USAGE = "usage: /fleet wait [name|--all] [--any] [--timeout <sec>]";
@@ -1268,21 +1384,34 @@ function parseWaitTimeout(raw: unknown): number {
 }
 
 function parseSpawnMemberInput(raw: any, missingMsg: string): SpawnMemberInput {
-  if (!raw || typeof raw !== "object" || !raw.name || !raw.task) {
+  if (
+    !raw ||
+    typeof raw !== "object" ||
+    typeof raw.name !== "string" ||
+    typeof raw.task !== "string" ||
+    !raw.name.trim() ||
+    !raw.task.trim()
+  ) {
     throw new Error(missingMsg);
   }
   if (raw.role !== undefined && !ROLE_NAMES.includes(raw.role)) {
     throw new Error(`invalid role '${raw.role}'`);
   }
+  if (raw.model !== undefined && typeof raw.model !== "string") {
+    throw new Error("model must be a string");
+  }
+  if (raw.over !== undefined && typeof raw.over !== "string") {
+    throw new Error("over must be a string");
+  }
   if (raw.transient !== undefined && typeof raw.transient !== "boolean") {
     throw new Error("transient must be a boolean");
   }
   return {
-    name: raw.name,
+    name: raw.name.trim(),
     task: raw.task,
     ...(raw.role ? { role: raw.role } : {}),
-    ...(raw.model ? { model: raw.model } : {}),
-    ...(raw.over ? { over: raw.over } : {}),
+    ...(raw.model?.trim() ? { model: raw.model.trim() } : {}),
+    ...(raw.over?.trim() ? { over: raw.over.trim() } : {}),
     ...(raw.transient !== undefined ? { transient: raw.transient } : {}),
   };
 }
@@ -1324,14 +1453,14 @@ export function parseFleetCommand(raw: string): FleetCommand {
           cursor = val.rest;
         } else if (next.token === "--model") {
           const val = shiftToken(next.rest);
-          if (!val.token) {
+          if (!val.token || val.token.startsWith("--")) {
             throw new Error(spawnUsage);
           }
           opts.model = val.token;
           cursor = val.rest;
         } else if (next.token === "--over") {
           const val = shiftToken(next.rest);
-          if (!val.token) {
+          if (!val.token || val.token.startsWith("--")) {
             throw new Error(spawnUsage);
           }
           opts.over = val.token;
@@ -1402,9 +1531,10 @@ export function parseFleetCommand(raw: string): FleetCommand {
 
     case "log": {
       const { token: name, rest: tail } = shiftToken(rest);
-      if (!name) throw new Error("usage: /fleet log <name> [n]");
-      const { token: nStr } = shiftToken(tail);
-      return { action: "log", name, n: parseLogCount(nStr) };
+      if (!name || name.startsWith("--")) throw new Error(LOG_USAGE);
+      const { token: nStr, rest: extra } = shiftToken(tail);
+      if (shiftToken(extra).token) throw new Error(LOG_USAGE);
+      return { action: "log", name, n: parseLogCount(nStr || undefined) };
     }
 
     case "merge": {
@@ -1500,17 +1630,20 @@ export function toolParamsToCommand(params: {
       };
     }
     case "resume": {
-      if (!params.name) throw new Error("resume requires name");
-      const extra = params.message?.trim();
+      const name = typeof params.name === "string" ? params.name.trim() : "";
+      if (!name) throw new Error("resume requires name");
+      const extra = typeof params.message === "string" ? params.message.trim() : "";
       return {
         action: "resume",
-        name: params.name,
+        name,
         ...(extra ? { extra } : {}),
       };
     }
     case "send": {
-      if (!params.name || !params.message) throw new Error("send requires name and message");
-      return { action: "send", name: params.name, message: params.message };
+      const name = typeof params.name === "string" ? params.name.trim() : "";
+      const message = typeof params.message === "string" ? params.message.trim() : "";
+      if (!name || !message) throw new Error("send requires name and message");
+      return { action: "send", name, message };
     }
     case "wait": {
       const timeout = params.timeout !== undefined ? parseWaitTimeout(params.timeout) : undefined;
@@ -1532,22 +1665,26 @@ export function toolParamsToCommand(params: {
       };
     }
     case "log": {
-      if (!params.name) throw new Error("log requires name");
-      return { action: "log", name: params.name, n: parseLogCount(params.n) };
+      const name = typeof params.name === "string" ? params.name.trim() : "";
+      if (!name) throw new Error("log requires name");
+      return { action: "log", name, n: parseLogCount(params.n) };
     }
     case "merge": {
-      if (!params.name) throw new Error("merge requires name (or '--done')");
-      return { action: "merge", target: parseMergeTarget(params.name) };
+      const name = typeof params.name === "string" ? params.name.trim() : "";
+      if (!name) throw new Error("merge requires name (or '--done')");
+      return { action: "merge", target: parseMergeTarget(name) };
     }
     case "stop": {
-      if (!params.name) throw new Error("stop requires name (or '--all')");
-      return { action: "stop", target: parseStopTarget(params.name) };
+      const name = typeof params.name === "string" ? params.name.trim() : "";
+      if (!name) throw new Error("stop requires name (or '--all')");
+      return { action: "stop", target: parseStopTarget(name) };
     }
     case "clean": {
-      if (!params.name) throw new Error("clean requires name (or '--done' / '--all')");
+      const name = typeof params.name === "string" ? params.name.trim() : "";
+      if (!name) throw new Error("clean requires name (or '--done' / '--all')");
       return {
         action: "clean",
-        target: parseCleanTarget(params.name),
+        target: parseCleanTarget(name),
         ...(params.force ? { force: true } : {}),
       };
     }

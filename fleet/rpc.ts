@@ -8,6 +8,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, type WriteStream } from "node:fs";
 import * as path from "node:path";
 import { mkdir } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 
 export type RpcEventHandler = (event: any) => void;
 export type RpcExitHandler = (code: number | null) => void;
@@ -65,6 +66,7 @@ export class RpcMember {
   lastEventAt = Date.now();
 
   private buffer = "";
+  private decoder = new StringDecoder("utf8");
   private seq = 0;
   private pending = new Map<
     string,
@@ -110,6 +112,7 @@ export class RpcMember {
     });
 
     this.proc.stdout?.on("data", (c: Buffer) => this.onData(c));
+    this.proc.stdout?.on("end", () => this.onStdoutEnd());
     this.proc.stderr?.on("data", (c: Buffer) => this.writeLog(c));
     this.proc.on("error", (err) => {
       this.spawnError = err;
@@ -170,38 +173,53 @@ export class RpcMember {
   }
 
   private onData(chunk: Buffer): void {
-    this.buffer += chunk.toString("utf8");
+    this.buffer += this.decoder.write(chunk);
+    let start = 0;
     let idx: number;
-    while ((idx = this.buffer.indexOf("\n")) >= 0) {
-      const line = this.buffer.slice(0, idx).replace(/\r$/, "");
-      this.buffer = this.buffer.slice(idx + 1);
-      if (!line.trim()) continue;
-      let msg: any;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        this.writeLog(line + "\n"); // non-JSON noise, keep for debugging
-        continue;
-      }
-      this.writeLog(line + "\n");
-      this.lastEventAt = Date.now();
+    while ((idx = this.buffer.indexOf("\n", start)) >= 0) {
+      const line = this.buffer.slice(start, idx).replace(/\r$/, "");
+      start = idx + 1;
+      this.processLine(line);
+    }
+    if (start > 0) this.buffer = this.buffer.slice(start);
+  }
 
-      if (msg.type === "response" && typeof msg.id === "string" && this.pending.has(msg.id)) {
-        const p = this.pending.get(msg.id)!;
-        this.pending.delete(msg.id);
-        clearTimeout(p.timer);
-        if (msg.success) p.resolve(msg.data);
-        else p.reject(new Error(msg.error ?? `RPC command failed: ${msg.command}`));
-        continue;
-      }
-      if (msg.type === "agent_start") this.busy = true;
-      if (msg.type === "agent_end" || msg.type === "agent_settled") this.busy = false;
-      for (const h of this.handlers) {
-        try {
-          h(msg);
-        } catch {
-          // Never let a handler kill the pump.
-        }
+  private onStdoutEnd(): void {
+    this.buffer += this.decoder.end();
+    const trailing = this.buffer.replace(/\r$/, "");
+    this.buffer = "";
+    if (trailing.trim()) {
+      this.processLine(trailing);
+    }
+  }
+
+  private processLine(line: string): void {
+    if (!line.trim()) return;
+    let msg: any;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      this.writeLog(line + "\n"); // non-JSON noise, keep for debugging
+      return;
+    }
+    this.writeLog(line + "\n");
+    this.lastEventAt = Date.now();
+
+    if (msg.type === "response" && typeof msg.id === "string" && this.pending.has(msg.id)) {
+      const p = this.pending.get(msg.id)!;
+      this.pending.delete(msg.id);
+      clearTimeout(p.timer);
+      if (msg.success) p.resolve(msg.data);
+      else p.reject(new Error(msg.error ?? `RPC command failed: ${msg.command}`));
+      return;
+    }
+    if (msg.type === "agent_start") this.busy = true;
+    if (msg.type === "agent_end" || msg.type === "agent_settled") this.busy = false;
+    for (const h of this.handlers) {
+      try {
+        h(msg);
+      } catch {
+        // Never let a handler kill the pump.
       }
     }
   }
