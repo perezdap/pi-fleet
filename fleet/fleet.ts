@@ -27,7 +27,7 @@ import {
 } from "./gitw.ts";
 import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import { buildSystemAppend, resumePreamble } from "./roles.ts";
-import { killProcessTree, RpcMember } from "./rpc.ts";
+import { killProcessTree, RpcMember, winQuote } from "./rpc.ts";
 import {
   ROLE_NAMES,
   type CleanTarget,
@@ -831,20 +831,29 @@ export class Fleet {
     if (!member?.sessionFile || !existsSync(member.sessionFile)) {
       throw new Error(`no resumable session recorded for '${name}'`);
     }
-    const target = JSON.stringify(member.sessionFile);
-    if (process.platform === "win32") {
-      spawn("cmd.exe", ["/c", "start", "cmd", "/k", `pi --session ${target}`], {
-        cwd: member.worktree,
-        windowsHide: true,
-      });
-    } else {
-      const child = spawn("pi", ["--session", member.sessionFile], {
-        cwd: member.worktree,
-        detached: true,
-        stdio: "inherit",
-      });
-      child.unref();
+    if (!existsSync(member.worktree)) {
+      throw new Error(`worktree for '${name}' does not exist: ${member.worktree}`);
     }
+    const cfg = await this.config();
+    const plan = planOpenLaunch({
+      platform: process.platform,
+      piBin: piBinary(cfg),
+      worktree: member.worktree,
+      sessionFile: member.sessionFile,
+      env: process.env,
+    });
+    if (plan.kind === "manual") {
+      return `run in a separate terminal: ${plan.command}`;
+    }
+    const child = spawn(plan.command, plan.args, {
+      cwd: member.worktree,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: plan.windowsHide,
+      windowsVerbatimArguments: plan.windowsVerbatimArguments,
+    });
+    child.on("error", (err) => this.reportHandlerError(name, err));
+    child.unref();
     return `opened interactive pi for '${name}' in ${member.worktree}`;
   }
 
@@ -1132,6 +1141,54 @@ export class Fleet {
 }
 
 // ── helpers & command parsers ────────────────────────────────────────────────
+
+export type OpenLaunchPlan =
+  | {
+      kind: "spawn";
+      command: string;
+      args: string[];
+      windowsVerbatimArguments?: boolean;
+      windowsHide?: boolean;
+    }
+  | {
+      kind: "manual";
+      command: string;
+    };
+
+function shellQuote(arg: string): string {
+  if (/^[A-Za-z0-9_\-./:@+=]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+export function planOpenLaunch(opts: {
+  platform: NodeJS.Platform;
+  piBin: string;
+  worktree: string;
+  sessionFile: string;
+  env?: NodeJS.ProcessEnv;
+}): OpenLaunchPlan {
+  if (opts.platform === "win32") {
+    const launchCmd = `${winQuote(opts.piBin)} --session ${winQuote(opts.sessionFile)}`;
+    return {
+      kind: "spawn",
+      command: opts.env?.ComSpec ?? "cmd.exe",
+      args: ["/d", "/c", "start", '""', "cmd.exe", "/s", "/k", `"${launchCmd}"`],
+      windowsVerbatimArguments: true,
+      windowsHide: true,
+    };
+  }
+  if (opts.env?.TMUX) {
+    return {
+      kind: "spawn",
+      command: "tmux",
+      args: ["new-window", "-c", opts.worktree, opts.piBin, "--session", opts.sessionFile],
+    };
+  }
+  return {
+    kind: "manual",
+    command: `cd ${shellQuote(opts.worktree)} && ${shellQuote(opts.piBin)} --session ${shellQuote(opts.sessionFile)}`,
+  };
+}
 
 function parseResultPrefix(text: string): "done" | "failed" | undefined {
   const match = /^\s*(DONE|FAILED):/i.exec(text.slice(0, 500));

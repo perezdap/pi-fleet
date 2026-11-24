@@ -5,11 +5,12 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { parseFleetCommand, toolParamsToCommand } from "./fleet.ts";
+import { parseFleetCommand, planOpenLaunch, toolParamsToCommand } from "./fleet.ts";
 import { addWorktree, branchExists, git, headRev, mergeBranch } from "./gitw.ts";
 import registerFleet from "./index.ts";
 import { isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import { roleAppend } from "./roles.ts";
+import { RpcMember, winQuote } from "./rpc.ts";
 import type { Member, MemberStatus, NotifyLevel } from "./types.ts";
 
 const FAKE_PI_SCRIPT = `#!/usr/bin/env node
@@ -2365,6 +2366,108 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       await h.cleanup();
     }
   });
+
+  it("spawns a member when piBin path contains spaces and arguments contain '=' and commas", async () => {
+    const h = await createHarness();
+    const spacedRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-spaced-"));
+    try {
+      const spacedBinDir = path.join(spacedRoot, "pi bin dir");
+      await mkdir(spacedBinDir, { recursive: true });
+      const mjsPath = path.join(spacedBinDir, "fake-pi.mjs");
+      await writeFile(mjsPath, FAKE_PI_SCRIPT, "utf8");
+      await chmod(mjsPath, 0o755);
+
+      let piBin = mjsPath;
+      if (process.platform === "win32") {
+        const cmdPath = path.join(spacedBinDir, "fake-pi.cmd");
+        await writeFile(cmdPath, `@node "%~dp0fake-pi.mjs" %*\r\n`, "utf8");
+        piBin = cmdPath;
+      }
+
+      const cfgPath = path.join(h.root, ".pi", "fleet", "config.json");
+      const baseCfg = JSON.parse(await readFile(cfgPath, "utf8"));
+      await writeFile(cfgPath, JSON.stringify({ ...baseCfg, piBin }), "utf8");
+
+      const spawnRes = await h.runTool({
+        action: "spawn",
+        name: "spaced-rev",
+        role: "reviewer",
+        model: "custom/model=v1",
+        transient: false,
+        task: "FINISH_NOW:DONE: spaced bin ok",
+      });
+      await h.runTool({ action: "wait", name: "spaced-rev" });
+      await h.runCommand("stop --all");
+
+      const argv: string[] = JSON.parse(
+        await readFile(
+          path.join(h.root, ".pi", "fleet", "wt", "spaced-rev", ".rpc-argv.json"),
+          "utf8",
+        ),
+      );
+      const hasOption = (flag: string, val: string): boolean => {
+        const idx = argv.indexOf(flag);
+        return idx >= 0 && argv[idx + 1] === val;
+      };
+
+      assert.deepEqual(
+        {
+          spawnOk: !spawnRes.isError,
+          hasModelEq: hasOption("--model", "custom/model=v1"),
+          hasToolsComma: hasOption("--tools", "read,grep,find,ls"),
+          errors: h.errors(),
+        },
+        {
+          spawnOk: true,
+          hasModelEq: true,
+          hasToolsComma: true,
+          errors: [],
+        },
+      );
+    } finally {
+      await h.cleanup();
+      await rm(spacedRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("validates sessionFile and worktree existence on /fleet open", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("no-sess", "stopped");
+      await h.runCommand("open no-sess");
+      const missingSessionErr = h
+        .errors()
+        .some((e) => e.includes("no resumable session recorded for 'no-sess'"));
+
+      const gone = await h.seedMember("gone-wt", "stopped");
+      const sessionDir = path.join(h.root, ".pi", "fleet", "sessions");
+      await mkdir(sessionDir, { recursive: true });
+      const sessionFile = path.join(sessionDir, "gone-wt.json");
+      await writeFile(sessionFile, "{}\n", "utf8");
+      const man = await loadManifest(h.root);
+      man.members["gone-wt"].sessionFile = sessionFile;
+      await saveManifest(man);
+
+      await git(h.root, "worktree", "remove", "--force", gone.worktree);
+      await h.runCommand("open gone-wt");
+      const missingWtErr = h
+        .errors()
+        .some((e) => e.includes("worktree for 'gone-wt' does not exist"));
+
+      assert.deepEqual(
+        {
+          missingSessionErr,
+          missingWtErr,
+        },
+        {
+          missingSessionErr: true,
+          missingWtErr: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
 
 describe("roleAppend", () => {
@@ -2389,5 +2492,188 @@ describe("roleAppend", () => {
         integratorHasDoneAndFailed: true,
       },
     );
+  });
+});
+
+describe("winQuote", () => {
+  it("quotes whitespace, '=', commas, empty strings, and trailing backslashes while rejecting cmd metacharacters", () => {
+    assert.deepEqual(
+      {
+        safe: winQuote("simple_path/file-1.ts:high"),
+        winPath: winQuote("C:\\pi\\pi.cmd"),
+        empty: winQuote(""),
+        spaced: winQuote("C:\\Program Files\\pi\\pi.cmd"),
+        equals: winQuote("custom/model=v1"),
+        commas: winQuote("read,grep,find,ls"),
+        semicolon: winQuote("a;b"),
+        trailingSlash: winQuote("C:\\dir with space\\"),
+      },
+      {
+        safe: "simple_path/file-1.ts:high",
+        winPath: "C:\\pi\\pi.cmd",
+        empty: '""',
+        spaced: '"C:\\Program Files\\pi\\pi.cmd"',
+        equals: '"custom/model=v1"',
+        commas: '"read,grep,find,ls"',
+        semicolon: '"a;b"',
+        trailingSlash: '"C:\\dir with space\\\\"',
+      },
+    );
+
+    for (const bad of ["a&b", "a|b", "a<b", "a>b", "a^b", "%PATH%", "!VAR!", 'say "hi"', "a\rb", "a\nb"]) {
+      assert.throws(() => winQuote(bad), /Refusing to pass unsafe argument/);
+    }
+  });
+});
+
+describe("planOpenLaunch", () => {
+  it("builds safe launch plans per platform and rejects unsafe Windows paths", () => {
+    const winPlan = planOpenLaunch({
+      platform: "win32",
+      piBin: "C:\\Program Files\\pi\\pi.cmd",
+      worktree: "C:\\repo\\wt",
+      sessionFile: "C:\\repo\\session file.json",
+      env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    });
+    const tmuxPlan = planOpenLaunch({
+      platform: "linux",
+      piBin: "/custom/bin/pi",
+      worktree: "/repo/wt",
+      sessionFile: "/repo/session.json",
+      env: { TMUX: "/tmp/tmux-1000/default,1,0" },
+    });
+    const manualPlan = planOpenLaunch({
+      platform: "darwin",
+      piBin: "/my bin/pi",
+      worktree: "/repo/my wt",
+      sessionFile: "/repo/it's.json",
+      env: {},
+    });
+
+    assert.deepEqual(
+      {
+        winPlan,
+        tmuxPlan,
+        manualPlan,
+      },
+      {
+        winPlan: {
+          kind: "spawn",
+          command: "C:\\Windows\\System32\\cmd.exe",
+          args: [
+            "/d",
+            "/c",
+            "start",
+            '""',
+            "cmd.exe",
+            "/s",
+            "/k",
+            '"\"C:\\Program Files\\pi\\pi.cmd\" --session \"C:\\repo\\session file.json\""',
+          ],
+          windowsVerbatimArguments: true,
+          windowsHide: true,
+        },
+        tmuxPlan: {
+          kind: "spawn",
+          command: "tmux",
+          args: ["new-window", "-c", "/repo/wt", "/custom/bin/pi", "--session", "/repo/session.json"],
+        },
+        manualPlan: {
+          kind: "manual",
+          command: "cd '/repo/my wt' && '/my bin/pi' --session '/repo/it'\\''s.json'",
+        },
+      },
+    );
+
+    assert.throws(
+      () =>
+        planOpenLaunch({
+          platform: "win32",
+          piBin: "pi",
+          worktree: "C:\\repo\\wt",
+          sessionFile: "C:\\repo\\a&b.json",
+        }),
+      /Refusing to pass unsafe argument/,
+    );
+  });
+});
+
+describe("RpcMember", () => {
+  it("fails fast in waitReady on spawn error, sets exited, fires onExit once, and closes log on exit", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-rpc-"));
+    try {
+      const mjsPath = path.join(tmpRoot, "fake-pi.mjs");
+      await writeFile(mjsPath, FAKE_PI_SCRIPT, "utf8");
+      await chmod(mjsPath, 0o755);
+      let piBin = mjsPath;
+      if (process.platform === "win32") {
+        const cmdPath = path.join(tmpRoot, "fake-pi.cmd");
+        await writeFile(cmdPath, `@node "%~dp0fake-pi.mjs" %*\r\n`, "utf8");
+        piBin = cmdPath;
+      }
+
+      const missingCwd = path.join(tmpRoot, "does-not-exist");
+      const errLogFile = path.join(tmpRoot, "err.jsonl");
+      const failedClient = await RpcMember.create({
+        piBin,
+        cwd: missingCwd,
+        args: [],
+        logFile: errLogFile,
+      });
+      let exitCallbacks = 0;
+      failedClient.onExit(() => {
+        exitCallbacks++;
+      });
+
+      const start = Date.now();
+      let readyErr: unknown;
+      try {
+        await failedClient.waitReady(5_000);
+      } catch (err) {
+        readyErr = err;
+      }
+      const elapsedMs = Date.now() - start;
+      await new Promise((r) => setTimeout(r, 50));
+
+      let sendErr: unknown;
+      try {
+        await failedClient.send({ type: "get_state" });
+      } catch (err) {
+        sendErr = err;
+      }
+
+      const exitLogFile = path.join(tmpRoot, "exit.jsonl");
+      const shortClient = await RpcMember.create({
+        piBin,
+        cwd: tmpRoot,
+        args: ["--name", "fleet:spawn-fail"],
+        logFile: exitLogFile,
+      });
+      await new Promise<void>((resolve) => {
+        shortClient.onExit(() => resolve());
+      });
+      await rm(exitLogFile);
+
+      assert.deepEqual(
+        {
+          readyRejected: readyErr instanceof Error && /failed to start|ENOENT/i.test(readyErr.message),
+          fastFailure: elapsedMs < 2_000,
+          exited: failedClient.exited,
+          exitCallbacks,
+          sendRejected: sendErr instanceof Error && /exited/i.test(sendErr.message),
+          exitLogRemoved: !existsSync(exitLogFile),
+        },
+        {
+          readyRejected: true,
+          fastFailure: true,
+          exited: true,
+          exitCallbacks: 1,
+          sendRejected: true,
+          exitLogRemoved: true,
+        },
+      );
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
