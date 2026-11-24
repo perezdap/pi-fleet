@@ -1,6 +1,6 @@
 /** JSONL RPC client for one headless `pi --mode rpc` member process.
  *
- * Protocol per docs/rpc.md: strict JSONL on stdin/stdout, split on "\n" only
+ * Protocol per pi's RPC spec: strict JSONL on stdin/stdout, split on "\n" only
  * (Node readline is not compliant because it splits on U+2028/U+2029).
  */
 
@@ -63,7 +63,6 @@ export class RpcMember {
   exited = false;
   exitCode: number | null = null;
   busy = false;
-  lastEventAt = Date.now();
 
   private buffer = "";
   private decoder = new StringDecoder("utf8");
@@ -203,7 +202,6 @@ export class RpcMember {
       return;
     }
     this.writeLog(line + "\n");
-    this.lastEventAt = Date.now();
 
     if (msg.type === "response" && typeof msg.id === "string" && this.pending.has(msg.id)) {
       const p = this.pending.get(msg.id)!;
@@ -259,19 +257,12 @@ export class RpcMember {
     });
   }
 
-  prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<any> {
-    return this.send(
-      { type: "prompt", message, ...(streamingBehavior ? { streamingBehavior } : {}) },
-      60_000,
-    );
+  prompt(message: string): Promise<any> {
+    return this.send({ type: "prompt", message }, 60_000);
   }
 
   steer(message: string): Promise<any> {
     return this.send({ type: "steer", message }, 60_000);
-  }
-
-  followUp(message: string): Promise<any> {
-    return this.send({ type: "follow_up", message }, 60_000);
   }
 
   abort(): Promise<any> {
@@ -283,7 +274,7 @@ export class RpcMember {
   }
 
   /** Poll get_state until the member answers (RPC ready). */
-  async waitReady(timeoutMs = 120_000): Promise<void> {
+  async waitReady(timeoutMs = 120_000): Promise<any> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       if (this.exited) {
@@ -293,8 +284,7 @@ export class RpcMember {
         throw new Error(`member exited during startup (code ${this.exitCode})`);
       }
       try {
-        await this.getState();
-        return;
+        return await this.getState();
       } catch {
         if (this.exited) continue;
         await sleep(500);

@@ -2,13 +2,13 @@
 
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
-import type { Manifest } from "./types.ts";
+import type { Manifest, MemberStatus } from "./types.ts";
 
 export function fleetDir(repoRoot: string): string {
   return path.join(repoRoot, ".pi", "fleet");
 }
 
-export function manifestPath(repoRoot: string): string {
+function manifestPath(repoRoot: string): string {
   return path.join(fleetDir(repoRoot), "manifest.json");
 }
 
@@ -80,6 +80,6 @@ export function isPidAlive(pid: number | undefined): boolean {
   }
 }
 
-export function isActiveStatus(status: string): boolean {
+export function isActiveStatus(status: MemberStatus): boolean {
   return ["starting", "running", "idle"].includes(status);
 }

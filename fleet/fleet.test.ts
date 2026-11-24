@@ -97,6 +97,11 @@ process.stdin.on("data", (chunk) => {
         }, ms);
       } else if (msg.type === "prompt" && activeMsg.startsWith("BUSY_NOW")) {
         process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+      } else if (msg.type === "prompt" && activeMsg.startsWith("SETTLED_NOW")) {
+        process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+        }, 30);
       }
     }
   }
@@ -638,14 +643,14 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
   it("delivers send messages and tails member activity logs through the tool adapter", async () => {
     const h = await createHarness();
     try {
-      await h.runTool({ action: "spawn", name: "worker1", task: "Initial task" });
+      await h.runTool({ action: "spawn", name: "coder1", task: "Initial task" });
       const sendRes = await h.runTool({
         action: "send",
-        name: "worker1",
+        name: "coder1",
         message: "Use strict types",
       });
 
-      const logPath = path.join(h.root, ".pi", "fleet", "logs", "worker1.jsonl");
+      const logPath = path.join(h.root, ".pi", "fleet", "logs", "coder1.jsonl");
       await writeFile(
         logPath,
         [
@@ -658,7 +663,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         { flag: "a" },
       );
 
-      const logRes = await h.runTool({ action: "log", name: "worker1", n: 5 });
+      const logRes = await h.runTool({ action: "log", name: "coder1", n: 5 });
       await h.runTool({ action: "stop", name: "--all" });
 
       assert.deepEqual(
@@ -668,7 +673,7 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
           hasAssistantEntry: logRes.text.includes("assistant: DONE: completed checks"),
         },
         {
-          sendText: "fleet: sent to 'worker1' (prompt)",
+          sendText: "fleet: sent to 'coder1' (prompt)",
           hasToolEntry: true,
           hasAssistantEntry: true,
         },
@@ -2835,6 +2840,145 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       } catch {
         // already killed
       }
+      await h.cleanup();
+    }
+  });
+
+  it("transitions running members to idle on agent_settled", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "settle-test",
+        task: "SETTLED_NOW",
+      });
+      await new Promise((r) => setTimeout(r, 120));
+      const man = await loadManifest(h.root);
+      await h.runCommand("stop --all");
+
+      assert.equal(man.members["settle-test"]?.status, "idle");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("sets isError on single-member merge conflict and emits single notifications for status, log, and wait", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("conf", "done", { conflictingCommit: true });
+      const mergeToolRes = await h.runTool({ action: "merge", name: "conf" });
+
+      await h.seedMember("s1", "done", { unmergedCommit: true });
+      const logPath = path.join(h.root, ".pi", "fleet", "logs", "s1.jsonl");
+      await mkdir(path.dirname(logPath), { recursive: true });
+      await writeFile(
+        logPath,
+        [
+          JSON.stringify({ type: "tool_execution_start", toolName: "read" }),
+          JSON.stringify({ type: "message_end", message: { role: "assistant", content: "DONE: ok" } }),
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      h.notifications.length = 0;
+      await h.runCommand("status");
+      await h.runCommand("log s1 5");
+      await h.runCommand("wait");
+
+      assert.deepEqual(
+        {
+          mergeIsError: mergeToolRes.isError,
+          mergeHasConflict: mergeToolRes.text.includes("CONFLICTS in: README.md"),
+          notificationCount: h.notifications.length,
+          statusHasTwoMembers: h.notifications[0]?.text.includes("s1") && h.notifications[0]?.text.includes("conf"),
+          logHasBothLines: h.notifications[1]?.text.includes("tool: read") && h.notifications[1]?.text.includes("DONE: ok"),
+          waitHasBothMembers: h.notifications[2]?.text.includes("s1") && h.notifications[2]?.text.includes("conf"),
+        },
+        {
+          mergeIsError: true,
+          mergeHasConflict: true,
+          notificationCount: 3,
+          statusHasTwoMembers: true,
+          logHasBothLines: true,
+          waitHasBothMembers: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("does not match a member named 'main' when spawning a reviewer with --over main", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("main", "done", { unmergedCommit: true });
+      await writeFile(path.join(h.root, "main-advance.txt"), "advanced main\n", "utf8");
+      await git(h.root, "add", "main-advance.txt");
+      await git(h.root, "commit", "-m", "advance main branch");
+
+      await h.runTool({
+        action: "spawn",
+        name: "rev-main",
+        role: "reviewer",
+        over: "main",
+        transient: false,
+        task: "Review main",
+      });
+      await h.runCommand("stop --all");
+
+      const ctx = await readFile(
+        path.join(h.root, ".pi", "fleet", "wt", "rev-main", ".pi", "fleet", "review-context.md"),
+        "utf8",
+      );
+
+      assert.deepEqual(
+        {
+          hasTarget: ctx.includes("Target: `main`"),
+          hasDiffBaseHead: ctx.includes("Diff base: `HEAD`"),
+          excludesAdvanceDiff: !ctx.includes("main-advance.txt"),
+        },
+        {
+          hasTarget: true,
+          hasDiffBaseHead: true,
+          excludesAdvanceDiff: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("reads the bounded tail chunk of logs larger than 2 MiB", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("big-log", "done");
+      const logPath = path.join(h.root, ".pi", "fleet", "logs", "big-log.jsonl");
+      await mkdir(path.dirname(logPath), { recursive: true });
+      const fillerLine = `${JSON.stringify({ type: "tool_execution_start", toolName: "bash-filler-0123456789" })}\n`;
+      const repeatCount = Math.ceil((2.2 * 1024 * 1024) / fillerLine.length);
+      const payload =
+        fillerLine.repeat(repeatCount) +
+        `${JSON.stringify({ type: "tool_execution_start", toolName: "tail-marker" })}\n` +
+        `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: "DONE: big log tail" } })}\n`;
+      await writeFile(logPath, payload, "utf8");
+
+      const logRes = await h.runTool({ action: "log", name: "big-log", n: 2 });
+
+      assert.deepEqual(
+        {
+          ok: !logRes.isError,
+          hasMarker: logRes.text.includes("tool: tail-marker"),
+          hasDone: logRes.text.includes("assistant: DONE: big log tail"),
+          lineCount: logRes.text.split("\n").length,
+        },
+        {
+          ok: true,
+          hasMarker: true,
+          hasDone: true,
+          lineCount: 2,
+        },
+      );
+    } finally {
       await h.cleanup();
     }
   });

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { ROLE_NAMES, type FleetConfig, type RoleName, type RoleSpec } from "./types.ts";
 
 /** Built-in role defaults. Config entries merge over these. */
-export const BUILTIN_ROLES: Record<RoleName, RoleSpec> = {
+const BUILTIN_ROLES: Record<RoleName, RoleSpec> = {
   coder: {},
   tester: {},
   // Enforced read-only: no write/edit/bash tools.
@@ -13,7 +13,7 @@ export const BUILTIN_ROLES: Record<RoleName, RoleSpec> = {
   integrator: {},
 };
 
-export function configPath(repoRoot: string): string {
+function configPath(repoRoot: string): string {
   return path.join(repoRoot, ".pi", "fleet", "config.json");
 }
 

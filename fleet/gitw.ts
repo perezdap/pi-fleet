@@ -40,7 +40,7 @@ function extractGitError(err: any): string {
   return String(err);
 }
 
-export async function tryGit(
+async function tryGit(
   cwd: string,
   ...args: string[]
 ): Promise<{ ok: boolean; out: string }> {
@@ -149,7 +149,9 @@ export async function diffForReview(
   dots: RangeDots = "...",
 ): Promise<string> {
   const range = `${baseRef}${dots}${branch}`;
-  const stat = await tryGitRaw(root, "diff", "--stat", range);
-  const diff = await tryGitRaw(root, "diff", range);
+  const [stat, diff] = await Promise.all([
+    tryGitRaw(root, "diff", "--stat", range),
+    tryGitRaw(root, "diff", range),
+  ]);
   return [stat.ok ? stat.out : "", diff.ok ? diff.out : ""].filter(Boolean).join("\n\n");
 }

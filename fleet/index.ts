@@ -11,10 +11,9 @@ import {
   parseFleetCommand,
   toolParamsToCommand,
   type FleetUi,
-  type NotifyLevel,
 } from "./fleet.ts";
 import { repoRoot } from "./gitw.ts";
-import { ROLE_NAMES } from "./types.ts";
+import { ROLE_NAMES, type NotifyLevel } from "./types.ts";
 
 const OPTIONAL = Symbol("optional");
 
@@ -54,7 +53,7 @@ function spawnOptionProps(suffix: string) {
     ),
     over: Type.Optional(
       Type.String({
-        description: `Base branch/ref the worktree starts from${suffix}`,
+        description: `Base branch/ref or commit range (base..head or base...head) the worktree starts from${suffix}`,
       }),
     ),
     transient: Type.Optional(
@@ -147,9 +146,9 @@ export default function (pi: ExtensionAPI) {
     label: "Fleet",
     description:
       "Manage a fleet of pi agents working in isolated git worktrees of this repository. " +
-      "spawn: start a member (role: coder|tester|reviewer|integrator; optionally set its model or base ref via over). " +
+      "spawn: start a member (or parallel batch via members: [...]; role: coder|tester|reviewer|integrator; optionally set model, over, or transient). " +
       "resume: continue a stale/stopped/failed/done member on its existing worktree. " +
-      "status: list members. send: message a member. wait: wait for member(s) (or '--all') to settle or ask a question. " +
+      "status: list members. send: message a member. wait: wait for member(s) (via name, names, or '--all') to settle or ask a question. " +
       "log: tail member activity. " +
       "merge: merge a member branch (or '--done') into HEAD. stop: abort+kill a member (or '--all'). " +
       "clean: remove worktree/branch for a member (or '--done' / '--all').",
@@ -224,9 +223,11 @@ export default function (pi: ExtensionAPI) {
         const cmd = toolParamsToCommand(params);
         const fleet = await getFleet(ctx);
         const { messages } = await fleet.execute(cmd, signal);
+        const isError = messages.length > 0 && messages.every((m) => m.level === "error");
         return {
           content: [{ type: "text", text: messages.map((m) => m.text).join("\n") }],
           details: {},
+          ...(isError ? { isError: true } : {}),
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
