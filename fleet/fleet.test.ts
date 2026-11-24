@@ -20,6 +20,8 @@ if (process.argv.some((a) => a.startsWith("fleet:spawn-fail"))) {
   process.exit(0);
 }
 
+writeFileSync(path.join(process.cwd(), ".rpc-argv.json"), JSON.stringify(process.argv.slice(2)), "utf8");
+
 let buf = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -109,7 +111,6 @@ interface TestHarness {
       needsAttention?: string;
     },
   ) => Promise<Member>;
-  shutdown: () => Promise<void>;
   cleanup: () => Promise<void>;
 }
 
@@ -123,7 +124,7 @@ async function createHarness(): Promise<TestHarness> {
   await git(rawRoot, "commit", "-m", "initial");
   await writeFile(
     path.join(rawRoot, ".git", "info", "exclude"),
-    ".rpc-received.jsonl\nsession.json\n",
+    ".rpc-received.jsonl\n.rpc-argv.json\nsession.json\n",
     "utf8",
   );
 
@@ -264,9 +265,6 @@ async function createHarness(): Promise<TestHarness> {
       };
     },
     seedMember,
-    shutdown: async () => {
-      for (const fn of shutdownHandlers) await fn();
-    },
     cleanup: async () => {
       for (const fn of shutdownHandlers) await fn();
       await rm(rawRoot, { recursive: true, force: true });
@@ -1956,6 +1954,232 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         await hCfg.cleanup();
       }
     } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("passes --thinking alongside --model unless the model already embeds a thinking suffix", async () => {
+    const h = await createHarness();
+    try {
+      const cfgPath = path.join(h.root, ".pi", "fleet", "config.json");
+      const baseCfg = JSON.parse(await readFile(cfgPath, "utf8"));
+      await writeFile(
+        cfgPath,
+        JSON.stringify({
+          ...baseCfg,
+          roles: {
+            reviewer: { model: "anthropic/claude-opus-4-5", thinking: "high", autoClean: false },
+            integrator: { model: "ollama/qwen3:32b", thinking: "medium" },
+            coder: { thinking: "low" },
+          },
+        }),
+        "utf8",
+      );
+
+      await h.runTool({
+        action: "spawn",
+        members: [
+          { name: "rev-think", role: "reviewer", task: "Review with role model and thinking" },
+          {
+            name: "rev-embedded",
+            role: "reviewer",
+            model: "anthropic/claude-opus-4-5:xhigh",
+            task: "Review with embedded thinking",
+          },
+          { name: "int-tag", role: "integrator", task: "Integrate with tagged model and thinking" },
+          { name: "coder-think", role: "coder", task: "Code with thinking only" },
+        ],
+      });
+      await h.runCommand("stop --all");
+
+      const readArgv = async (name: string): Promise<string[]> =>
+        JSON.parse(
+          await readFile(path.join(h.root, ".pi", "fleet", "wt", name, ".rpc-argv.json"), "utf8"),
+        );
+      const hasOption = (argv: string[], flag: string, val: string): boolean => {
+        const idx = argv.indexOf(flag);
+        return idx >= 0 && argv[idx + 1] === val;
+      };
+
+      const revThink = await readArgv("rev-think");
+      const revEmbedded = await readArgv("rev-embedded");
+      const intTag = await readArgv("int-tag");
+      const coderThink = await readArgv("coder-think");
+
+      assert.deepEqual(
+        {
+          revThinkModel: hasOption(revThink, "--model", "anthropic/claude-opus-4-5"),
+          revThinkLevel: hasOption(revThink, "--thinking", "high"),
+          revEmbeddedModel: hasOption(revEmbedded, "--model", "anthropic/claude-opus-4-5:xhigh"),
+          revEmbeddedHasThinkingFlag: revEmbedded.includes("--thinking"),
+          intTagModel: hasOption(intTag, "--model", "ollama/qwen3:32b"),
+          intTagLevel: hasOption(intTag, "--thinking", "medium"),
+          coderThinkHasModelFlag: coderThink.includes("--model"),
+          coderThinkLevel: hasOption(coderThink, "--thinking", "low"),
+        },
+        {
+          revThinkModel: true,
+          revThinkLevel: true,
+          revEmbeddedModel: true,
+          revEmbeddedHasThinkingFlag: false,
+          intTagModel: true,
+          intTagLevel: true,
+          coderThinkHasModelFlag: false,
+          coderThinkLevel: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("cleans non-transient and failed reviewer members without --force when .pi/fleet is not gitignored", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "rev-kept",
+        role: "reviewer",
+        transient: false,
+        task: "FINISH_NOW:DONE: clean review",
+      });
+      await h.runTool({ action: "wait", name: "rev-kept" });
+      await h.runCommand("stop rev-kept");
+      const cleanKeptRes = await h.runTool({ action: "clean", name: "rev-kept" });
+
+      await h.runTool({
+        action: "spawn",
+        name: "rev-failed",
+        role: "reviewer",
+        task: "DELAY_DONE:60:FAILED: blocker",
+      });
+      await h.runTool({ action: "wait", name: "rev-failed" });
+      await h.runCommand("stop rev-failed");
+      const cleanFailedRes = await h.runTool({ action: "clean", name: "--done" });
+
+      await h.runTool({
+        action: "spawn",
+        name: "rev-dirty",
+        role: "reviewer",
+        transient: false,
+        task: "FINISH_NOW:DONE: dirty review",
+      });
+      await h.runTool({ action: "wait", name: "rev-dirty" });
+      await h.runCommand("stop rev-dirty");
+      const dirtyWt = path.join(h.root, ".pi", "fleet", "wt", "rev-dirty");
+      await writeFile(path.join(dirtyWt, "extra.txt"), "uncommitted\n", "utf8");
+      const cleanDirtyRes = await h.runTool({ action: "clean", name: "rev-dirty" });
+
+      const man = await loadManifest(h.root);
+
+      assert.deepEqual(
+        {
+          cleanKeptOk: !cleanKeptRes.isError,
+          keptInManifest: "rev-kept" in man.members,
+          keptWtExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "rev-kept")),
+          cleanFailedOk: !cleanFailedRes.isError,
+          failedInManifest: "rev-failed" in man.members,
+          failedWtExists: existsSync(path.join(h.root, ".pi", "fleet", "wt", "rev-failed")),
+          cleanDirtyRejected: cleanDirtyRes.isError,
+          dirtyWtStillExists: existsSync(dirtyWt),
+          dirtyInManifest: "rev-dirty" in man.members,
+        },
+        {
+          cleanKeptOk: true,
+          keptInManifest: false,
+          keptWtExists: false,
+          cleanFailedOk: true,
+          failedInManifest: false,
+          failedWtExists: false,
+          cleanDirtyRejected: true,
+          dirtyWtStillExists: true,
+          dirtyInManifest: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("stops detached members on stop --all and kills live detached processes on clean <name> and clean --all", async () => {
+    const h = await createHarness();
+    const sleepers = Array.from({ length: 4 }, () =>
+      spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        stdio: "ignore",
+        windowsHide: true,
+      }),
+    );
+    try {
+      await h.seedMember("det-a", "detached");
+      await h.seedMember("det-b", "detached");
+      const man1 = await loadManifest(h.root);
+      man1.members["det-a"].pid = sleepers[0].pid;
+      man1.members["det-b"].pid = sleepers[1].pid;
+      await saveManifest(man1);
+
+      await h.runCommand("stop --all");
+      const afterStopAll = await loadManifest(h.root);
+      await h.runCommand("clean --done");
+
+      await h.seedMember("det-direct", "detached");
+      await h.seedMember("det-all", "detached");
+      const man2 = await loadManifest(h.root);
+      man2.members["det-direct"].pid = sleepers[2].pid;
+      man2.members["det-all"].pid = sleepers[3].pid;
+      await saveManifest(man2);
+
+      const cleanDirectRes = await h.runTool({ action: "clean", name: "det-direct" });
+      const afterDirect = await loadManifest(h.root);
+      const directPidAlive = isPidAlive(sleepers[2].pid);
+
+      const cleanAllRes = await h.runTool({ action: "clean", name: "--all" });
+      const afterAll = await loadManifest(h.root);
+      const allPidAlive = isPidAlive(sleepers[3].pid);
+
+      assert.deepEqual(
+        {
+          detAStatus: afterStopAll.members["det-a"]?.status,
+          detBStatus: afterStopAll.members["det-b"]?.status,
+          detAPid: afterStopAll.members["det-a"]?.pid,
+          detBPid: afterStopAll.members["det-b"]?.pid,
+          s0Alive: isPidAlive(sleepers[0].pid),
+          s1Alive: isPidAlive(sleepers[1].pid),
+          cleanDirectOk: !cleanDirectRes.isError,
+          directPidAlive,
+          directWtGone: !existsSync(path.join(h.root, ".pi", "fleet", "wt", "det-direct")),
+          directInManifest: "det-direct" in afterDirect.members,
+          cleanAllOk: !cleanAllRes.isError,
+          allPidAlive,
+          allWtGone: !existsSync(path.join(h.root, ".pi", "fleet", "wt", "det-all")),
+          remainingAfterCleanAll: Object.keys(afterAll.members),
+          errors: h.errors(),
+        },
+        {
+          detAStatus: "stopped",
+          detBStatus: "stopped",
+          detAPid: undefined,
+          detBPid: undefined,
+          s0Alive: false,
+          s1Alive: false,
+          cleanDirectOk: true,
+          directPidAlive: false,
+          directWtGone: true,
+          directInManifest: false,
+          cleanAllOk: true,
+          allPidAlive: false,
+          allWtGone: true,
+          remainingAfterCleanAll: [],
+          errors: [],
+        },
+      );
+    } finally {
+      for (const s of sleepers) {
+        try {
+          s.kill();
+        } catch {
+          // already killed
+        }
+      }
       await h.cleanup();
     }
   });

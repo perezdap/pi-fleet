@@ -95,6 +95,7 @@ const USAGE = [
 ].join("\n");
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
+const THINKING_SUFFIX_RE = /:(off|minimal|low|medium|high|xhigh|max)$/;
 const RESUMABLE = new Set<MemberStatus>(["stale", "stopped", "failed", "done"]);
 const CLEANABLE_DONE = new Set<MemberStatus>(["done", "merged", "failed", "stopped", "stale", "detached"]);
 const SETTLED_STATUSES = new Set<MemberStatus>(["done", "failed", "stopped", "stale", "merged"]);
@@ -131,7 +132,6 @@ export class Fleet {
   private completedTransient = new Map<string, { createdAt: number; lines: string[] }>();
   private saveChain: Promise<void> = Promise.resolve();
   private prepareChain: Promise<void> = Promise.resolve();
-  private cfg?: FleetConfig;
   private cfgPromise?: Promise<FleetConfig>;
   private man?: Manifest;
   private manPromise?: Promise<Manifest>;
@@ -144,7 +144,7 @@ export class Fleet {
   // ── state ────────────────────────────────────────────────────────────────
 
   private async config(): Promise<FleetConfig> {
-    this.cfgPromise ??= loadFleetConfig(this.root).then((cfg) => (this.cfg = cfg));
+    this.cfgPromise ??= loadFleetConfig(this.root);
     return this.cfgPromise;
   }
 
@@ -263,7 +263,7 @@ export class Fleet {
         const names =
           cmd.target.kind === "all"
             ? Object.values(man.members)
-                .filter((m) => isActiveStatus(m.status) || this.clients.has(m.name))
+                .filter((m) => isActiveStatus(m.status) || m.status === "detached" || this.clients.has(m.name))
                 .map((m) => m.name)
             : [cmd.target.name];
         if (cmd.target.kind === "all" && names.length === 0) {
@@ -293,9 +293,6 @@ export class Fleet {
         }
         const lines: string[] = [];
         for (const name of names) {
-          if (cmd.target.kind === "done" && man.members[name]?.status === "detached") {
-            await this.stop(name);
-          }
           const outcome = await this.clean(name, force);
           lines.push(`fleet: cleaned '${name}' (${outcome})`);
         }
@@ -502,7 +499,9 @@ export class Fleet {
             "--append-system-prompt", promptFile,
           ];
           if (model) args.push("--model", model);
-          else if (spec.thinking) args.push("--thinking", spec.thinking);
+          if (spec.thinking && (!model || !THINKING_SUFFIX_RE.test(model))) {
+            args.push("--thinking", spec.thinking);
+          }
           if (spec.tools) args.push("--tools", spec.tools);
 
           const client = await RpcMember.create({
@@ -771,9 +770,12 @@ export class Fleet {
     if (this.clients.has(name)) {
       if (!force) throw new Error(`member '${name}' is still attached; run /fleet stop ${name} first`);
       await this.stop(name);
+    } else if (member.status === "detached" || (force && isActiveStatus(member.status))) {
+      await this.stop(name);
     }
     this.unwatchAsk(name);
     if (existsSync(member.worktree)) {
+      await rm(reviewContextPath(member.worktree), { force: true }).catch(() => undefined);
       const r = await removeWorktree(this.root, member.worktree, force);
       if (!r.ok) throw new Error(`worktree remove failed: ${r.out}`);
     }
@@ -1035,7 +1037,6 @@ export class Fleet {
       const lines = await this.formatWaitMember(current);
       this.completedTransient.set(current.name, { createdAt: current.createdAt, lines });
       await this.killAttachedClient(name);
-      await rm(reviewContextPath(current.worktree), { force: true }).catch(() => undefined);
       try {
         await this.clean(name, false);
       } catch (err) {
