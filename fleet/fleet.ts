@@ -98,7 +98,8 @@ const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const THINKING_SUFFIX_RE = /:(off|minimal|low|medium|high|xhigh|max)$/;
 const RESUMABLE = new Set<MemberStatus>(["stale", "stopped", "failed", "done"]);
 const CLEANABLE_DONE = new Set<MemberStatus>(["done", "merged", "failed", "stopped", "stale", "detached"]);
-const SETTLED_STATUSES = new Set<MemberStatus>(["done", "failed", "stopped", "stale", "merged"]);
+const SETTLED_STATUSES = new Set<MemberStatus>(["done", "failed", "stopped", "stale", "merged", "detached"]);
+const MAX_COMPLETED_TRANSIENT = 64;
 
 function isMemberSettled(member: Member): boolean {
   return SETTLED_STATUSES.has(member.status) || Boolean(member.needsAttention);
@@ -129,7 +130,7 @@ export class Fleet {
   private stateListeners = new Set<() => void>();
   private spawning = new Map<string, Promise<void>>();
   private cleaningTransient = new Set<string>();
-  private completedTransient = new Map<string, { createdAt: number; lines: string[] }>();
+  private completedTransient = new Map<string, { createdAt: number; lines: string[]; reported: boolean }>();
   private saveChain: Promise<void> = Promise.resolve();
   private prepareChain: Promise<void> = Promise.resolve();
   private cfgPromise?: Promise<FleetConfig>;
@@ -610,20 +611,41 @@ export class Fleet {
     const client = this.mustClient(name);
     const man = await this.manifest();
     const member = man.members[name];
+    let prev: { status: MemberStatus; result: string | undefined; updatedAt: number } | undefined;
     if (member) {
       await rm(path.join(member.worktree, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
+      let dirty = false;
       if (member.needsAttention) {
         member.needsAttention = undefined;
+        dirty = true;
+      }
+      if (member.status !== "running" || member.result !== undefined) {
+        prev = { status: member.status, result: member.result, updatedAt: member.updatedAt };
+        member.status = "running";
+        member.result = undefined;
+        dirty = true;
+      }
+      if (dirty) {
         member.updatedAt = Date.now();
         await this.save();
       }
     }
-    if (client.busy) {
-      await client.steer(message);
-      return "steer";
+    try {
+      if (client.busy) {
+        await client.steer(message);
+        return "steer";
+      }
+      await client.prompt(message);
+      return "prompt";
+    } catch (err) {
+      if (member && prev && !client.exited) {
+        member.status = prev.status;
+        member.result = prev.result;
+        member.updatedAt = prev.updatedAt;
+        await this.save().catch(() => undefined);
+      }
+      throw err;
     }
-    await client.prompt(message);
-    return "prompt";
   }
 
   private async waitForMembers(
@@ -637,7 +659,7 @@ export class Fleet {
       const entries = new Map<string, number>();
       for (const m of Object.values(man.members)) entries.set(m.name, m.createdAt);
       for (const [name, snap] of this.completedTransient.entries()) {
-        if (!entries.has(name)) entries.set(name, snap.createdAt);
+        if (!snap.reported && !entries.has(name)) entries.set(name, snap.createdAt);
       }
       names = Array.from(entries.entries())
         .sort((a, b) => a[1] - b[1])
@@ -711,6 +733,7 @@ export class Fleet {
     for (const name of names) {
       const snap = this.completedTransient.get(name);
       if (snap) {
+        snap.reported = true;
         lines.push(...snap.lines);
         continue;
       }
@@ -947,6 +970,7 @@ export class Fleet {
   dispose(): void {
     const entries = Array.from(this.clients.entries());
     this.clients.clear();
+    this.completedTransient.clear();
     for (const [name, client] of entries) {
       client.detach();
       this.unwatchAsk(name);
@@ -970,6 +994,7 @@ export class Fleet {
 
     if (ev.type === "agent_start" && member.status !== "running") {
       member.status = "running";
+      member.result = undefined;
       member.updatedAt = Date.now();
       await this.save();
     } else if (ev.type === "agent_end" && member.status === "running") {
@@ -1035,7 +1060,13 @@ export class Fleet {
       const current = man.members[name];
       if (!current || current.status === "failed") return;
       const lines = await this.formatWaitMember(current);
-      this.completedTransient.set(current.name, { createdAt: current.createdAt, lines });
+      this.completedTransient.delete(current.name);
+      this.completedTransient.set(current.name, { createdAt: current.createdAt, lines, reported: false });
+      while (this.completedTransient.size > MAX_COMPLETED_TRANSIENT) {
+        const oldest = this.completedTransient.keys().next().value;
+        if (oldest === undefined) break;
+        this.completedTransient.delete(oldest);
+      }
       await this.killAttachedClient(name);
       try {
         await this.clean(name, false);

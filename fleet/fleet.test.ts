@@ -2183,6 +2183,188 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       await h.cleanup();
     }
   });
+
+  it("re-activates a done or failed attached member on send so wait blocks for the new result", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "reprompt",
+        task: "FINISH_NOW:DONE: first pass",
+      });
+      const firstWait = await h.runTool({ action: "wait", name: "reprompt" });
+
+      await h.runTool({
+        action: "send",
+        name: "reprompt",
+        message: "DELAY_DONE:120:DONE: second pass",
+      });
+      const secondWait = await h.runTool({ action: "wait", name: "reprompt" });
+
+      await h.runTool({
+        action: "send",
+        name: "reprompt",
+        message: "DELAY_DONE:100:FAILED: second fail",
+      });
+      const failWait = await h.runTool({ action: "wait", name: "reprompt" });
+
+      await h.runTool({
+        action: "send",
+        name: "reprompt",
+        message: "DELAY_DONE:100:DONE: recovered",
+      });
+      const recoverWait = await h.runTool({ action: "wait", name: "reprompt" });
+
+      await h.runTool({
+        action: "send",
+        name: "reprompt",
+        message: "FINISH_NOW:DONE: instant third",
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      const instantWait = await h.runTool({ action: "wait", name: "reprompt" });
+      const man = await loadManifest(h.root);
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          firstOk: !firstWait.isError && firstWait.text.includes("DONE: first pass"),
+          secondOk:
+            !secondWait.isError &&
+            secondWait.text.includes("status=done") &&
+            secondWait.text.includes("DONE: second pass") &&
+            !secondWait.text.includes("DONE: first pass"),
+          failOk:
+            !failWait.isError &&
+            failWait.text.includes("status=failed") &&
+            failWait.text.includes("FAILED: second fail") &&
+            !failWait.text.includes("DONE: second pass"),
+          recoverOk:
+            !recoverWait.isError &&
+            recoverWait.text.includes("status=done") &&
+            recoverWait.text.includes("DONE: recovered") &&
+            !recoverWait.text.includes("FAILED: second fail"),
+          instantStatus: man.members.reprompt?.status,
+          instantResult: man.members.reprompt?.result,
+          instantWaitOk: !instantWait.isError && instantWait.text.includes("DONE: instant third"),
+        },
+        {
+          firstOk: true,
+          secondOk: true,
+          failOk: true,
+          recoverOk: true,
+          instantStatus: "done",
+          instantResult: "DONE: instant third",
+          instantWaitOk: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("reports cleaned transient snapshots once in wait --all without hijacking later wait --all --any while preserving explicit name lookup", async () => {
+    const h = await createHarness();
+    try {
+      await h.runTool({
+        action: "spawn",
+        name: "rev-first",
+        role: "reviewer",
+        task: "FINISH_NOW:DONE: first review",
+      });
+      const firstAllWait = await h.runTool({ action: "wait", name: "--all" });
+      const secondAllWait = await h.runTool({ action: "wait", name: "--all" });
+      const explicitWait = await h.runTool({ action: "wait", name: "rev-first" });
+
+      await h.runTool({
+        action: "spawn",
+        name: "slow-coder",
+        task: "Stay running until prompted",
+      });
+      const anyWaitAfterFirst = await h.runTool({
+        action: "wait",
+        name: "--all",
+        mode: "any",
+        timeout: 0.15,
+      });
+
+      await h.runTool({
+        action: "spawn",
+        name: "rev-second",
+        role: "reviewer",
+        task: "FINISH_NOW:DONE: second review",
+      });
+      await h.runTool({ action: "wait", name: "rev-second" });
+      const anyWaitAfterSecond = await h.runTool({
+        action: "wait",
+        name: "--all",
+        mode: "any",
+        timeout: 0.15,
+      });
+
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          firstAllOk: !firstAllWait.isError && firstAllWait.text.includes("DONE: first review"),
+          secondAllEmpty: !secondAllWait.isError && secondAllWait.text === "fleet: no members to wait for",
+          explicitPreserved: !explicitWait.isError && explicitWait.text.includes("DONE: first review"),
+          anyTimedOutOnSlowAfterFirst:
+            /timed out/i.test(anyWaitAfterFirst.text) &&
+            anyWaitAfterFirst.text.includes("running: slow-coder") &&
+            !anyWaitAfterFirst.text.includes("rev-first"),
+          anyTimedOutOnSlowAfterSecond:
+            /timed out/i.test(anyWaitAfterSecond.text) &&
+            anyWaitAfterSecond.text.includes("running: slow-coder") &&
+            !anyWaitAfterSecond.text.includes("rev-second"),
+        },
+        {
+          firstAllOk: true,
+          secondAllEmpty: true,
+          explicitPreserved: true,
+          anyTimedOutOnSlowAfterFirst: true,
+          anyTimedOutOnSlowAfterSecond: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("resolves wait immediately for detached members and completes wait --all once running members settle", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("m-detached", "detached");
+      const singleWait = await h.runTool({ action: "wait", name: "m-detached", timeout: 2 });
+
+      await h.runTool({
+        action: "spawn",
+        name: "m-run",
+        task: "DELAY_DONE:100:DONE: finished running",
+      });
+      const allWait = await h.runTool({ action: "wait", name: "--all", timeout: 2 });
+      await h.runCommand("stop --all");
+
+      assert.deepEqual(
+        {
+          singleOk:
+            !singleWait.isError &&
+            singleWait.text.includes("status=detached") &&
+            !/timed out/i.test(singleWait.text),
+          allOk:
+            !allWait.isError &&
+            !/timed out/i.test(allWait.text) &&
+            allWait.text.includes("status=detached") &&
+            allWait.text.includes("DONE: finished running"),
+        },
+        {
+          singleOk: true,
+          allOk: true,
+        },
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
 
 describe("roleAppend", () => {
