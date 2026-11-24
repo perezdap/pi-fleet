@@ -5,6 +5,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, watch, type FSWatcher } from "node:fs";
 import { mkdir, open as openFile, readFile, rm, stat, writeFile } from "node:fs/promises";
 import * as path from "node:path";
@@ -27,7 +28,14 @@ import {
 } from "./gitw.ts";
 import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import { buildSystemAppend, resumePreamble } from "./roles.ts";
-import { killProcessTree, RpcMember, winQuote } from "./rpc.ts";
+import {
+  getProcessInfo,
+  hasFleetCommandIdentity,
+  RpcMember,
+  terminateProcessTreeVerified,
+  winQuote,
+  type ProcessInfoResult,
+} from "./rpc.ts";
 import {
   ROLE_NAMES,
   type CleanTarget,
@@ -51,6 +59,16 @@ export interface FleetUi {
   notify(text: string, level?: NotifyLevel): void;
   /** Pass an empty array to clear the widget. */
   setWidget(lines: string[]): void;
+}
+
+export interface FleetProcessOps {
+  inspectProcess: (pid: number) => Promise<ProcessInfoResult>;
+  terminateProcess: (pid: number) => Promise<boolean>;
+  isAlive: (pid: number | undefined) => boolean;
+}
+
+export interface FleetOptions {
+  processOps?: Partial<FleetProcessOps>;
 }
 
 interface SpawnOptions extends SpawnMemberInput {
@@ -131,15 +149,38 @@ export class Fleet {
   private spawning = new Map<string, Promise<void>>();
   private cleaningTransient = new Set<string>();
   private completedTransient = new Map<string, { createdAt: number; lines: string[]; reported: boolean }>();
+  private activeWaitTargets = new Map<string, number>();
+  private sendGen = new Map<string, number>();
+  private procOps: FleetProcessOps;
   private saveChain: Promise<void> = Promise.resolve();
   private prepareChain: Promise<void> = Promise.resolve();
   private cfgPromise?: Promise<FleetConfig>;
   private man?: Manifest;
   private manPromise?: Promise<Manifest>;
 
-  constructor(root: string, ui: FleetUi) {
+  constructor(root: string, ui: FleetUi, opts?: FleetOptions) {
     this.root = root;
     this.ui = ui;
+    this.procOps = {
+      inspectProcess: opts?.processOps?.inspectProcess ?? getProcessInfo,
+      terminateProcess: opts?.processOps?.terminateProcess ?? terminateProcessTreeVerified,
+      isAlive: opts?.processOps?.isAlive ?? isPidAlive,
+    };
+  }
+
+  private bumpSendGen(name: string): number {
+    const next = (this.sendGen.get(name) ?? 0) + 1;
+    this.sendGen.set(name, next);
+    return next;
+  }
+
+  private trimCompletedTransient(): void {
+    if (this.completedTransient.size <= MAX_COMPLETED_TRANSIENT) return;
+    for (const key of this.completedTransient.keys()) {
+      if (this.completedTransient.size <= MAX_COMPLETED_TRANSIENT) break;
+      if ((this.activeWaitTargets.get(key) ?? 0) > 0) continue;
+      this.completedTransient.delete(key);
+    }
   }
 
   // ── state ────────────────────────────────────────────────────────────────
@@ -476,9 +517,12 @@ export class Fleet {
           member.transient = transient;
           member.status = "starting";
           member.pid = undefined;
+          member.pidStartedAt = undefined;
+          member.reviewContextSha256 = undefined;
           member.needsAttention = undefined;
           member.result = undefined;
           member.updatedAt = now;
+          this.bumpSendGen(input.name);
           man.members[input.name] = member;
           prepared.push({ input, member, resume, role, spec, model, branch, wt, effectiveOver, range });
         }
@@ -554,11 +598,16 @@ export class Fleet {
           client.onExit(() => void this.onClientExit(input.name, client).catch((err) => this.reportHandlerError(input.name, err)));
           this.watchAsk(member);
 
-          const state = await client.waitReady();
+          const [state, procInfo] = await Promise.all([
+            client.waitReady(),
+            this.procOps.inspectProcess(client.pid),
+          ]);
           member.pid = client.pid;
+          member.pidStartedAt = procInfo.status === "ok" ? procInfo.info.startedAt : undefined;
           member.sessionFile = state?.sessionFile ?? member.sessionFile;
           member.status = "running";
           member.updatedAt = Date.now();
+          this.bumpSendGen(input.name);
           await this.save();
 
           const firstMessage = resume ? resumePreamble(member, input.extra) : member.task;
@@ -639,11 +688,24 @@ export class Fleet {
     await mkdir(path.dirname(file), { recursive: true });
     const commitList = commits.length ? commits.map((c) => `- ${c}`).join("\n") : "(no commits)";
     const fence = markdownFence(diff);
-    await writeFile(
-      file,
-      `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Assignment\n\n${member.task}\n\n## Commits\n\n${commitList}\n\n## Diff\n\n${fence}diff\n${diff}\n${fence}\n`,
-      "utf8",
-    );
+    const content = `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Assignment\n\n${member.task}\n\n## Commits\n\n${commitList}\n\n## Diff\n\n${fence}diff\n${diff}\n${fence}\n`;
+    await writeFile(file, content, "utf8");
+    member.reviewContextSha256 = createHash("sha256").update(content, "utf8").digest("hex");
+  }
+
+  private async removeGeneratedReviewContext(member: Member): Promise<void> {
+    if (!member.reviewContextSha256) return;
+    const file = reviewContextPath(member.worktree);
+    let currentBytes: Buffer;
+    try {
+      currentBytes = await readFile(file);
+    } catch {
+      return;
+    }
+    const currentHash = createHash("sha256").update(currentBytes).digest("hex");
+    if (currentHash === member.reviewContextSha256) {
+      await rm(file, { force: true }).catch(() => undefined);
+    }
   }
 
   private async send(name: string, message: string): Promise<"steer" | "prompt"> {
@@ -651,8 +713,13 @@ export class Fleet {
     const man = await this.manifest();
     const member = man.members[name];
     let prev: { status: MemberStatus; result: string | undefined; updatedAt: number } | undefined;
+    let gen: number | undefined;
     if (member) {
       await rm(path.join(member.worktree, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
+      // Recheck liveness and attachment after async I/O before mutating status to running.
+      if (this.clients.get(name) !== client || client.exited) {
+        throw new Error(`member '${name}' is not attached (status may be stale; try /fleet resume ${name})`);
+      }
       let dirty = false;
       if (member.needsAttention) {
         member.needsAttention = undefined;
@@ -664,12 +731,16 @@ export class Fleet {
         member.result = undefined;
         dirty = true;
       }
+      gen = this.bumpSendGen(name);
       if (dirty) {
         member.updatedAt = Date.now();
         await this.save();
       }
     }
     try {
+      if (this.clients.get(name) !== client || client.exited) {
+        throw new Error("member process exited");
+      }
       if (client.busy) {
         await client.steer(message);
         return "steer";
@@ -677,7 +748,15 @@ export class Fleet {
       await client.prompt(message);
       return "prompt";
     } catch (err) {
-      if (member && prev && !client.exited) {
+      if (
+        member &&
+        man.members[name] === member &&
+        prev &&
+        gen !== undefined &&
+        this.sendGen.get(name) === gen &&
+        this.clients.get(name) === client &&
+        !client.exited
+      ) {
         member.status = prev.status;
         member.result = prev.result;
         member.updatedAt = prev.updatedAt;
@@ -749,78 +828,93 @@ export class Fleet {
       }
     };
 
-    let timedOut = false;
-    await syncAsks();
-    if (!isSatisfied()) {
-      await new Promise<void>((resolve, reject) => {
-        let timer: NodeJS.Timeout | undefined;
-        let syncing = false;
-        let settled = false;
-        const cleanup = () => {
-          if (settled) return;
-          settled = true;
-          this.stateListeners.delete(check);
-          clearInterval(poll);
-          if (timer) clearTimeout(timer);
-          signal?.removeEventListener("abort", onAbort);
-        };
-        const done = () => {
-          cleanup();
-          resolve();
-        };
-        const onAbort = () => {
-          cleanup();
-          reject(new Error("wait aborted"));
-        };
-        const check = () => {
-          if (isSatisfied()) done();
-        };
-        if (signal?.aborted) {
-          onAbort();
-          return;
-        }
-        signal?.addEventListener("abort", onAbort, { once: true });
-        const poll = setInterval(() => {
-          if (syncing) return;
-          syncing = true;
-          void syncAsks()
-            .then(check)
-            .catch((err) => this.reportHandlerError("wait", err))
-            .finally(() => {
-              syncing = false;
-            });
-        }, 100);
-        if (timeoutSec !== undefined) {
-          timer = setTimeout(() => {
-            if (!isSatisfied()) timedOut = true;
-            done();
-          }, Math.max(1, Math.round(timeoutSec * 1000)));
-        }
-        this.stateListeners.add(check);
-      });
+    for (const name of names) {
+      this.activeWaitTargets.set(name, (this.activeWaitTargets.get(name) ?? 0) + 1);
     }
 
-    const lines: string[] = [];
-    if (timedOut) {
-      const settled = names.filter(isSettled);
-      const running = names.filter((n) => !isSettled(n));
-      lines.push(
-        `fleet: wait timed out after ${timeoutSec}s (settled: ${settled.join(", ") || "none"}; running: ${running.join(", ") || "none"})`,
+    try {
+      let timedOut = false;
+      await syncAsks();
+      if (signal?.aborted) throw new Error("wait aborted");
+      if (!isSatisfied()) {
+        await new Promise<void>((resolve, reject) => {
+          let timer: NodeJS.Timeout | undefined;
+          let poll: NodeJS.Timeout | undefined;
+          let syncing = false;
+          let settled = false;
+          const cleanup = () => {
+            if (settled) return;
+            settled = true;
+            this.stateListeners.delete(check);
+            if (poll) clearInterval(poll);
+            if (timer) clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
+          };
+          const done = () => {
+            cleanup();
+            resolve();
+          };
+          const onAbort = () => {
+            cleanup();
+            reject(new Error("wait aborted"));
+          };
+          const check = () => {
+            if (isSatisfied()) done();
+          };
+          if (signal?.aborted) {
+            onAbort();
+            return;
+          }
+          signal?.addEventListener("abort", onAbort, { once: true });
+          poll = setInterval(() => {
+            if (syncing) return;
+            syncing = true;
+            void syncAsks()
+              .then(check)
+              .catch((err) => this.reportHandlerError("wait", err))
+              .finally(() => {
+                syncing = false;
+              });
+          }, 100);
+          if (timeoutSec !== undefined) {
+            timer = setTimeout(() => {
+              if (!isSatisfied()) timedOut = true;
+              done();
+            }, Math.max(1, Math.round(timeoutSec * 1000)));
+          }
+          this.stateListeners.add(check);
+        });
+      }
+
+      const lines: string[] = [];
+      if (timedOut) {
+        const settled = names.filter(isSettled);
+        const running = names.filter((n) => !isSettled(n));
+        lines.push(
+          `fleet: wait timed out after ${timeoutSec}s (settled: ${settled.join(", ") || "none"}; running: ${running.join(", ") || "none"})`,
+        );
+      }
+      const memberChunks = await Promise.all(
+        names.map(async (name) => {
+          const snap = this.completedTransient.get(name);
+          if (snap) {
+            snap.reported = true;
+            return snap.lines;
+          }
+          const member = man.members[name];
+          return member ? this.formatWaitMember(member) : [];
+        }),
       );
+      for (const chunk of memberChunks) lines.push(...chunk);
+      return info([lines.join("\n")]);
+    } finally {
+      for (const name of names) {
+        const next = (this.activeWaitTargets.get(name) ?? 1) - 1;
+        if (next <= 0) this.activeWaitTargets.delete(name);
+        else this.activeWaitTargets.set(name, next);
+      }
+      this.trimCompletedTransient();
     }
-    const memberChunks = await Promise.all(
-      names.map(async (name) => {
-        const snap = this.completedTransient.get(name);
-        if (snap) {
-          snap.reported = true;
-          return snap.lines;
-        }
-        const member = man.members[name];
-        return member ? this.formatWaitMember(member) : [];
-      }),
-    );
-    for (const chunk of memberChunks) lines.push(...chunk);
-    return info([lines.join("\n")]);
   }
 
   private async formatWaitMember(member: Member): Promise<string[]> {
@@ -848,18 +942,55 @@ export class Fleet {
     return true;
   }
 
+  private async verifyDetachedProcess(
+    member: Member,
+  ): Promise<"not_running" | "match" | "mismatch" | "unavailable"> {
+    if (!member.pid || !this.procOps.isAlive(member.pid)) {
+      return "not_running";
+    }
+    const inspected = await this.procOps.inspectProcess(member.pid);
+    if (inspected.status === "not_found") return "not_running";
+    if (inspected.status === "unavailable") return "unavailable";
+    if (member.pidStartedAt) {
+      if (!inspected.info.startedAt) return "unavailable";
+      if (inspected.info.startedAt !== member.pidStartedAt) return "mismatch";
+    }
+    if (!hasFleetCommandIdentity(inspected.info.commandLine, member.name)) {
+      return "mismatch";
+    }
+    return "match";
+  }
+
   private async stop(name: string, save = true): Promise<boolean> {
+    this.bumpSendGen(name);
     const hadClient = await this.killAttachedClient(name);
     const man = await this.manifest();
     const member = man.members[name];
     const canKillDetached =
       !!member && (isActiveStatus(member.status) || member.status === "detached");
-    if (!hadClient && canKillDetached && member.pid && isPidAlive(member.pid)) {
-      await killProcessTree(member.pid);
+    if (!hadClient && canKillDetached && member.pid) {
+      const identity = await this.verifyDetachedProcess(member);
+      if (identity === "unavailable") {
+        throw new Error(
+          `cannot verify process identity for detached member '${name}' (pid ${member.pid}); refusing to terminate`,
+        );
+      }
+      if (identity === "mismatch") {
+        this.ui.notify(
+          `fleet: refusing to terminate pid ${member.pid} for '${name}' because it no longer matches this member (PID appears reused)`,
+          "warn",
+        );
+      } else if (identity === "match") {
+        const exited = await this.procOps.terminateProcess(member.pid);
+        if (!exited) {
+          throw new Error(`failed to stop detached member '${name}' (pid ${member.pid} is still running)`);
+        }
+      }
     }
     if (member && (canKillDetached || hadClient)) {
       member.status = "stopped";
       member.pid = undefined;
+      member.pidStartedAt = undefined;
       member.updatedAt = Date.now();
       if (save) await this.save();
       return true;
@@ -881,7 +1012,7 @@ export class Fleet {
     this.unwatchAsk(name);
     try {
       if (existsSync(member.worktree)) {
-        await rm(reviewContextPath(member.worktree), { force: true }).catch(() => undefined);
+        await this.removeGeneratedReviewContext(member);
         const r = await removeWorktree(this.root, member.worktree, force);
         if (!r.ok) throw new Error(`worktree remove failed: ${r.out}`);
       }
@@ -1026,32 +1157,15 @@ export class Fleet {
     }
     const cfg = await this.config();
     const logFile = path.join(this.root, cfg.logDir ?? ".pi/fleet/logs", `${name}.jsonl`);
-    let parsed: ReturnType<typeof parseLogEntries>;
+    let parsed: { items: LogEntry[]; lastResultIdx: number };
     try {
-      const infoStat = await stat(logFile);
-      if (infoStat.size > LOG_TAIL_CHUNK_BYTES) {
-        const fh = await openFile(logFile, "r");
-        try {
-          const startOffset = infoStat.size - LOG_TAIL_CHUNK_BYTES;
-          const buf = Buffer.alloc(LOG_TAIL_CHUNK_BYTES);
-          const { bytesRead } = await fh.read(buf, 0, LOG_TAIL_CHUNK_BYTES, startOffset);
-          parsed = parseLogEntries(buf.subarray(0, bytesRead).toString("utf8"), true);
-        } finally {
-          await fh.close();
-        }
-        if (parsed.items.length < n) {
-          parsed = parseLogEntries(await readFile(logFile, "utf8"), false);
-        }
-      } else {
-        parsed = parseLogEntries(await readFile(logFile, "utf8"), false);
-      }
+      parsed = await readLogTailEntries(logFile, n);
     } catch {
       return `(no log yet for '${name}')`;
     }
-    const startIdx = Math.max(0, parsed.items.length - n);
-    const tail = parsed.items.slice(startIdx).map((item, idx) => {
+    const tail = parsed.items.map((item, idx) => {
       if (item.kind === "tool") return `tool: ${item.toolName}`;
-      if (startIdx + idx === parsed.lastResultIdx) return `assistant: ${item.text}`;
+      if (idx === parsed.lastResultIdx) return `assistant: ${item.text}`;
       return `assistant: ${truncate(item.text.replace(/\s+/g, " "), 220)}`;
     });
     return tail.length ? tail.join("\n") : `(no activity logged for '${name}')`;
@@ -1064,7 +1178,18 @@ export class Fleet {
     for (const member of Object.values(man.members)) {
       if (!isActiveStatus(member.status)) continue;
       if (this.clients.has(member.name)) continue;
-      const alive = isPidAlive(member.pid) && existsSync(member.worktree);
+      let alive = false;
+      if (existsSync(member.worktree)) {
+        const identity = await this.verifyDetachedProcess(member);
+        alive = identity === "match" || identity === "unavailable";
+        if (identity === "not_running" || identity === "mismatch") {
+          member.pid = undefined;
+          member.pidStartedAt = undefined;
+        }
+      } else {
+        member.pid = undefined;
+        member.pidStartedAt = undefined;
+      }
       member.status = alive ? "detached" : "stale";
       member.updatedAt = Date.now();
       changed = true;
@@ -1105,11 +1230,13 @@ export class Fleet {
     if (!member) return;
 
     if (ev.type === "agent_start" && member.status !== "running") {
+      this.bumpSendGen(name);
       member.status = "running";
       member.result = undefined;
       member.updatedAt = Date.now();
       await this.save();
     } else if ((ev.type === "agent_end" || ev.type === "agent_settled") && member.status === "running") {
+      this.bumpSendGen(name);
       member.status = "idle";
       member.updatedAt = Date.now();
       await this.save();
@@ -1117,6 +1244,7 @@ export class Fleet {
       const text = extractText(ev.message);
       const prefix = parseResultPrefix(text);
       if (prefix === "done") {
+        this.bumpSendGen(name);
         if (member.transient) {
           const cleanPromise = this.completeAndCleanTransient(member, text.trim());
           this.ui.notify(`fleet member '${name}' reports DONE`, "info");
@@ -1129,6 +1257,7 @@ export class Fleet {
           this.ui.notify(`fleet member '${name}' reports DONE`, "info");
         }
       } else if (prefix === "failed") {
+        this.bumpSendGen(name);
         member.status = "failed";
         member.result = text.trim();
         member.updatedAt = Date.now();
@@ -1140,6 +1269,7 @@ export class Fleet {
 
   private async onClientExit(name: string, client: RpcMember): Promise<void> {
     if (this.clients.get(name) !== client) return;
+    this.bumpSendGen(name);
     this.clients.delete(name);
     this.unwatchAsk(name);
     await this.spawning.get(name);
@@ -1155,8 +1285,9 @@ export class Fleet {
       member.status = "failed";
       dirty = true;
     }
-    if (member.pid !== undefined) {
+    if (member.pid !== undefined || member.pidStartedAt !== undefined) {
       member.pid = undefined;
+      member.pidStartedAt = undefined;
       dirty = true;
     }
     if (dirty) {
@@ -1172,6 +1303,7 @@ export class Fleet {
     try {
       member.status = "done";
       member.pid = undefined;
+      member.pidStartedAt = undefined;
       if (result !== undefined) member.result = result;
       member.updatedAt = Date.now();
       await this.spawning.get(name);
@@ -1181,11 +1313,7 @@ export class Fleet {
       const lines = await this.formatWaitMember(current);
       this.completedTransient.delete(current.name);
       this.completedTransient.set(current.name, { createdAt: current.createdAt, lines, reported: false });
-      while (this.completedTransient.size > MAX_COMPLETED_TRANSIENT) {
-        const oldest = this.completedTransient.keys().next().value;
-        if (oldest === undefined) break;
-        this.completedTransient.delete(oldest);
-      }
+      this.trimCompletedTransient();
       await this.killAttachedClient(name);
       try {
         await this.clean(name, false);
@@ -1311,37 +1439,103 @@ export function planOpenLaunch(opts: {
   };
 }
 
-function parseLogEntries(
-  raw: string,
-  dropPartialFirstLine = false,
-): {
-  items: Array<{ kind: "assistant"; text: string } | { kind: "tool"; toolName: string }>;
-  lastResultIdx: number;
-} {
-  const lines = raw.split("\n");
-  const start = dropPartialFirstLine ? 1 : 0;
-  const items: Array<{ kind: "assistant"; text: string } | { kind: "tool"; toolName: string }> = [];
-  let lastResultIdx = -1;
-  for (let i = start; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim()) continue;
-    let ev: any;
-    try {
-      ev = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (ev.type === "message_end" && ev.message?.role === "assistant") {
-      const text = extractText(ev.message).trim();
-      if (text) {
-        if (parseResultPrefix(text)) lastResultIdx = items.length;
-        items.push({ kind: "assistant", text });
-      }
-    } else if (ev.type === "tool_execution_start") {
-      items.push({ kind: "tool", toolName: ev.toolName });
-    }
+export type LogEntry =
+  | { kind: "assistant"; text: string }
+  | { kind: "tool"; toolName: string };
+
+function parseLogLine(line: string): LogEntry | undefined {
+  if (!line.trim()) return undefined;
+  let ev: any;
+  try {
+    ev = JSON.parse(line);
+  } catch {
+    return undefined;
   }
-  return { items, lastResultIdx };
+  if (ev.type === "message_end" && ev.message?.role === "assistant") {
+    const text = extractText(ev.message).trim();
+    if (text) return { kind: "assistant", text };
+  } else if (ev.type === "tool_execution_start" && typeof ev.toolName === "string") {
+    return { kind: "tool", toolName: ev.toolName };
+  }
+  return undefined;
+}
+
+/**
+ * Scan a JSONL activity log backward in bounded chunks, retaining at most `n`
+ * entries in memory. Splits raw bytes on 0x0A ('\n') before UTF-8 decoding so
+ * multi-byte characters straddling chunk boundaries are never corrupted.
+ */
+export async function readLogTailEntries(
+  logFile: string,
+  n: number,
+  chunkBytes = LOG_TAIL_CHUNK_BYTES,
+): Promise<{ items: LogEntry[]; lastResultIdx: number }> {
+  const fh = await openFile(logFile, "r");
+  try {
+    const fileSize = (await fh.stat()).size;
+    let offset = fileSize;
+    let carryBytes: Buffer = Buffer.alloc(0);
+    const revItems: LogEntry[] = [];
+    const readSize = Math.max(1, Math.floor(chunkBytes));
+
+    while (offset > 0 && revItems.length < n) {
+      const toRead = Math.min(readSize, offset);
+      const chunkStart = offset - toRead;
+      const chunkBuf = Buffer.alloc(toRead);
+      let filled = 0;
+      while (filled < toRead) {
+        const { bytesRead } = await fh.read(chunkBuf, filled, toRead - filled, chunkStart + filled);
+        if (bytesRead <= 0) break;
+        filled += bytesRead;
+      }
+      offset = chunkStart;
+
+      const slice = filled === toRead ? chunkBuf : chunkBuf.subarray(0, filled);
+      const combined = carryBytes.length > 0 ? Buffer.concat([slice, carryBytes]) : slice;
+
+      let completeBytes: Buffer;
+      if (chunkStart > 0) {
+        const firstNl = combined.indexOf(0x0a);
+        if (firstNl === -1) {
+          carryBytes = combined;
+          continue;
+        }
+        carryBytes = Buffer.from(combined.subarray(0, firstNl));
+        completeBytes = combined.subarray(firstNl + 1);
+      } else {
+        carryBytes = Buffer.alloc(0);
+        completeBytes = combined;
+      }
+
+      // Walk completeBytes backward by 0x0A line separators.
+      let end = completeBytes.length;
+      while (end > 0 && revItems.length < n) {
+        const prevNl = completeBytes.lastIndexOf(0x0a, end - 1);
+        const lineStart = prevNl + 1;
+        let lineEnd = end;
+        if (lineEnd > lineStart && completeBytes[lineEnd - 1] === 0x0d) {
+          lineEnd -= 1;
+        }
+        if (lineEnd > lineStart) {
+          const entry = parseLogLine(completeBytes.subarray(lineStart, lineEnd).toString("utf8"));
+          if (entry) revItems.push(entry);
+        }
+        end = prevNl;
+      }
+    }
+
+    const items = revItems.reverse();
+    let lastResultIdx = -1;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === "assistant" && parseResultPrefix(item.text)) {
+        lastResultIdx = i;
+      }
+    }
+    return { items, lastResultIdx };
+  } finally {
+    await fh.close();
+  }
 }
 
 function parseResultPrefix(text: string): "done" | "failed" | undefined {

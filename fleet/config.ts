@@ -2,7 +2,14 @@
 
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
-import { ROLE_NAMES, type FleetConfig, type RoleName, type RoleSpec } from "./types.ts";
+import {
+  ROLE_NAMES,
+  THINKING_LEVELS,
+  type FleetConfig,
+  type RoleName,
+  type RoleSpec,
+  type ThinkingLevel,
+} from "./types.ts";
 
 /** Built-in role defaults. Config entries merge over these. */
 const BUILTIN_ROLES: Record<RoleName, RoleSpec> = {
@@ -19,6 +26,54 @@ function configPath(repoRoot: string): string {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeRoleSpec(
+  role: RoleName,
+  raw: unknown,
+  onWarn?: (msg: string) => void,
+): RoleSpec | undefined {
+  if (!isPlainObject(raw)) {
+    onWarn?.(`fleet: config roles.${role} must be an object; ignoring`);
+    return undefined;
+  }
+  const spec: RoleSpec = {};
+  if (raw.model !== undefined) {
+    if (typeof raw.model === "string" && raw.model.trim().length > 0) {
+      spec.model = raw.model;
+    } else {
+      onWarn?.(`fleet: config roles.${role}.model must be a non-empty string; ignoring`);
+    }
+  }
+  if (raw.thinking !== undefined) {
+    if (typeof raw.thinking === "string" && THINKING_LEVELS.includes(raw.thinking as ThinkingLevel)) {
+      spec.thinking = raw.thinking as ThinkingLevel;
+    } else {
+      onWarn?.(`fleet: config roles.${role}.thinking '${String(raw.thinking)}' is invalid; ignoring`);
+    }
+  }
+  if (raw.tools !== undefined) {
+    if (typeof raw.tools === "string") {
+      spec.tools = raw.tools;
+    } else {
+      onWarn?.(`fleet: config roles.${role}.tools must be a string; ignoring`);
+    }
+  }
+  if (raw.systemAppend !== undefined) {
+    if (typeof raw.systemAppend === "string") {
+      spec.systemAppend = raw.systemAppend;
+    } else {
+      onWarn?.(`fleet: config roles.${role}.systemAppend must be a string; ignoring`);
+    }
+  }
+  if (raw.autoClean !== undefined) {
+    if (typeof raw.autoClean === "boolean") {
+      spec.autoClean = raw.autoClean;
+    } else {
+      onWarn?.(`fleet: config roles.${role}.autoClean must be a boolean; ignoring`);
+    }
+  }
+  return spec;
 }
 
 export async function loadFleetConfig(
@@ -65,10 +120,18 @@ export async function loadFleetConfig(
     }
   }
 
-  let roles: Partial<Record<RoleName, RoleSpec>> = {};
+  const roles: Partial<Record<RoleName, RoleSpec>> = {};
   if (user.roles !== undefined) {
     if (isPlainObject(user.roles)) {
-      roles = user.roles as Partial<Record<RoleName, RoleSpec>>;
+      for (const [roleKey, rawRole] of Object.entries(user.roles)) {
+        if (!ROLE_NAMES.includes(roleKey as RoleName)) {
+          onWarn?.(`fleet: config roles.${roleKey} is not a known role; ignoring`);
+          continue;
+        }
+        const role = roleKey as RoleName;
+        const sanitized = sanitizeRoleSpec(role, rawRole, onWarn);
+        if (sanitized) roles[role] = sanitized;
+      }
     } else {
       onWarn?.("fleet: config roles must be an object; ignoring");
     }
@@ -90,7 +153,9 @@ export async function loadFleetConfig(
 
 /** Merge built-in role defaults with config overrides. */
 export function resolveRoleSpec(cfg: FleetConfig, role: RoleName): RoleSpec {
-  return { ...BUILTIN_ROLES[role], ...(cfg.roles?.[role] ?? {}) };
+  const rawOverride = cfg.roles?.[role];
+  const override = rawOverride !== undefined ? (sanitizeRoleSpec(role, rawOverride) ?? {}) : {};
+  return { ...BUILTIN_ROLES[role], ...override };
 }
 
 export function piBinary(cfg: FleetConfig): string {

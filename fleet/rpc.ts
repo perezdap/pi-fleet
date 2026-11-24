@@ -6,9 +6,10 @@
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, type WriteStream } from "node:fs";
+import { mkdir, readFile } from "node:fs/promises";
 import * as path from "node:path";
-import { mkdir } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
+import { isPidAlive } from "./manifest.ts";
 
 export type RpcEventHandler = (event: any) => void;
 export type RpcExitHandler = (code: number | null) => void;
@@ -23,7 +24,124 @@ export interface RpcSpawnOptions {
   logFile: string;
 }
 
+export interface ProcessInfo {
+  commandLine: string;
+  startedAt?: string;
+}
+
+export type ProcessInfoResult =
+  | { status: "ok"; info: ProcessInfo }
+  | { status: "not_found" }
+  | { status: "unavailable"; reason: string };
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Check whether a live process's command line identifies this Fleet member. */
+export function hasFleetCommandIdentity(commandLine: string, memberName: string): boolean {
+  if (!commandLine.trim()) return false;
+  const hasRpcMode = /(?:^|[\s"'])--mode[\s"']+rpc(?:$|[\s"'])/.test(commandLine);
+  const memberToken = new RegExp(`(?:^|[\\s"'])fleet:${escapeRegExp(memberName)}(?:$|[\\s"'])`);
+  return hasRpcMode && memberToken.test(commandLine);
+}
+
+/** Inspect OS process metadata (command line + start time) to guard against PID reuse. */
+export async function getProcessInfo(pid: number): Promise<ProcessInfoResult> {
+  if (!Number.isInteger(pid) || pid <= 0) return { status: "not_found" };
+
+  if (process.platform === "linux") {
+    try {
+      const [cmdlineBuf, statRaw] = await Promise.all([
+        readFile(`/proc/${pid}/cmdline`),
+        readFile(`/proc/${pid}/stat`, "utf8"),
+      ]);
+      const commandLine = cmdlineBuf
+        .toString("utf8")
+        .split("\0")
+        .filter(Boolean)
+        .join(" ");
+      const rparen = statRaw.lastIndexOf(")");
+      let startedAt: string | undefined;
+      if (rparen >= 0) {
+        const fields = statRaw.slice(rparen + 2).trim().split(/\s+/);
+        // Field 22 in /proc/<pid>/stat is starttime (index 19 after comm/state/ppid).
+        if (fields[19]) startedAt = fields[19];
+      }
+      if (!commandLine) return { status: "not_found" };
+      return { status: "ok", info: { commandLine, startedAt } };
+    } catch (err: any) {
+      if (err?.code === "ENOENT" || err?.code === "ESRCH") {
+        return { status: "not_found" };
+      }
+      return { status: "unavailable", reason: err?.message ?? String(err) };
+    }
+  }
+
+  if (process.platform === "win32") {
+    return new Promise<ProcessInfoResult>((resolve) => {
+      const script =
+        `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; ` +
+        `if ($null -eq $p) { '' } else { ` +
+        `$s = if ($p.CreationDate) { $p.CreationDate.ToUniversalTime().ToString('o') } else { '' }; ` +
+        `[pscustomobject]@{ startedAt = $s; commandLine = [string]$p.CommandLine } | ConvertTo-Json -Compress }`;
+      execFile(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", script],
+        { windowsHide: true, timeout: 10_000 },
+        (err, stdout) => {
+          if (err) {
+            resolve({ status: "unavailable", reason: err.message });
+            return;
+          }
+          const trimmed = stdout.trim();
+          if (!trimmed) {
+            resolve({ status: "not_found" });
+            return;
+          }
+          try {
+            const parsed = JSON.parse(trimmed);
+            const commandLine = typeof parsed?.commandLine === "string" ? parsed.commandLine : "";
+            const startedAt =
+              typeof parsed?.startedAt === "string" && parsed.startedAt ? parsed.startedAt : undefined;
+            if (!commandLine) {
+              resolve({ status: "unavailable", reason: "empty commandLine" });
+              return;
+            }
+            resolve({ status: "ok", info: { commandLine, startedAt } });
+          } catch (parseErr: any) {
+            resolve({ status: "unavailable", reason: parseErr?.message ?? String(parseErr) });
+          }
+        },
+      );
+    });
+  }
+
+  // macOS and other POSIX platforms
+  return new Promise<ProcessInfoResult>((resolve) => {
+    execFile("ps", ["-o", "lstart=", "-p", String(pid)], { timeout: 5_000 }, (startErr, startOut) => {
+      if (startErr) {
+        resolve(isPidAlive(pid) ? { status: "unavailable", reason: startErr.message } : { status: "not_found" });
+        return;
+      }
+      const startedAt = startOut.trim() || undefined;
+      execFile("ps", ["-o", "args=", "-p", String(pid)], { timeout: 5_000 }, (argsErr, argsOut) => {
+        if (argsErr) {
+          resolve(isPidAlive(pid) ? { status: "unavailable", reason: argsErr.message } : { status: "not_found" });
+          return;
+        }
+        const commandLine = argsOut.trim();
+        if (!commandLine) {
+          resolve({ status: "not_found" });
+          return;
+        }
+        resolve({ status: "ok", info: { commandLine, startedAt } });
+      });
+    });
+  });
+}
 
 /** Quote one argument for cmd.exe on Windows. */
 export function winQuote(arg: string): string {
@@ -57,6 +175,44 @@ export async function killProcessTree(pid: number, signal: NodeJS.Signals = "SIG
   }
 }
 
+export async function waitForPidExit(
+  pid: number,
+  timeoutMs: number,
+  checkAlive: (pid: number) => boolean = isPidAlive,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (checkAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await sleep(50);
+  }
+  return true;
+}
+
+export async function terminateProcessTreeVerified(
+  pid: number,
+  opts?: {
+    termTimeoutMs?: number;
+    killTimeoutMs?: number;
+    killTree?: (pid: number, signal?: NodeJS.Signals) => Promise<void>;
+    checkAlive?: (pid: number) => boolean;
+  },
+): Promise<boolean> {
+  const killTree = opts?.killTree ?? killProcessTree;
+  const checkAlive = opts?.checkAlive ?? isPidAlive;
+  const termTimeoutMs = opts?.termTimeoutMs ?? 3_000;
+  const killTimeoutMs = opts?.killTimeoutMs ?? 2_000;
+
+  if (!checkAlive(pid)) return true;
+  await killTree(pid, "SIGTERM");
+  if (await waitForPidExit(pid, termTimeoutMs, checkAlive)) return true;
+
+  if (process.platform !== "win32") {
+    await killTree(pid, "SIGKILL");
+    if (await waitForPidExit(pid, killTimeoutMs, checkAlive)) return true;
+  }
+  return !checkAlive(pid);
+}
+
 export class RpcMember {
   readonly proc: ChildProcess;
   readonly pid: number;
@@ -76,6 +232,7 @@ export class RpcMember {
   private log?: WriteStream;
   private spawnError?: Error;
   private exitNotified = false;
+  private stdoutFlushed = false;
 
   private constructor(opts: RpcSpawnOptions) {
     const isWin = process.platform === "win32";
@@ -124,9 +281,17 @@ export class RpcMember {
     this.proc.on("exit", (code) => {
       this.exited = true;
       this.exitCode = code;
-      this.failPending(new Error("member process exited"));
+      // Do not fail pending requests yet: stdout may still have a buffered final
+      // response (especially without a trailing newline) that arrives before 'end'/'close'.
+      if (this.stdoutFlushed) {
+        this.failPending(new Error("member process exited"));
+      }
     });
     this.proc.on("close", (code) => {
+      this.exited = true;
+      if (this.exitCode === null) this.exitCode = code;
+      this.onStdoutEnd();
+      this.failPending(new Error("member process exited"));
       this.closeLog();
       this.emitExit(code);
     });
@@ -184,11 +349,16 @@ export class RpcMember {
   }
 
   private onStdoutEnd(): void {
+    if (this.stdoutFlushed) return;
+    this.stdoutFlushed = true;
     this.buffer += this.decoder.end();
     const trailing = this.buffer.replace(/\r$/, "");
     this.buffer = "";
     if (trailing.trim()) {
       this.processLine(trailing);
+    }
+    if (this.exited) {
+      this.failPending(new Error("member process exited"));
     }
   }
 

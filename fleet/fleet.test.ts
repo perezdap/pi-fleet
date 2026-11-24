@@ -5,13 +5,13 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { loadFleetConfig } from "./config.ts";
-import { parseFleetCommand, planOpenLaunch, toolParamsToCommand } from "./fleet.ts";
+import { loadFleetConfig, resolveRoleSpec } from "./config.ts";
+import { Fleet, parseFleetCommand, planOpenLaunch, readLogTailEntries, toolParamsToCommand } from "./fleet.ts";
 import { addWorktree, branchExists, diffForReview, git, headRev, mergeBranch } from "./gitw.ts";
 import registerFleet from "./index.ts";
 import { isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
 import { roleAppend } from "./roles.ts";
-import { RpcMember, winQuote } from "./rpc.ts";
+import { getProcessInfo, hasFleetCommandIdentity, RpcMember, winQuote } from "./rpc.ts";
 import type { Member, MemberStatus, NotifyLevel } from "./types.ts";
 
 const FAKE_PI_SCRIPT = `#!/usr/bin/env node
@@ -575,10 +575,14 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
 
   it("kills the live process of a detached member when stopped and clears its pid", async () => {
     const h = await createHarness();
-    const sleeper = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
+    const sleeper = spawnChild(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)", "--", "--mode", "rpc", "--name", "fleet:ghost"],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
     try {
       const m = await h.seedMember("ghost", "detached");
       const man = await loadManifest(h.root);
@@ -710,10 +714,14 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
 
   it("cleans finished and detached members (stopping live detached PIDs) on clean --done while leaving active members intact", async () => {
     const h = await createHarness();
-    const sleeper = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
+    const sleeper = spawnChild(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)", "--", "--mode", "rpc", "--name", "fleet:fin-detached"],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
     try {
       const finished: MemberStatus[] = ["done", "merged", "failed", "stopped", "stale", "detached"];
       const untouched: MemberStatus[] = ["starting", "running", "idle"];
@@ -2124,11 +2132,16 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
 
   it("stops detached members on stop --all and kills live detached processes on clean <name> and clean --all", async () => {
     const h = await createHarness();
-    const sleepers = Array.from({ length: 4 }, () =>
-      spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-        stdio: "ignore",
-        windowsHide: true,
-      }),
+    const sleeperNames = ["det-a", "det-b", "det-direct", "det-all"];
+    const sleepers = sleeperNames.map((n) =>
+      spawnChild(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)", "--", "--mode", "rpc", "--name", `fleet:${n}`],
+        {
+          stdio: "ignore",
+          windowsHide: true,
+        },
+      ),
     );
     try {
       await h.seedMember("det-a", "detached");
@@ -2805,10 +2818,14 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
 
   it("reconciles unattached active members into stale (dead pid) and detached (live pid)", async () => {
     const h = await createHarness();
-    const sleeper = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
+    const sleeper = spawnChild(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)", "--", "--mode", "rpc", "--name", "fleet:rec-live"],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
     try {
       await h.seedMember("rec-dead", "running");
       await h.seedMember("rec-live", "idle");
@@ -3200,7 +3217,7 @@ describe("RpcMember", () => {
       const mjsPath = path.join(tmpRoot, "split-utf8.mjs");
       await writeFile(
         mjsPath,
-        `
+        `#!/usr/bin/env node
 const first = Buffer.from(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "OK ✓⚙" } }) + "\\n", "utf8");
 const splitAt = first.indexOf(0xe2) + 1;
 process.stdout.write(first.subarray(0, splitAt));
@@ -3213,6 +3230,7 @@ setTimeout(() => {
         "utf8",
       );
       await chmod(mjsPath, 0o755);
+      assert.ok((await readFile(mjsPath, "utf8")).startsWith("#!/usr/bin/env node\n"));
       let piBin = mjsPath;
       if (process.platform === "win32") {
         const cmdPath = path.join(tmpRoot, "split-utf8.cmd");
@@ -3317,6 +3335,500 @@ describe("loadFleetConfig and loadManifest", () => {
       );
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Audit regression tests (F1-F10)", () => {
+  it("F1: clean refuses to delete user-created or modified .pi/fleet/review-context.md without --force", async () => {
+    const h = await createHarness();
+    try {
+      // Case 1: Coder worktree with user-created notes at .pi/fleet/review-context.md
+      const coder = await h.seedMember("coder-notes", "done");
+      const coderNotesFile = path.join(coder.worktree, ".pi", "fleet", "review-context.md");
+      await mkdir(path.dirname(coderNotesFile), { recursive: true });
+      await writeFile(coderNotesFile, "my private scratch notes\n", "utf8");
+
+      const coderClean = await h.runTool({ action: "clean", name: "coder-notes" });
+      assert.equal(coderClean.isError, true);
+      assert.equal(existsSync(coderNotesFile), true);
+      assert.equal(await readFile(coderNotesFile, "utf8"), "my private scratch notes\n");
+
+      // Case 2: Reviewer whose Fleet-generated review-context.md was later modified by the user
+      await h.runTool({
+        action: "spawn",
+        role: "reviewer",
+        transient: false,
+        name: "rev-edited",
+        task: "DONE: review done",
+      });
+      await h.runTool({ action: "wait", name: "rev-edited", timeout: 5 });
+      await h.runTool({ action: "stop", name: "rev-edited" });
+
+      const man = await loadManifest(h.root);
+      const revContext = path.join(man.members["rev-edited"].worktree, ".pi", "fleet", "review-context.md");
+      assert.ok(man.members["rev-edited"].reviewContextSha256, "expected generated SHA-256 recorded");
+      await writeFile(revContext, "# User edited notes\n", "utf8");
+
+      const revClean = await h.runTool({ action: "clean", name: "rev-edited" });
+      assert.equal(revClean.isError, true);
+      assert.equal(existsSync(revContext), true);
+      assert.equal(await readFile(revContext, "utf8"), "# User edited notes\n");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("F2: detached stop/clean refuses to kill unrelated reused PIDs and fails cleanly if a verified process does not exit", async () => {
+    const h = await createHarness();
+    const unrelated = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    const fleetLike = spawnChild(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)", "--", "--mode", "rpc", "--name", "fleet:wrong-start"],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
+    try {
+      // 1. Unrelated process (no fleet CLI identity): stop must NOT kill it; reconcile marks stale.
+      const m1 = await h.seedMember("reused-pid", "running");
+      const man1 = await loadManifest(h.root);
+      man1.members[m1.name].pid = unrelated.pid;
+      await saveManifest(man1);
+
+      await h.reconcileSession();
+      const afterReconcile = await loadManifest(h.root);
+      assert.equal(afterReconcile.members["reused-pid"]?.status, "stale");
+      assert.equal(afterReconcile.members["reused-pid"]?.pid, undefined);
+      assert.equal(isPidAlive(unrelated.pid), true, "unrelated process must stay alive on reconcile");
+
+      // Also test direct stop on detached member pointing to unrelated PID.
+      const m2 = await h.seedMember("reused-det", "detached");
+      const man2 = await loadManifest(h.root);
+      man2.members[m2.name].pid = unrelated.pid;
+      await saveManifest(man2);
+
+      const stopRes = await h.runTool({ action: "stop", name: "reused-det" });
+      assert.equal(stopRes.isError, false);
+      assert.equal(isPidAlive(unrelated.pid), true, "unrelated process must NOT be killed by stop");
+      assert.ok(
+        h.notifications.some((n) => n.level === "warn" && /refusing to terminate/i.test(n.text)),
+        "expected warning when refusing to terminate reused PID",
+      );
+
+      // 2. Matching command line but mismatched pidStartedAt -> must NOT kill.
+      const m3 = await h.seedMember("wrong-start", "detached");
+      const man3 = await loadManifest(h.root);
+      man3.members[m3.name].pid = fleetLike.pid;
+      man3.members[m3.name].pidStartedAt = "1999-01-01T00:00:00.0000000Z";
+      await saveManifest(man3);
+
+      const stopWrongStart = await h.runTool({ action: "stop", name: "wrong-start" });
+      assert.equal(stopWrongStart.isError, false);
+      assert.equal(isPidAlive(fleetLike.pid), true, "process with mismatched start time must NOT be killed");
+
+      // 3. Verified detached process that refuses to exit -> clean must fail and keep worktree + pid.
+      const stubborn = await h.seedMember("stubborn-det", "detached");
+      const man4 = await loadManifest(h.root);
+      man4.members[stubborn.name].pid = 424242;
+      await saveManifest(man4);
+
+      const uiNotes: Array<{ text: string; level?: NotifyLevel }> = [];
+      const stubbornFleet = new Fleet(
+        h.root,
+        {
+          notify: (text, level) => uiNotes.push({ text, level }),
+          setWidget: () => undefined,
+        },
+        {
+          processOps: {
+            isAlive: () => true,
+            inspectProcess: async () => ({
+              status: "ok",
+              info: { commandLine: "pi --mode rpc --name fleet:stubborn-det", startedAt: "2026-01-01T00:00:00Z" },
+            }),
+            terminateProcess: async () => false,
+          },
+        },
+      );
+      await assert.rejects(
+        () => stubbornFleet.execute({ action: "clean", target: { kind: "member", name: "stubborn-det" } }),
+        /still running/i,
+      );
+      assert.equal(existsSync(stubborn.worktree), true, "worktree must remain if detached process is still alive");
+      const afterStubborn = await loadManifest(h.root);
+      assert.equal(afterStubborn.members["stubborn-det"]?.pid, 424242);
+
+      // 4. Uninspectable process -> must fail cleanly without killing or deleting worktree.
+      const uninspectableFleet = new Fleet(
+        h.root,
+        {
+          notify: () => undefined,
+          setWidget: () => undefined,
+        },
+        {
+          processOps: {
+            isAlive: () => true,
+            inspectProcess: async () => ({ status: "unavailable", reason: "EPERM" }),
+            terminateProcess: async () => {
+              throw new Error("terminateProcess must not be called when identity is unavailable");
+            },
+          },
+        },
+      );
+      await assert.rejects(
+        () => uninspectableFleet.execute({ action: "clean", target: { kind: "member", name: "stubborn-det" } }),
+        /cannot verify process identity/i,
+      );
+      assert.equal(existsSync(stubborn.worktree), true);
+
+      // Direct unit check on hasFleetCommandIdentity boundary matching.
+      assert.equal(hasFleetCommandIdentity("pi --mode rpc --name fleet:alpha", "alpha"), true);
+      assert.equal(hasFleetCommandIdentity("pi --mode rpc --name fleet:alpha-2", "alpha"), false);
+      assert.equal(hasFleetCommandIdentity("node -e setInterval", "alpha"), false);
+      const selfInfo = await getProcessInfo(process.pid);
+      assert.equal(selfInfo.status, "ok");
+    } finally {
+      for (const proc of [unrelated, fleetLike]) {
+        try {
+          proc.kill();
+        } catch {
+          // already gone
+        }
+      }
+      await h.cleanup();
+    }
+  });
+
+  it("F3: send does not mark an exited member running and an older failed send cannot overwrite a newer accepted send", async () => {
+    const h = await createHarness();
+    try {
+      const m = await h.seedMember("send-race", "done", { result: "DONE: initial" });
+      const fleet = new Fleet(h.root, {
+        notify: () => undefined,
+        setWidget: () => undefined,
+      });
+
+      // Part A: Client exits while send is between mustClient and status update.
+      let rejectPrompt1!: (e: Error) => void;
+      const fakeClient1: any = {
+        exited: false,
+        busy: false,
+        prompt: () =>
+          new Promise((_res, rej) => {
+            rejectPrompt1 = rej;
+          }),
+        steer: async () => undefined,
+        detach: () => undefined,
+        kill: async () => undefined,
+        abort: async () => undefined,
+      };
+      (fleet as any).clients.set(m.name, fakeClient1);
+
+      // Overlap: send #1 transitions done -> running (gen 1) and hangs on prompt;
+      // send #2 runs while send #1 is in flight (gen 2) and succeeds;
+      // then send #1 rejects -> manifest MUST stay running (NOT rolled back to done).
+      const send1 = fleet.execute({ action: "send", name: m.name, message: "first" });
+      // Wait for send #1 to reach prompt()
+      await new Promise((r) => setTimeout(r, 40));
+
+      let prompt2Called = false;
+      fakeClient1.prompt = async () => {
+        prompt2Called = true;
+        return {};
+      };
+      const send2Res = await fleet.execute({ action: "send", name: m.name, message: "second" });
+      assert.equal(prompt2Called, true);
+      assert.match(send2Res.messages[0]?.text ?? "", /sent to 'send-race'/);
+
+      rejectPrompt1(new Error("first prompt rejected"));
+      await assert.rejects(() => send1, /first prompt rejected/);
+
+      const afterOverlap = await loadManifest(h.root);
+      assert.equal(afterOverlap.members[m.name]?.status, "running");
+      assert.equal(afterOverlap.members[m.name]?.result, undefined);
+
+      // Part B: Member marked done; client exits right as manifest() resolves before status flip.
+      const m2 = await h.seedMember("send-exited", "done", { result: "DONE: done" });
+      const fleet2 = new Fleet(h.root, {
+        notify: () => undefined,
+        setWidget: () => undefined,
+      });
+      const dyingClient: any = {
+        exited: false,
+        busy: false,
+        prompt: async () => undefined,
+        steer: async () => undefined,
+        detach: () => undefined,
+        kill: async () => undefined,
+        abort: async () => undefined,
+      };
+      (fleet2 as any).clients.set(m2.name, dyingClient);
+      const origManifest = (fleet2 as any).manifest.bind(fleet2);
+      (fleet2 as any).manifest = async () => {
+        const res = await origManifest();
+        dyingClient.exited = true;
+        return res;
+      };
+
+      await assert.rejects(
+        () => fleet2.execute({ action: "send", name: m2.name, message: "too late" }),
+        /not attached/i,
+      );
+      const afterExited = await loadManifest(h.root);
+      assert.equal(afterExited.members[m2.name]?.status, "done");
+      assert.equal(afterExited.members[m2.name]?.result, "DONE: done");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("F4: loadManifest propagates non-ENOENT read errors and fails if corrupt-manifest backup fails", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-f4-"));
+    try {
+      const fDir = path.join(tmpRoot, ".pi", "fleet");
+      const manPath = path.join(fDir, "manifest.json");
+
+      // Non-ENOENT read error (manifest.json is a directory -> EISDIR).
+      await mkdir(manPath, { recursive: true });
+      await assert.rejects(() => loadManifest(tmpRoot), (err: any) => err?.code === "EISDIR");
+      await rm(manPath, { recursive: true, force: true });
+
+      // Corrupt manifest whose backup fails must throw and NOT emit a false backup warning.
+      await writeFile(manPath, "{ broken json", "utf8");
+      const warnings: string[] = [];
+      await assert.rejects(
+        () =>
+          loadManifest(tmpRoot, (w) => warnings.push(w), {
+            copyBackup: async () => {
+              throw new Error("ENOSPC: disk full");
+            },
+          }),
+        /backup.*failed.*ENOSPC/i,
+      );
+      assert.deepEqual(warnings, []);
+      assert.equal(await readFile(manPath, "utf8"), "{ broken json");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("F5: aborting wait during initial syncAsks rejects cleanly with 'wait aborted' instead of ReferenceError", async () => {
+    const h = await createHarness();
+    try {
+      const m = await h.seedMember("abort-early", "running");
+      const fleet = new Fleet(h.root, {
+        notify: () => undefined,
+        setWidget: () => undefined,
+      });
+
+      const controller = new AbortController();
+      // Abort while initial readAsk() runs during syncAsks() before poll is initialized.
+      await writeFile(path.join(m.worktree, "FLEET_ASK.md"), "", "utf8");
+      const origReadAsk = (fleet as any).readAsk.bind(fleet);
+      (fleet as any).readAsk = async (name: string) => {
+        controller.abort();
+        return origReadAsk(name);
+      };
+
+      await assert.rejects(
+        () => fleet.execute({ action: "wait", target: { kind: "members", names: ["abort-early"] } }, controller.signal),
+        (err: unknown) => err instanceof Error && err.message === "wait aborted" && !(err instanceof ReferenceError),
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("F6: active wait a b retains transient member a's result even after 64+ other completions", async () => {
+    const h = await createHarness();
+    try {
+      await h.seedMember("member-a", "done", { result: "DONE: result from A" });
+      await h.seedMember("member-b", "running");
+      const fleet = new Fleet(h.root, {
+        notify: () => undefined,
+        setWidget: () => undefined,
+      });
+
+      // Seed member-a as a completed transient snapshot (removed from manifest like transient auto-clean).
+      const man = await loadManifest(h.root);
+      delete man.members["member-a"];
+      await saveManifest(man);
+      (fleet as any).completedTransient.set("member-a", {
+        createdAt: 1,
+        lines: ["member-a [reviewer] status=done branch=fleet/member-a", "  result: DONE: result from A"],
+        reported: false,
+      });
+
+      const waitPromise = fleet.execute({
+        action: "wait",
+        target: { kind: "members", names: ["member-a", "member-b"] },
+        mode: "all",
+        timeout: 5,
+      });
+
+      // Wait a tick so waitForMembers has pinned member-a and member-b.
+      await new Promise((r) => setTimeout(r, 30));
+
+      // Simulate 70 other transient completions and invoke eviction.
+      for (let i = 0; i < 70; i++) {
+        (fleet as any).completedTransient.set(`other-${i}`, {
+          createdAt: 100 + i,
+          lines: [`other-${i} [reviewer] status=done`],
+          reported: false,
+        });
+        (fleet as any).trimCompletedTransient();
+      }
+      assert.equal((fleet as any).completedTransient.has("member-a"), true, "pinned member-a must not be evicted");
+
+      // Now settle member-b.
+      const loaded = await (fleet as any).manifest();
+      loaded.members["member-b"].status = "done";
+      loaded.members["member-b"].result = "DONE: result from B";
+      await (fleet as any).save();
+
+      const res = await waitPromise;
+      const text = res.messages.map((msg) => msg.text).join("\n");
+      assert.match(text, /DONE: result from A/);
+      assert.match(text, /DONE: result from B/);
+      assert.ok((fleet as any).completedTransient.size <= 64, "cache trims back to cap after wait ends");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("F7: RpcMember resolves a valid final RPC response without a trailing newline even when process exits immediately", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-f7-"));
+    try {
+      const mjsPath = path.join(tmpRoot, "no-nl-rpc.mjs");
+      await writeFile(
+        mjsPath,
+        `#!/usr/bin/env node
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  const idx = buf.indexOf("\\n");
+  if (idx < 0) return;
+  const req = JSON.parse(buf.slice(0, idx).replace(/\\r$/, ""));
+  // Write valid JSON response with NO trailing newline and exit immediately.
+  process.stdout.write(JSON.stringify({
+    type: "response",
+    id: req.id,
+    command: req.type,
+    success: true,
+    data: { finalNoNewline: true },
+  }), () => {
+    process.exit(0);
+  });
+});
+`,
+        "utf8",
+      );
+      await chmod(mjsPath, 0o755);
+      let piBin = mjsPath;
+      if (process.platform === "win32") {
+        const cmdPath = path.join(tmpRoot, "no-nl-rpc.cmd");
+        await writeFile(cmdPath, `@node "%~dp0no-nl-rpc.mjs" %*\\r\\n`, "utf8");
+        piBin = cmdPath;
+      }
+
+      const client = await RpcMember.create({
+        piBin,
+        cwd: tmpRoot,
+        args: [],
+        logFile: path.join(tmpRoot, "rpc.jsonl"),
+      });
+      const response = await client.getState();
+      assert.deepEqual(response, { finalNoNewline: true });
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("F8: readLogTailEntries scans sparse logs backward in bounded chunks across multi-byte UTF-8 boundaries", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-f8-"));
+    try {
+      const logFile = path.join(tmpRoot, "sparse.jsonl");
+      const filler = JSON.stringify({ type: "agent_heartbeat", pad: "x".repeat(400) }) + "\n";
+      const lines: string[] = [
+        JSON.stringify({ type: "message_end", message: { role: "assistant", content: "EARLY_1 ✓⚙🌱" } }) + "\n",
+        JSON.stringify({ type: "tool_execution_start", toolName: "read" }) + "\n",
+        filler.repeat(40),
+        JSON.stringify({ type: "message_end", message: { role: "assistant", content: "MID_2 ✓⚙🌱" } }) + "\n",
+        filler.repeat(40),
+        JSON.stringify({ type: "message_end", message: { role: "assistant", content: "DONE: FINAL_3 ✓⚙🌱" } }),
+      ];
+      await writeFile(logFile, lines.join(""), "utf8");
+
+      // Use a tiny chunk size (137 bytes — prime, guaranteed to split mid-line and mid-UTF-8!)
+      const res = await readLogTailEntries(logFile, 4, 137);
+      assert.deepEqual(res.items, [
+        { kind: "assistant", text: "EARLY_1 ✓⚙🌱" },
+        { kind: "tool", toolName: "read" },
+        { kind: "assistant", text: "MID_2 ✓⚙🌱" },
+        { kind: "assistant", text: "DONE: FINAL_3 ✓⚙🌱" },
+      ]);
+      assert.equal(res.lastResultIdx, 3);
+
+      // Requesting only last 2 entries stops early without needing earlier entries.
+      const res2 = await readLogTailEntries(logFile, 2, 137);
+      assert.deepEqual(res2.items, [
+        { kind: "assistant", text: "MID_2 ✓⚙🌱" },
+        { kind: "assistant", text: "DONE: FINAL_3 ✓⚙🌱" },
+      ]);
+      assert.equal(res2.lastResultIdx, 1);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("F9: validates nested manifest members and config role fields without truthy coercion on autoClean='false'", async () => {
+    const h = await createHarness();
+    try {
+      // 1. Null member in manifest.json -> backed up, warned, and /fleet status does not crash.
+      const manPath = path.join(h.root, ".pi", "fleet", "manifest.json");
+      await mkdir(path.dirname(manPath), { recursive: true });
+      await writeFile(
+        manPath,
+        JSON.stringify({ version: 1, repoRoot: h.root, members: { broken: null } }),
+        "utf8",
+      );
+      const statusRes = await h.runTool({ action: "status" });
+      assert.equal(statusRes.isError, false);
+      assert.match(statusRes.text, /no members/i);
+      const fleetFiles = await readdir(path.join(h.root, ".pi", "fleet"));
+      assert.ok(fleetFiles.some((f) => f.startsWith("manifest.json.corrupt.")));
+
+      // 2. Role configured with autoClean: "false" (truthy string) must NOT enable autoClean.
+      const cfgPath = path.join(h.root, ".pi", "fleet", "config.json");
+      const existingCfg = JSON.parse(await readFile(cfgPath, "utf8"));
+      await writeFile(
+        cfgPath,
+        JSON.stringify({
+          ...existingCfg,
+          roles: {
+            coder: { autoClean: "false", thinking: "bogus", model: 123 },
+            reviewer: { autoClean: "false" },
+            unknownRole: { autoClean: true },
+          },
+        }),
+        "utf8",
+      );
+      const cfgWarnings: string[] = [];
+      const cfg = await loadFleetConfig(h.root, (w) => cfgWarnings.push(w));
+      assert.equal(resolveRoleSpec(cfg, "coder").autoClean, undefined);
+      assert.equal(resolveRoleSpec(cfg, "coder").thinking, undefined);
+      assert.equal(resolveRoleSpec(cfg, "coder").model, undefined);
+      assert.equal(resolveRoleSpec(cfg, "reviewer").autoClean, true); // built-in default preserved when override invalid
+      assert.ok(cfgWarnings.some((w) => /roles\.coder\.autoClean must be a boolean/i.test(w)));
+      assert.ok(cfgWarnings.some((w) => /roles\.unknownRole is not a known role/i.test(w)));
+    } finally {
+      await h.cleanup();
     }
   });
 });
