@@ -7,7 +7,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import { mkdir, open as openFile, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open as openFile, readFile, rm, stat, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { loadFleetConfig, piBinary, resolveRoleSpec } from "./config.ts";
 import {
@@ -696,6 +696,12 @@ export class Fleet {
   private async removeGeneratedReviewContext(member: Member): Promise<void> {
     if (!member.reviewContextSha256) return;
     const file = reviewContextPath(member.worktree);
+    try {
+      const st = await lstat(file);
+      if (!st.isFile()) return;
+    } catch {
+      return;
+    }
     let currentBytes: Buffer;
     try {
       currentBytes = await readFile(file);

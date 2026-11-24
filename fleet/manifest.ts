@@ -29,7 +29,11 @@ function isOptString(value: unknown): boolean {
   return value === undefined || typeof value === "string";
 }
 
+const FORBIDDEN_MEMBER_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const MEMBER_NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
+
 function isValidMember(key: string, value: unknown): value is Member {
+  if (FORBIDDEN_MEMBER_KEYS.has(key) || !MEMBER_NAME_RE.test(key)) return false;
   if (!isPlainObject(value)) return false;
   if (typeof value.name !== "string" || !value.name || value.name !== key) return false;
   if (typeof value.role !== "string" || !ROLE_NAMES.includes(value.role as RoleName)) return false;
@@ -63,7 +67,12 @@ function validateMembers(rawMembers: Record<string, unknown>): Record<string, Me
   const members: Record<string, Member> = {};
   for (const [key, value] of Object.entries(rawMembers)) {
     if (!isValidMember(key, value)) return undefined;
-    members[key] = value;
+    Object.defineProperty(members, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   return members;
 }

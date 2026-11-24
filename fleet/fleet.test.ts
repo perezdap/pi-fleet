@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn as spawnChild } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
@@ -3374,6 +3374,28 @@ describe("Audit regression tests (F1-F10)", () => {
       assert.equal(revClean.isError, true);
       assert.equal(existsSync(revContext), true);
       assert.equal(await readFile(revContext, "utf8"), "# User edited notes\n");
+
+      // Case 3: Symlink (or non-regular file/directory) at review-context.md must not be followed or deleted.
+      const realTarget = path.join(man.members["rev-edited"].worktree, "outside-target.txt");
+      const generatedContent = "# Target content\n";
+      await writeFile(realTarget, generatedContent, "utf8");
+      await rm(revContext, { force: true });
+      let testedSymlink = false;
+      try {
+        await symlink(realTarget, revContext);
+        testedSymlink = true;
+      } catch (err: any) {
+        if (err?.code !== "EPERM" && err?.code !== "EACCES") throw err;
+      }
+      if (!testedSymlink) {
+        // Unprivileged Windows fallback: place a directory at review-context.md.
+        await mkdir(revContext, { recursive: true });
+        await writeFile(path.join(revContext, "note.txt"), "keep\n", "utf8");
+      }
+      const nonFileClean = await h.runTool({ action: "clean", name: "rev-edited" });
+      assert.equal(nonFileClean.isError, true);
+      assert.equal(existsSync(revContext), true);
+      assert.equal(existsSync(realTarget), true);
     } finally {
       await h.cleanup();
     }
@@ -3733,7 +3755,7 @@ process.stdin.on("data", (chunk) => {
       let piBin = mjsPath;
       if (process.platform === "win32") {
         const cmdPath = path.join(tmpRoot, "no-nl-rpc.cmd");
-        await writeFile(cmdPath, `@node "%~dp0no-nl-rpc.mjs" %*\\r\\n`, "utf8");
+        await writeFile(cmdPath, `@node "%~dp0no-nl-rpc.mjs" %*\r\n`, "utf8");
         piBin = cmdPath;
       }
 
@@ -3745,8 +3767,62 @@ process.stdin.on("data", (chunk) => {
       });
       const response = await client.getState();
       assert.deepEqual(response, { finalNoNewline: true });
+
+      // Grandchild inheriting stdout after member exits must still reject pending RPC promptly.
+      const childMjs = path.join(tmpRoot, "grandchild-stdout.mjs");
+      const grandchildPidFile = path.join(tmpRoot, "grandchild.pid");
+      await writeFile(
+        childMjs,
+        `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+process.stdin.once("data", () => {
+  const gc = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
+    cwd: tmpdir(),
+    stdio: ["ignore", "inherit", "ignore"],
+    detached: true,
+    windowsHide: true,
+  });
+  writeFileSync(${JSON.stringify(grandchildPidFile)}, String(gc.pid), "utf8");
+  gc.unref();
+  process.exit(0);
+});
+`,
+        "utf8",
+      );
+      await chmod(childMjs, 0o755);
+      let gcBin = childMjs;
+      if (process.platform === "win32") {
+        const cmdPath = path.join(tmpRoot, "grandchild-stdout.cmd");
+        await writeFile(cmdPath, `@node "%~dp0grandchild-stdout.mjs" %*\r\n`, "utf8");
+        gcBin = cmdPath;
+      }
+      const gcClient = await RpcMember.create({
+        piBin: gcBin,
+        cwd: tmpRoot,
+        args: [],
+        logFile: path.join(tmpRoot, "gc-rpc.jsonl"),
+      });
+      try {
+        const started = Date.now();
+        await assert.rejects(() => gcClient.getState(), /member process exited/i);
+        assert.ok(Date.now() - started < 3_000, "pending RPC must reject promptly via drain timer");
+      } finally {
+        gcClient.detach();
+        if (existsSync(grandchildPidFile)) {
+          const gcPid = Number((await readFile(grandchildPidFile, "utf8")).trim());
+          if (gcPid > 0) {
+            try {
+              process.kill(gcPid);
+            } catch {
+              // already exited
+            }
+          }
+        }
+      }
     } finally {
-      await rm(tmpRoot, { recursive: true, force: true });
+      await rm(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   });
 
@@ -3803,6 +3879,29 @@ process.stdin.on("data", (chunk) => {
       assert.match(statusRes.text, /no members/i);
       const fleetFiles = await readdir(path.join(h.root, ".pi", "fleet"));
       assert.ok(fleetFiles.some((f) => f.startsWith("manifest.json.corrupt.")));
+
+      // 1b. Prototype-polluting "__proto__" key with otherwise valid member shape must be rejected as corrupt.
+      const protoMember = {
+        name: "__proto__",
+        role: "coder",
+        task: "pollute",
+        branch: "fleet/proto",
+        worktree: h.root,
+        baseRef: "HEAD",
+        status: "done",
+        createdAt: 1,
+        updatedAt: 1,
+      };
+      await writeFile(
+        manPath,
+        `{"version":1,"repoRoot":${JSON.stringify(h.root)},"members":{"__proto__":${JSON.stringify(protoMember)}}}`,
+        "utf8",
+      );
+      const protoWarnings: string[] = [];
+      const recovered = await loadManifest(h.root, (w) => protoWarnings.push(w));
+      assert.deepEqual(recovered.members, {});
+      assert.equal(Object.getPrototypeOf(recovered.members), Object.prototype);
+      assert.equal(protoWarnings.length, 1);
 
       // 2. Role configured with autoClean: "false" (truthy string) must NOT enable autoClean.
       const cfgPath = path.join(h.root, ".pi", "fleet", "config.json");

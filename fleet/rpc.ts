@@ -121,25 +121,30 @@ export async function getProcessInfo(pid: number): Promise<ProcessInfoResult> {
 
   // macOS and other POSIX platforms
   return new Promise<ProcessInfoResult>((resolve) => {
-    execFile("ps", ["-o", "lstart=", "-p", String(pid)], { timeout: 5_000 }, (startErr, startOut) => {
-      if (startErr) {
-        resolve(isPidAlive(pid) ? { status: "unavailable", reason: startErr.message } : { status: "not_found" });
-        return;
-      }
-      const startedAt = startOut.trim() || undefined;
-      execFile("ps", ["-o", "args=", "-p", String(pid)], { timeout: 5_000 }, (argsErr, argsOut) => {
-        if (argsErr) {
-          resolve(isPidAlive(pid) ? { status: "unavailable", reason: argsErr.message } : { status: "not_found" });
+    execFile(
+      "ps",
+      ["-o", "lstart=", "-p", String(pid)],
+      { timeout: 5_000, env: { ...process.env, LC_ALL: "C" } },
+      (startErr, startOut) => {
+        if (startErr) {
+          resolve(isPidAlive(pid) ? { status: "unavailable", reason: startErr.message } : { status: "not_found" });
           return;
         }
-        const commandLine = argsOut.trim();
-        if (!commandLine) {
-          resolve({ status: "not_found" });
-          return;
-        }
-        resolve({ status: "ok", info: { commandLine, startedAt } });
-      });
-    });
+        const startedAt = startOut.trim() || undefined;
+        execFile("ps", ["-ww", "-o", "args=", "-p", String(pid)], { timeout: 5_000 }, (argsErr, argsOut) => {
+          if (argsErr) {
+            resolve(isPidAlive(pid) ? { status: "unavailable", reason: argsErr.message } : { status: "not_found" });
+            return;
+          }
+          const commandLine = argsOut.trim();
+          if (!commandLine) {
+            resolve({ status: "not_found" });
+            return;
+          }
+          resolve({ status: "ok", info: { commandLine, startedAt } });
+        });
+      },
+    );
   });
 }
 
@@ -233,6 +238,7 @@ export class RpcMember {
   private spawnError?: Error;
   private exitNotified = false;
   private stdoutFlushed = false;
+  private exitDrainTimer?: NodeJS.Timeout;
 
   private constructor(opts: RpcSpawnOptions) {
     const isWin = process.platform === "win32";
@@ -271,6 +277,7 @@ export class RpcMember {
     this.proc.stdout?.on("end", () => this.onStdoutEnd());
     this.proc.stderr?.on("data", (c: Buffer) => this.writeLog(c));
     this.proc.on("error", (err) => {
+      this.clearExitDrainTimer();
       this.spawnError = err;
       this.exited = true;
       this.writeLog(`[fleet] spawn error: ${err.message}\n`);
@@ -285,9 +292,18 @@ export class RpcMember {
       // response (especially without a trailing newline) that arrives before 'end'/'close'.
       if (this.stdoutFlushed) {
         this.failPending(new Error("member process exited"));
+      } else if (this.pending.size > 0 && !this.exitDrainTimer) {
+        // Bound the wait if an inherited grandchild keeps stdout open after exit.
+        this.exitDrainTimer = setTimeout(() => {
+          this.exitDrainTimer = undefined;
+          this.onStdoutEnd();
+          this.failPending(new Error("member process exited"));
+        }, 250);
+        this.exitDrainTimer.unref();
       }
     });
     this.proc.on("close", (code) => {
+      this.clearExitDrainTimer();
       this.exited = true;
       if (this.exitCode === null) this.exitCode = code;
       this.onStdoutEnd();
@@ -348,7 +364,15 @@ export class RpcMember {
     if (start > 0) this.buffer = this.buffer.slice(start);
   }
 
+  private clearExitDrainTimer(): void {
+    if (this.exitDrainTimer) {
+      clearTimeout(this.exitDrainTimer);
+      this.exitDrainTimer = undefined;
+    }
+  }
+
   private onStdoutEnd(): void {
+    this.clearExitDrainTimer();
     if (this.stdoutFlushed) return;
     this.stdoutFlushed = true;
     this.buffer += this.decoder.end();
@@ -465,6 +489,7 @@ export class RpcMember {
 
   /** Stop receiving events and close the log (does not kill the process). */
   detach(): void {
+    this.clearExitDrainTimer();
     this.handlers.clear();
     this.exitHandlers.clear();
     this.closeLog();
