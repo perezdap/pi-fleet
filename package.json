@@ -9,7 +9,7 @@
   "scripts": {
     "test": "node --test"
   },
-  "description": "Run a fleet of pi coding agents in isolated git worktrees, orchestrated from one supervisor session. No dependencies beyond pi itself.",
+  "description": "Run a fleet of pi coding agents in isolated git worktrees, managed from one supervisor session. No dependencies beyond pi itself.",
   "keywords": [
     "pi",
     "pi-extension",

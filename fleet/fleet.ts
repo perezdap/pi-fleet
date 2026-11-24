@@ -1654,6 +1654,7 @@ export function toolParamsToCommand(params: {
   mode?: WaitMode;
   timeout?: number;
 }): FleetCommand {
+  const trimString = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
   switch (params.action) {
     case "status":
       return { action: "status" };
@@ -1685,9 +1686,9 @@ export function toolParamsToCommand(params: {
       };
     }
     case "resume": {
-      const name = typeof params.name === "string" ? params.name.trim() : "";
+      const name = trimString(params.name);
       if (!name) throw new Error("resume requires name");
-      const extra = typeof params.message === "string" ? params.message.trim() : "";
+      const extra = trimString(params.message);
       return {
         action: "resume",
         name,
@@ -1695,8 +1696,8 @@ export function toolParamsToCommand(params: {
       };
     }
     case "send": {
-      const name = typeof params.name === "string" ? params.name.trim() : "";
-      const message = typeof params.message === "string" ? params.message.trim() : "";
+      const name = trimString(params.name);
+      const message = trimString(params.message);
       if (!name || !message) throw new Error("send requires name and message");
       return { action: "send", name, message };
     }
@@ -1705,10 +1706,19 @@ export function toolParamsToCommand(params: {
       if (params.mode !== undefined && params.mode !== "all" && params.mode !== "any") {
         throw new Error(WAIT_USAGE);
       }
+      if (params.name !== undefined && typeof params.name !== "string") {
+        throw new Error(WAIT_USAGE);
+      }
+      if (
+        params.names !== undefined &&
+        (!Array.isArray(params.names) || params.names.some((n) => typeof n !== "string"))
+      ) {
+        throw new Error(WAIT_USAGE);
+      }
       const targetTokens = [
         ...(params.name ? params.name.trim().split(/\s+/) : []),
-        ...(Array.isArray(params.names) ? params.names.map(String) : []),
-      ].filter((t) => t.trim().length > 0);
+        ...(params.names ? params.names.map((n) => n.trim()) : []),
+      ].filter((t) => t.length > 0);
       if ((params.name !== undefined || params.names !== undefined) && targetTokens.length === 0) {
         throw new Error(WAIT_USAGE);
       }
@@ -1720,22 +1730,22 @@ export function toolParamsToCommand(params: {
       };
     }
     case "log": {
-      const name = typeof params.name === "string" ? params.name.trim() : "";
+      const name = trimString(params.name);
       if (!name) throw new Error("log requires name");
       return { action: "log", name, n: parseLogCount(params.n) };
     }
     case "merge": {
-      const name = typeof params.name === "string" ? params.name.trim() : "";
+      const name = trimString(params.name);
       if (!name) throw new Error("merge requires name (or '--done')");
       return { action: "merge", target: parseMergeTarget(name) };
     }
     case "stop": {
-      const name = typeof params.name === "string" ? params.name.trim() : "";
+      const name = trimString(params.name);
       if (!name) throw new Error("stop requires name (or '--all')");
       return { action: "stop", target: parseStopTarget(name) };
     }
     case "clean": {
-      const name = typeof params.name === "string" ? params.name.trim() : "";
+      const name = trimString(params.name);
       if (!name) throw new Error("clean requires name (or '--done' / '--all')");
       return {
         action: "clean",

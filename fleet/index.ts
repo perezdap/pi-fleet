@@ -1,6 +1,6 @@
 /** pi-fleet extension entry.
  *
- * Orchestrates a fleet of pi coding agents in isolated git worktrees from a
+ * Manages a fleet of pi coding agents in isolated git worktrees from a
  * single supervisor session. Zero runtime dependencies: only pi's extension API,
  * pi's own CLI in RPC mode, git, and Node built-ins.
  */

@@ -44,11 +44,8 @@ async function tryGit(
   cwd: string,
   ...args: string[]
 ): Promise<{ ok: boolean; out: string }> {
-  try {
-    return { ok: true, out: await git(cwd, ...args) };
-  } catch (err: any) {
-    return { ok: false, out: extractGitError(err) };
-  }
+  const res = await tryGitRaw(cwd, ...args);
+  return res.ok ? { ok: true, out: res.out.trim() } : res;
 }
 
 async function tryGitRaw(

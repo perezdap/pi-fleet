@@ -504,6 +504,9 @@ describe("toolParamsToCommand", () => {
     const usageRe = /usage: \/fleet wait \[name\|--all\] \[--any\] \[--timeout <sec>\]/;
     assert.throws(() => toolParamsToCommand({ action: "wait", names: [] }), usageRe);
     assert.throws(() => toolParamsToCommand({ action: "wait", name: "   " }), usageRe);
+    assert.throws(() => toolParamsToCommand({ action: "wait", name: 42 as unknown as string }), usageRe);
+    assert.throws(() => toolParamsToCommand({ action: "wait", names: ["api", 42 as unknown as string] }), usageRe);
+    assert.throws(() => toolParamsToCommand({ action: "wait", names: "api" as unknown as string[] }), usageRe);
     assert.deepEqual(
       {
         allOmitted: toolParamsToCommand({ action: "wait" }),
