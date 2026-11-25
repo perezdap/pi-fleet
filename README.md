@@ -1,6 +1,6 @@
 # pi-fleet
 
-Run a **fleet of pi coding agents in isolated git worktrees**, orchestrated from
+Run a **fleet of pi coding agents in isolated git worktrees**, managed from
 one supervisor session. No dependencies beyond pi itself: this extension only
 uses pi's extension API, pi's own CLI in RPC mode (`pi --mode rpc`), git, and
 Node built-ins.
@@ -29,10 +29,10 @@ fleet: 3 members (2 active)
 | Command | Description |
 |---|---|
 | `/fleet status` | Show all members (also shown as a status widget) |
-| `/fleet spawn [--role r] [--model m] [--over ref] [--transient\|--no-transient] <name> <task…>` | Start a member |
-| `/fleet resume <name> [extra…]` | Continue a stale/stopped member on its existing worktree |
+| `/fleet spawn [--role r] [--model m] [--over ref\|a..b] [--transient\|--no-transient] <name> <task…>` | Start a member |
+| `/fleet resume <name> [extra…]` | Continue a stale/stopped/failed/done member on its existing worktree |
 | `/fleet send <name> <message…>` | Steer a busy member, or prompt an idle one |
-| `/fleet wait [name\|--all] [--any] [--timeout <sec>]` | Wait for member(s) to settle or raise a question |
+| `/fleet wait [name…\|--all] [--any] [--timeout <sec>]` | Wait for member(s) to settle or raise a question |
 | `/fleet log <name> [n]` | Tail the member's recorded activity |
 | `/fleet merge <name\|--done>` | Merge a member branch into HEAD (aborts + reports on conflict) |
 | `/fleet stop <name\|--all>` | Abort + kill member process(es) |
@@ -59,7 +59,7 @@ Typical flow:
 1. Spawn one `coder` per task → they work in parallel, commit to their branches.
 2. `/fleet merge --done` (supervisor merges sequentially, surfaces conflicts).
 3. Spawn a `tester` on the integrated state to validate.
-4. Spawn a `reviewer` with `--over <branch>`: its worktree starts from the
+4. Spawn a `reviewer` with `--over <branch>` (or commit range `<base..head>` / `<base...head>`): its worktree starts from the
    branch under review, and the diff is dropped into
    `.pi/fleet/review-context.md` for it. Read-only is *enforced* via the tool
    allowlist, not just instructions.
@@ -126,7 +126,7 @@ and run `tsc -p tsconfig.local.json --noEmit`.
 ```
 fleet/
 ├── index.ts    # extension entry: /fleet command + fleet tool + lifecycle
-├── fleet.ts    # Fleet controller: spawn/send/merge/stop/clean/reconcile
+├── fleet.ts    # Fleet manager: spawn/send/merge/stop/clean/reconcile
 ├── rpc.ts      # JSONL client for pi --mode rpc members
 ├── gitw.ts     # git worktree/merge helpers
 ├── manifest.ts # manifest persistence + pid checks

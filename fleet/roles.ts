@@ -11,7 +11,7 @@ export interface ContractInput {
 }
 
 /** Injected into every member via --append-system-prompt. */
-export function fleetContract(input: ContractInput): string {
+function fleetContract(input: ContractInput): string {
   return `# Fleet contract
 
 You are "${input.name}", a ${input.role} member of a pi fleet working on the repository at ${input.repoRoot}.

@@ -4,12 +4,28 @@ export type RoleName = "coder" | "tester" | "reviewer" | "integrator";
 
 export const ROLE_NAMES: RoleName[] = ["coder", "tester", "reviewer", "integrator"];
 
+export const MEMBER_NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
+
+export const RESERVED_MEMBER_NAMES = new Set(["__proto__", "constructor", "prototype"]);
+
+export function isValidMemberName(name: string): boolean {
+  return MEMBER_NAME_RE.test(name) && !RESERVED_MEMBER_NAMES.has(name);
+}
+
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 /** Role specification. All fields optional; merged over built-in defaults. */
 export interface RoleSpec {
   /** Model pattern passed to the member's `pi --model`, e.g. "anthropic/claude-opus-4-5:high". */
   model?: string;
   /** Thinking level when no model-embedded ":level" is used. */
-  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  thinking?: ThinkingLevel;
   /** Comma-separated tool allowlist, e.g. "read,grep,find,ls" for read-only reviewers. */
   tools?: string;
   /** Extra role-specific instructions appended to the fleet contract. */
@@ -48,6 +64,18 @@ export type MemberStatus =
   | "stale"
   | "merged";
 
+export const MEMBER_STATUSES: MemberStatus[] = [
+  "starting",
+  "running",
+  "idle",
+  "done",
+  "failed",
+  "stopped",
+  "detached",
+  "stale",
+  "merged",
+];
+
 export interface Member {
   name: string;
   role: RoleName;
@@ -61,6 +89,10 @@ export interface Member {
   over?: string;
   model?: string;
   pid?: number;
+  /** OS process start-time token captured at spawn to detect PID reuse. */
+  pidStartedAt?: string;
+  /** SHA-256 hex digest of Fleet-generated .pi/fleet/review-context.md. */
+  reviewContextSha256?: string;
   sessionFile?: string;
   status: MemberStatus;
   /** First line of FLEET_ASK.md if the member raised a question. */

@@ -1,12 +1,13 @@
-/** Fleet controller: spawn, steer, watch, merge, and clean member agents.
+/** Fleet manager: spawn, steer, watch, merge, and clean member agents.
  *
  * Members are headless `pi --mode rpc` processes, one per git worktree.
  * The manifest (.pi/fleet/manifest.json) is the disk-truth registry.
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open as openFile, readFile, rm, stat, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { loadFleetConfig, piBinary, resolveRoleSpec } from "./config.ts";
 import {
@@ -25,11 +26,20 @@ import {
   type CommitRange,
   type MergeResult,
 } from "./gitw.ts";
-import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
+import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest, setOwnMember } from "./manifest.ts";
 import { buildSystemAppend, resumePreamble } from "./roles.ts";
-import { killProcessTree, RpcMember } from "./rpc.ts";
 import {
+  getProcessInfo,
+  hasFleetCommandIdentity,
+  RpcMember,
+  terminateProcessTreeVerified,
+  winQuote,
+  type ProcessInfoResult,
+} from "./rpc.ts";
+import {
+  isValidMemberName,
   ROLE_NAMES,
+  THINKING_LEVELS,
   type CleanTarget,
   type FleetCommand,
   type FleetConfig,
@@ -47,12 +57,20 @@ import {
   type WaitTarget,
 } from "./types.ts";
 
-export type { NotifyLevel } from "./types.ts";
-
 export interface FleetUi {
   notify(text: string, level?: NotifyLevel): void;
   /** Pass an empty array to clear the widget. */
   setWidget(lines: string[]): void;
+}
+
+export interface FleetProcessOps {
+  inspectProcess: (pid: number) => Promise<ProcessInfoResult>;
+  terminateProcess: (pid: number) => Promise<boolean>;
+  isAlive: (pid: number | undefined) => boolean;
+}
+
+export interface FleetOptions {
+  processOps?: Partial<FleetProcessOps>;
 }
 
 interface SpawnOptions extends SpawnMemberInput {
@@ -82,10 +100,10 @@ interface StatusRow {
 const USAGE = [
   "/fleet — run parallel pi agents in isolated git worktrees",
   "  status                          Show all members",
-  "  spawn [--role r] [--model m] [--over ref] [--transient|--no-transient] <name> <task…>",
-  "  resume <name> [extra…]          Continue a stale/stopped member",
+  "  spawn [--role r] [--model m] [--over ref|a..b] [--transient|--no-transient] <name> <task…>",
+  "  resume <name> [extra…]          Continue a stale/stopped/failed/done member",
   "  send <name> <message…>          Steer or prompt a member",
-  "  wait [name|--all] [--any] [--timeout <sec>]  Wait for member(s) to settle",
+  "  wait [name…|--all] [--any] [--timeout <sec>]  Wait for member(s) to settle",
   "  log <name> [n]                  Tail a member's activity log",
   "  merge <name|--done>             Merge a member branch into HEAD",
   "  stop <name|--all>               Abort + kill member process(es)",
@@ -94,10 +112,17 @@ const USAGE = [
   "Roles: coder, tester, reviewer (read-only), integrator — see README.",
 ].join("\n");
 
-const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
+const THINKING_SUFFIX_RE = new RegExp(`:(${THINKING_LEVELS.join("|")})$`);
 const RESUMABLE = new Set<MemberStatus>(["stale", "stopped", "failed", "done"]);
 const CLEANABLE_DONE = new Set<MemberStatus>(["done", "merged", "failed", "stopped", "stale", "detached"]);
-const SETTLED_STATUSES = new Set<MemberStatus>(["done", "failed", "stopped", "stale", "merged"]);
+const SETTLED_STATUSES = new Set<MemberStatus>(["done", "failed", "stopped", "stale", "merged", "detached"]);
+const MAX_COMPLETED_TRANSIENT = 64;
+const LOG_TAIL_CHUNK_BYTES = 2 * 1024 * 1024;
+export const MAX_LOG_LINE_BYTES = 256 * 1024;
+
+function getMember(man: Manifest, name: string): Member | undefined {
+  return Object.hasOwn(man.members, name) ? man.members[name] : undefined;
+}
 
 function isMemberSettled(member: Member): boolean {
   return SETTLED_STATUSES.has(member.status) || Boolean(member.needsAttention);
@@ -125,31 +150,66 @@ export class Fleet {
 
   private clients = new Map<string, RpcMember>();
   private askWatchers = new Map<string, FSWatcher>();
+  private askTimers = new Map<string, NodeJS.Timeout>();
   private stateListeners = new Set<() => void>();
   private spawning = new Map<string, Promise<void>>();
   private cleaningTransient = new Set<string>();
-  private completedTransient = new Map<string, { createdAt: number; lines: string[] }>();
+  private completedTransient = new Map<string, { createdAt: number; lines: string[]; reported: boolean }>();
+  private activeWaitTargets = new Map<string, number>();
+  private stateGeneration = new Map<string, number>();
+  private procOps: FleetProcessOps;
   private saveChain: Promise<void> = Promise.resolve();
   private prepareChain: Promise<void> = Promise.resolve();
-  private cfg?: FleetConfig;
   private cfgPromise?: Promise<FleetConfig>;
   private man?: Manifest;
   private manPromise?: Promise<Manifest>;
 
-  constructor(root: string, ui: FleetUi) {
+  constructor(root: string, ui: FleetUi, opts?: FleetOptions) {
     this.root = root;
     this.ui = ui;
+    this.procOps = {
+      inspectProcess: opts?.processOps?.inspectProcess ?? getProcessInfo,
+      terminateProcess: opts?.processOps?.terminateProcess ?? terminateProcessTreeVerified,
+      isAlive: opts?.processOps?.isAlive ?? isPidAlive,
+    };
+  }
+
+  private bumpStateGeneration(name: string): number {
+    const next = (this.stateGeneration.get(name) ?? 0) + 1;
+    this.stateGeneration.set(name, next);
+    return next;
+  }
+
+  private trimCompletedTransient(): void {
+    if (this.completedTransient.size <= MAX_COMPLETED_TRANSIENT) return;
+    for (const key of this.completedTransient.keys()) {
+      if (this.completedTransient.size <= MAX_COMPLETED_TRANSIENT) break;
+      if ((this.activeWaitTargets.get(key) ?? 0) > 0) continue;
+      this.completedTransient.delete(key);
+    }
   }
 
   // ── state ────────────────────────────────────────────────────────────────
 
   private async config(): Promise<FleetConfig> {
-    this.cfgPromise ??= loadFleetConfig(this.root).then((cfg) => (this.cfg = cfg));
+    if (!this.cfgPromise) {
+      this.cfgPromise = loadFleetConfig(this.root, (msg) => this.ui.notify(msg, "warn")).catch((err) => {
+        this.cfgPromise = undefined;
+        throw err;
+      });
+    }
     return this.cfgPromise;
   }
 
   private async manifest(): Promise<Manifest> {
-    this.manPromise ??= loadManifest(this.root).then((man) => (this.man = man));
+    if (!this.manPromise) {
+      this.manPromise = loadManifest(this.root, (msg) => this.ui.notify(msg, "warn"))
+        .then((man) => (this.man = man))
+        .catch((err) => {
+          this.manPromise = undefined;
+          throw err;
+        });
+    }
     return this.manPromise;
   }
 
@@ -182,18 +242,18 @@ export class Fleet {
 
   // ── command dispatch ─────────────────────────────────────────────────────
 
-  async execute(cmd: FleetCommand): Promise<FleetResult> {
+  async execute(cmd: FleetCommand, signal?: AbortSignal): Promise<FleetResult> {
     switch (cmd.action) {
       case "help":
         return info([USAGE]);
 
       case "status": {
         const rows = await this.statusRows();
-        await this.refreshWidget();
+        await this.refreshWidget(rows);
         if (rows.length === 0) {
           return info(["fleet: no members; try /fleet spawn <name> <task>"]);
         }
-        return info(this.statusLines(rows));
+        return info([this.statusLines(rows).join("\n")]);
       }
 
       case "spawn": {
@@ -214,8 +274,8 @@ export class Fleet {
       }
 
       case "resume": {
-        const resumed = await this.resume(cmd.name, cmd.extra);
-        return info([`fleet: resumed '${resumed.name}'`]);
+        await this.resume(cmd.name, cmd.extra);
+        return info([`fleet: resumed '${cmd.name}'`]);
       }
 
       case "send": {
@@ -224,12 +284,12 @@ export class Fleet {
       }
 
       case "wait": {
-        return this.waitForMembers(cmd.target, cmd.mode ?? "all", cmd.timeout);
+        return this.waitForMembers(cmd.target, cmd.mode ?? "all", cmd.timeout, signal);
       }
 
       case "log": {
         const text = await this.logTail(cmd.name, cmd.n ?? 20);
-        return info(text.split("\n"));
+        return info([text]);
       }
 
       case "merge": {
@@ -243,36 +303,56 @@ export class Fleet {
         if (cmd.target.kind === "done" && names.length === 0) {
           return info(["fleet: no matching members to merge"]);
         }
+        const batchSave = names.length > 1;
+        let mergedAny = false;
         const messages: FleetMessage[] = [];
-        for (const name of names) {
-          const result = await this.merge(name);
-          if (result.ok) {
-            messages.push({ text: `fleet: merged ${name}`, level: "info" });
-          } else {
-            messages.push({
-              text: `fleet: merge ${name} CONFLICTS in: ${result.conflicts.join(", ") || "(unknown)"}`,
-              level: "error",
-            });
+        try {
+          for (const name of names) {
+            const result = await this.merge(name, !batchSave);
+            if (result.ok) {
+              mergedAny = true;
+              messages.push({ text: `fleet: merged ${name}`, level: "info" });
+            } else {
+              const detail =
+                result.conflicts.length > 0
+                  ? `CONFLICTS in: ${result.conflicts.join(", ")}`
+                  : `failed: ${result.output || "(unknown error)"}`;
+              messages.push({
+                text: `fleet: merge ${name} ${detail}`,
+                level: "error",
+              });
+            }
           }
+        } finally {
+          if (batchSave && mergedAny) await this.save();
         }
         return { messages };
       }
 
       case "stop": {
         const man = await this.manifest();
+        if (cmd.target.kind === "member" && !getMember(man, cmd.target.name)) {
+          throw new Error(`no such member '${cmd.target.name}'`);
+        }
         const names =
           cmd.target.kind === "all"
             ? Object.values(man.members)
-                .filter((m) => isActiveStatus(m.status) || this.clients.has(m.name))
+                .filter((m) => isActiveStatus(m.status) || m.status === "detached" || this.clients.has(m.name))
                 .map((m) => m.name)
             : [cmd.target.name];
         if (cmd.target.kind === "all" && names.length === 0) {
           return info(["fleet: no matching members to stop"]);
         }
+        const batchSave = names.length > 1;
+        let stoppedAny = false;
         const lines: string[] = [];
-        for (const name of names) {
-          await this.stop(name);
-          lines.push(`fleet: stopped '${name}'`);
+        try {
+          for (const name of names) {
+            if (await this.stop(name, !batchSave)) stoppedAny = true;
+            lines.push(`fleet: stopped '${name}'`);
+          }
+        } finally {
+          if (batchSave && stoppedAny) await this.save();
         }
         return info(lines);
       }
@@ -291,13 +371,17 @@ export class Fleet {
         if (cmd.target.kind !== "member" && names.length === 0) {
           return info(["fleet: no matching members to clean"]);
         }
+        const batchSave = names.length > 1;
+        let cleanedAny = false;
         const lines: string[] = [];
-        for (const name of names) {
-          if (cmd.target.kind === "done" && man.members[name]?.status === "detached") {
-            await this.stop(name);
+        try {
+          for (const name of names) {
+            const outcome = await this.clean(name, force, !batchSave);
+            cleanedAny = true;
+            lines.push(`fleet: cleaned '${name}' (${outcome})`);
           }
-          const outcome = await this.clean(name, force);
-          lines.push(`fleet: cleaned '${name}' (${outcome})`);
+        } finally {
+          if (batchSave && cleanedAny) await this.save();
         }
         return info(lines);
       }
@@ -318,15 +402,17 @@ export class Fleet {
 
       const seenNames = new Set<string>();
       const candidates = batch.map((input) => {
-        if (!NAME_RE.test(input.name)) {
-          throw new Error(`invalid member name '${input.name}' (use lowercase letters, digits, dashes)`);
+        if (!isValidMemberName(input.name)) {
+          throw new Error(
+            `invalid member name '${input.name}' (use lowercase letters, digits, dashes; reserved names are not allowed)`,
+          );
         }
         if (seenNames.has(input.name)) {
           throw new Error(`duplicate member name '${input.name}' in spawn batch`);
         }
         seenNames.add(input.name);
 
-        const existing = man.members[input.name];
+        const existing = getMember(man, input.name);
         const resume = !!existing && RESUMABLE.has(existing.status);
         if (existing && !resume) {
           throw new Error(`member '${input.name}' already exists with status '${existing.status}'`);
@@ -347,7 +433,7 @@ export class Fleet {
         candidates.map(async ({ input, existing, resume }) => {
           const role: RoleName = input.role ?? (resume ? existing!.role : (cfg.defaultRole ?? "coder"));
           const spec = resolveRoleSpec(cfg, role);
-          const model = input.model ?? spec.model;
+          const model = input.model ?? (resume ? existing!.model : undefined) ?? spec.model;
 
           const branch = `fleet/${input.name}`;
           const wt = path.join(this.root, cfg.worktreeRoot ?? ".pi/fleet/wt", input.name);
@@ -431,19 +517,21 @@ export class Fleet {
           };
           if (resume) {
             if (!input.preserveTask && input.task) member.task = input.task;
-            member.model = model ?? member.model;
-          } else {
-            member.model = model;
           }
+          member.model = model;
           member.role = role;
           member.baseRef = baseRef;
           member.over = effectiveOver;
           member.transient = transient;
           member.status = "starting";
+          member.pid = undefined;
+          member.pidStartedAt = undefined;
+          member.reviewContextSha256 = undefined;
           member.needsAttention = undefined;
           member.result = undefined;
           member.updatedAt = now;
-          man.members[input.name] = member;
+          this.bumpStateGeneration(input.name);
+          setOwnMember(man.members, input.name, member);
           prepared.push({ input, member, resume, role, spec, model, branch, wt, effectiveOver, range });
         }
         await this.save();
@@ -456,7 +544,7 @@ export class Fleet {
           await removeWorktree(this.root, wt).catch(() => undefined);
         }
         for (const [name, snap] of prevSnapshots) {
-          if (snap) man.members[name] = snap;
+          if (snap) setOwnMember(man.members, name, snap);
           else delete man.members[name];
         }
         await this.save().catch(() => undefined);
@@ -502,7 +590,9 @@ export class Fleet {
             "--append-system-prompt", promptFile,
           ];
           if (model) args.push("--model", model);
-          else if (spec.thinking) args.push("--thinking", spec.thinking);
+          if (spec.thinking && (!model || !THINKING_SUFFIX_RE.test(model))) {
+            args.push("--thinking", spec.thinking);
+          }
           if (spec.tools) args.push("--tools", spec.tools);
 
           const client = await RpcMember.create({
@@ -516,12 +606,16 @@ export class Fleet {
           client.onExit(() => void this.onClientExit(input.name, client).catch((err) => this.reportHandlerError(input.name, err)));
           this.watchAsk(member);
 
-          await client.waitReady();
-          const state = await client.getState().catch(() => undefined);
+          const [state, procInfo] = await Promise.all([
+            client.waitReady(),
+            this.procOps.inspectProcess(client.pid),
+          ]);
           member.pid = client.pid;
+          member.pidStartedAt = procInfo.status === "ok" ? procInfo.info.startedAt : undefined;
           member.sessionFile = state?.sessionFile ?? member.sessionFile;
           member.status = "running";
           member.updatedAt = Date.now();
+          this.bumpStateGeneration(input.name);
           await this.save();
 
           const firstMessage = resume ? resumePreamble(member, input.extra) : member.task;
@@ -567,9 +661,9 @@ export class Fleet {
     return { messages };
   }
 
-  private async resume(name: string, extra?: string): Promise<Member> {
+  private async resume(name: string, extra?: string): Promise<void> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) throw new Error(`no such member '${name}'`);
     await this.spawnBatch([
       {
@@ -581,7 +675,6 @@ export class Fleet {
         preserveTask: true,
       },
     ]);
-    return (await this.manifest()).members[name];
   }
 
   private async writeReviewContext(
@@ -592,53 +685,115 @@ export class Fleet {
     const cfg = await this.config();
     const man = await this.manifest();
     const target = range ? range.head : (over ?? member.baseRef);
-    const targetName = !range && over ? over.replace(/^fleet\//, "") : undefined;
-    const targetMember = targetName ? man.members[targetName] : undefined;
+    const targetMember =
+      !range && over ? Object.values(man.members).find((m) => m.branch === over) : undefined;
     const diffBase = range ? range.base : (targetMember?.baseRef ?? cfg.baseRef ?? "HEAD");
-    const commits = await commitsSince(this.root, diffBase, target).catch(() => [] as string[]);
-    const diff = await diffForReview(this.root, diffBase, target, range?.dots);
+    const [commits, diff] = await Promise.all([
+      commitsSince(this.root, diffBase, target).catch(() => [] as string[]),
+      diffForReview(this.root, diffBase, target, range?.dots),
+    ]);
     const file = reviewContextPath(member.worktree);
     await mkdir(path.dirname(file), { recursive: true });
     const commitList = commits.length ? commits.map((c) => `- ${c}`).join("\n") : "(no commits)";
-    await writeFile(
-      file,
-      `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Assignment\n\n${member.task}\n\n## Commits\n\n${commitList}\n\n## Diff\n\n\`\`\`diff\n${diff}\n\`\`\`\n`,
-      "utf8",
-    );
+    const fence = markdownFence(diff);
+    const content = `# Review context\n\nTarget: \`${target}\`\nDiff base: \`${diffBase}\`\n\n## Assignment\n\n${member.task}\n\n## Commits\n\n${commitList}\n\n## Diff\n\n${fence}diff\n${diff}\n${fence}\n`;
+    await writeFile(file, content, "utf8");
+    member.reviewContextSha256 = createHash("sha256").update(content, "utf8").digest("hex");
+  }
+
+  private async removeGeneratedReviewContext(member: Member): Promise<void> {
+    if (!member.reviewContextSha256) return;
+    const file = reviewContextPath(member.worktree);
+    try {
+      const st = await lstat(file);
+      if (!st.isFile()) return;
+    } catch {
+      return;
+    }
+    let currentBytes: Buffer;
+    try {
+      currentBytes = await readFile(file);
+    } catch {
+      return;
+    }
+    const currentHash = createHash("sha256").update(currentBytes).digest("hex");
+    if (currentHash === member.reviewContextSha256) {
+      await rm(file, { force: true }).catch(() => undefined);
+    }
   }
 
   private async send(name: string, message: string): Promise<"steer" | "prompt"> {
     const client = this.mustClient(name);
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
+    let prev: { status: MemberStatus; result: string | undefined; updatedAt: number } | undefined;
+    let gen: number | undefined;
     if (member) {
       await rm(path.join(member.worktree, "FLEET_ASK.md"), { force: true }).catch(() => undefined);
+      // Recheck liveness and attachment after async I/O before mutating status to running.
+      if (this.clients.get(name) !== client || client.exited) {
+        throw new Error(`member '${name}' is not attached (status may be stale; try /fleet resume ${name})`);
+      }
+      let dirty = false;
       if (member.needsAttention) {
         member.needsAttention = undefined;
+        dirty = true;
+      }
+      if (member.status !== "running" || member.result !== undefined) {
+        prev = { status: member.status, result: member.result, updatedAt: member.updatedAt };
+        member.status = "running";
+        member.result = undefined;
+        dirty = true;
+      }
+      gen = this.bumpStateGeneration(name);
+      if (dirty) {
         member.updatedAt = Date.now();
         await this.save();
       }
     }
-    if (client.busy) {
-      await client.steer(message);
-      return "steer";
+    try {
+      if (this.clients.get(name) !== client || client.exited) {
+        throw new Error("member process exited");
+      }
+      if (client.busy) {
+        await client.steer(message);
+        return "steer";
+      }
+      await client.prompt(message);
+      return "prompt";
+    } catch (err) {
+      if (
+        member &&
+        getMember(man, name) === member &&
+        prev &&
+        gen !== undefined &&
+        this.stateGeneration.get(name) === gen &&
+        this.clients.get(name) === client &&
+        !client.exited
+      ) {
+        member.status = prev.status;
+        member.result = prev.result;
+        member.updatedAt = prev.updatedAt;
+        await this.save().catch(() => undefined);
+      }
+      throw err;
     }
-    await client.prompt(message);
-    return "prompt";
   }
 
   private async waitForMembers(
     target: WaitTarget,
     mode: WaitMode,
     timeoutSec?: number,
+    signal?: AbortSignal,
   ): Promise<FleetResult> {
+    if (signal?.aborted) throw new Error("wait aborted");
     const man = await this.manifest();
     let names: string[];
     if (target.kind === "all") {
       const entries = new Map<string, number>();
       for (const m of Object.values(man.members)) entries.set(m.name, m.createdAt);
       for (const [name, snap] of this.completedTransient.entries()) {
-        if (!entries.has(name)) entries.set(name, snap.createdAt);
+        if (!snap.reported && !entries.has(name)) entries.set(name, snap.createdAt);
       }
       names = Array.from(entries.entries())
         .sort((a, b) => a[1] - b[1])
@@ -648,7 +803,7 @@ export class Fleet {
       }
     } else {
       for (const name of target.names) {
-        if (!man.members[name] && !this.completedTransient.has(name)) {
+        if (!getMember(man, name) && !this.completedTransient.has(name)) {
           throw new Error(`no such member '${name}'`);
         }
       }
@@ -656,7 +811,7 @@ export class Fleet {
     }
 
     const isSettled = (n: string): boolean => {
-      const m = man.members[n];
+      const m = getMember(man, n);
       if (!m) return true;
       if (this.cleaningTransient.has(n)) return false;
       return isMemberSettled(m);
@@ -665,61 +820,115 @@ export class Fleet {
     const isSatisfied = (): boolean =>
       mode === "any" ? names.some(isSettled) : names.every(isSettled);
 
+    const askMtimes = new Map<string, number>();
     const syncAsks = async (): Promise<void> => {
       for (const name of names) {
-        const member = man.members[name];
-        if (member && existsSync(path.join(member.worktree, "FLEET_ASK.md"))) {
-          await this.readAsk(name);
+        const member = getMember(man, name);
+        if (!member) continue;
+        const askFile = path.join(member.worktree, "FLEET_ASK.md");
+        try {
+          const st = await stat(askFile);
+          if (askMtimes.get(name) !== st.mtimeMs) {
+            askMtimes.set(name, st.mtimeMs);
+            await this.readAsk(name);
+          }
+        } catch (err: any) {
+          if (err?.code === "ENOENT") {
+            if (askMtimes.delete(name)) {
+              await this.readAsk(name);
+            }
+          }
         }
       }
     };
 
-    let timedOut = false;
-    await syncAsks();
-    if (!isSatisfied()) {
-      await new Promise<void>((resolve) => {
-        let timer: NodeJS.Timeout | undefined;
-        const done = () => {
-          this.stateListeners.delete(check);
-          clearInterval(poll);
-          if (timer) clearTimeout(timer);
-          resolve();
-        };
-        const check = () => {
-          if (isSatisfied()) done();
-        };
-        const poll = setInterval(() => {
-          void syncAsks().then(check);
-        }, 50);
-        if (timeoutSec !== undefined) {
-          timer = setTimeout(() => {
-            if (!isSatisfied()) timedOut = true;
-            done();
-          }, Math.max(1, Math.round(timeoutSec * 1000)));
-        }
-        this.stateListeners.add(check);
-      });
+    for (const name of names) {
+      this.activeWaitTargets.set(name, (this.activeWaitTargets.get(name) ?? 0) + 1);
     }
 
-    const lines: string[] = [];
-    if (timedOut) {
-      const settled = names.filter(isSettled);
-      const running = names.filter((n) => !isSettled(n));
-      lines.push(
-        `fleet: wait timed out after ${timeoutSec}s (settled: ${settled.join(", ") || "none"}; running: ${running.join(", ") || "none"})`,
-      );
-    }
-    for (const name of names) {
-      const snap = this.completedTransient.get(name);
-      if (snap) {
-        lines.push(...snap.lines);
-        continue;
+    try {
+      let timedOut = false;
+      await syncAsks();
+      if (signal?.aborted) throw new Error("wait aborted");
+      if (!isSatisfied()) {
+        await new Promise<void>((resolve, reject) => {
+          let timer: NodeJS.Timeout | undefined;
+          let poll: NodeJS.Timeout | undefined;
+          let syncing = false;
+          let settled = false;
+          const cleanup = () => {
+            if (settled) return;
+            settled = true;
+            this.stateListeners.delete(check);
+            if (poll) clearInterval(poll);
+            if (timer) clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
+          };
+          const done = () => {
+            cleanup();
+            resolve();
+          };
+          const onAbort = () => {
+            cleanup();
+            reject(new Error("wait aborted"));
+          };
+          const check = () => {
+            if (isSatisfied()) done();
+          };
+          if (signal?.aborted) {
+            onAbort();
+            return;
+          }
+          signal?.addEventListener("abort", onAbort, { once: true });
+          poll = setInterval(() => {
+            if (syncing) return;
+            syncing = true;
+            void syncAsks()
+              .then(check)
+              .catch((err) => this.reportHandlerError("wait", err))
+              .finally(() => {
+                syncing = false;
+              });
+          }, 100);
+          if (timeoutSec !== undefined) {
+            timer = setTimeout(() => {
+              if (!isSatisfied()) timedOut = true;
+              done();
+            }, Math.max(1, Math.round(timeoutSec * 1000)));
+          }
+          this.stateListeners.add(check);
+        });
       }
-      const member = man.members[name];
-      if (!member) continue;
-      lines.push(...(await this.formatWaitMember(member)));
+
+      const lines: string[] = [];
+      if (timedOut) {
+        const settled = names.filter(isSettled);
+        const running = names.filter((n) => !isSettled(n));
+        lines.push(
+          `fleet: wait timed out after ${timeoutSec}s (settled: ${settled.join(", ") || "none"}; running: ${running.join(", ") || "none"})`,
+        );
+      }
+      const memberChunks = await Promise.all(
+        names.map(async (name) => {
+          const snap = this.completedTransient.get(name);
+          if (snap) {
+            snap.reported = true;
+            return snap.lines;
+          }
+          const member = getMember(man, name);
+          return member ? this.formatWaitMember(member) : [];
+        }),
+      );
+      for (const chunk of memberChunks) lines.push(...chunk);
+      return info([lines.join("\n")]);
+    } finally {
+      for (const name of names) {
+        const next = (this.activeWaitTargets.get(name) ?? 1) - 1;
+        if (next <= 0) this.activeWaitTargets.delete(name);
+        else this.activeWaitTargets.set(name, next);
+      }
+      this.trimCompletedTransient();
     }
-    return info(lines);
   }
 
   private async formatWaitMember(member: Member): Promise<string[]> {
@@ -747,79 +956,148 @@ export class Fleet {
     return true;
   }
 
-  private async stop(name: string): Promise<void> {
+  private async verifyDetachedProcess(
+    member: Member,
+  ): Promise<"not_running" | "match" | "mismatch" | "unavailable"> {
+    if (!member.pid || !this.procOps.isAlive(member.pid)) {
+      return "not_running";
+    }
+    if (!member.pidStartedAt) {
+      return "unavailable";
+    }
+    const inspected = await this.procOps.inspectProcess(member.pid);
+    if (inspected.status === "not_found") return "not_running";
+    if (inspected.status === "unavailable") return "unavailable";
+    if (!inspected.info.startedAt) return "unavailable";
+    if (inspected.info.startedAt !== member.pidStartedAt) return "mismatch";
+    if (!hasFleetCommandIdentity(inspected.info.commandLine, member.name)) {
+      return "mismatch";
+    }
+    return "match";
+  }
+
+  private async stop(name: string, save = true): Promise<boolean> {
+    this.bumpStateGeneration(name);
     const hadClient = await this.killAttachedClient(name);
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     const canKillDetached =
       !!member && (isActiveStatus(member.status) || member.status === "detached");
-    if (!hadClient && canKillDetached && member.pid && isPidAlive(member.pid)) {
-      await killProcessTree(member.pid);
+    if (!hadClient && canKillDetached && member.pid) {
+      const identity = await this.verifyDetachedProcess(member);
+      if (identity === "unavailable") {
+        throw new Error(
+          `cannot verify process start time and identity for detached member '${name}' (pid ${member.pid}); refusing to terminate`,
+        );
+      }
+      if (identity === "mismatch") {
+        this.ui.notify(
+          `fleet: refusing to terminate pid ${member.pid} for '${name}' because it no longer matches this member (PID appears reused)`,
+          "warn",
+        );
+      } else if (identity === "match") {
+        const exited = await this.procOps.terminateProcess(member.pid);
+        if (!exited) {
+          throw new Error(`failed to stop detached member '${name}' (pid ${member.pid} is still running)`);
+        }
+      }
     }
     if (member && (canKillDetached || hadClient)) {
       member.status = "stopped";
       member.pid = undefined;
+      member.pidStartedAt = undefined;
       member.updatedAt = Date.now();
-      await this.save();
+      if (save) await this.save();
+      return true;
     }
+    return false;
   }
 
-  private async clean(name: string, force = false): Promise<string> {
+  private async clean(name: string, force = false, save = true): Promise<string> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) throw new Error(`no such member '${name}'`);
+    let stoppedMutated = false;
     if (this.clients.has(name)) {
       if (!force) throw new Error(`member '${name}' is still attached; run /fleet stop ${name} first`);
-      await this.stop(name);
+      stoppedMutated = await this.stop(name, false);
+    } else if (member.status === "detached" || (force && isActiveStatus(member.status))) {
+      stoppedMutated = await this.stop(name, false);
     }
     this.unwatchAsk(name);
-    if (existsSync(member.worktree)) {
-      const r = await removeWorktree(this.root, member.worktree, force);
-      if (!r.ok) throw new Error(`worktree remove failed: ${r.out}`);
+    try {
+      if (existsSync(member.worktree)) {
+        await this.removeGeneratedReviewContext(member);
+        const r = await removeWorktree(this.root, member.worktree, force);
+        if (!r.ok) throw new Error(`worktree remove failed: ${r.out}`);
+      }
+      const hasBranch = await branchExists(this.root, member.branch).catch(() => false);
+      const merged = hasBranch ? await branchMerged(this.root, member.branch).catch(() => false) : false;
+      let branchOutcome = "branch already absent";
+      if (hasBranch) {
+        if (merged || force) {
+          const r = await deleteBranch(this.root, member.branch, force);
+          if (!r.ok) {
+            if (force) throw new Error(`branch delete failed: ${r.out}`);
+            branchOutcome = "branch kept (delete failed)";
+          } else {
+            branchOutcome = merged ? "merged branch deleted" : "unmerged branch force-deleted";
+          }
+        } else {
+          branchOutcome = "branch kept (unmerged)";
+        }
+      }
+      delete man.members[name];
+      if (save) await this.save();
+      return `worktree removed, ${branchOutcome}`;
+    } catch (err) {
+      if (stoppedMutated) await this.save().catch(() => undefined);
+      throw err;
     }
-    const merged = await branchMerged(this.root, member.branch).catch(() => false);
-    if (merged || force) {
-      const r = await deleteBranch(this.root, member.branch, force);
-      if (!r.ok && force) throw new Error(`branch delete failed: ${r.out}`);
-    }
-    delete man.members[name];
-    await this.save();
-    return merged ? "worktree removed, merged branch deleted" : "worktree removed, branch kept (unmerged)";
   }
 
-  private async merge(name: string): Promise<MergeResult> {
+  private async merge(name: string, save = true): Promise<MergeResult> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) throw new Error(`no such member '${name}'`);
     const result = await mergeBranch(this.root, member.branch, `fleet(${name}): ${member.task.split("\n")[0]}`);
     if (result.ok) {
       member.status = "merged";
       member.updatedAt = Date.now();
-      await this.save();
+      if (save) await this.save();
     }
     return result;
   }
 
   private async open(name: string): Promise<string> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member?.sessionFile || !existsSync(member.sessionFile)) {
       throw new Error(`no resumable session recorded for '${name}'`);
     }
-    const target = JSON.stringify(member.sessionFile);
-    if (process.platform === "win32") {
-      spawn("cmd.exe", ["/c", "start", "cmd", "/k", `pi --session ${target}`], {
-        cwd: member.worktree,
-        windowsHide: true,
-      });
-    } else {
-      const child = spawn("pi", ["--session", member.sessionFile], {
-        cwd: member.worktree,
-        detached: true,
-        stdio: "inherit",
-      });
-      child.unref();
+    if (!existsSync(member.worktree)) {
+      throw new Error(`worktree for '${name}' does not exist: ${member.worktree}`);
     }
+    const cfg = await this.config();
+    const plan = planOpenLaunch({
+      platform: process.platform,
+      piBin: piBinary(cfg),
+      worktree: member.worktree,
+      sessionFile: member.sessionFile,
+      env: process.env,
+    });
+    if (plan.kind === "manual") {
+      return `run in a separate terminal: ${plan.command}`;
+    }
+    const child = spawn(plan.command, plan.args, {
+      cwd: member.worktree,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: plan.windowsHide,
+      windowsVerbatimArguments: plan.windowsVerbatimArguments,
+    });
+    child.on("error", (err) => this.reportHandlerError(name, err));
+    child.unref();
     return `opened interactive pi for '${name}' in ${member.worktree}`;
   }
 
@@ -842,7 +1120,16 @@ export class Fleet {
   }
 
   private memberGlyph(member: Member, live: boolean): string {
-    return live ? GLYPH[member.status] : (member.status === "merged" ? "✔" : "·");
+    if (live) return GLYPH[member.status];
+    if (
+      member.status === "stopped" ||
+      member.status === "detached" ||
+      member.status === "stale" ||
+      member.status === "merged"
+    ) {
+      return GLYPH[member.status];
+    }
+    return "·";
   }
 
   private statusLines(rows: StatusRow[]): string[] {
@@ -870,53 +1157,35 @@ export class Fleet {
     return lines;
   }
 
-  private async refreshWidget(): Promise<void> {
+  private async refreshWidget(rows?: StatusRow[]): Promise<void> {
     try {
-      const rows = await this.statusRows();
-      this.ui.setWidget(this.widgetLines(rows));
+      const current = rows ?? (await this.statusRows());
+      this.ui.setWidget(this.widgetLines(current));
     } catch {
       // Widget is best-effort.
     }
   }
 
   private async logTail(name: string, n = 20): Promise<string> {
+    if (!isValidMemberName(name)) {
+      throw new Error(`invalid member name '${name}'`);
+    }
     const cfg = await this.config();
     const logFile = path.join(this.root, cfg.logDir ?? ".pi/fleet/logs", `${name}.jsonl`);
-    let raw: string;
+    let parsed: { items: LogEntry[]; lastResultIdx: number };
     try {
-      raw = await readFile(logFile, "utf8");
+      parsed = await readLogTailEntries(logFile, n);
     } catch {
       return `(no log yet for '${name}')`;
     }
-    const items: Array<
-      | { kind: "assistant"; text: string }
-      | { kind: "tool"; toolName: string }
-    > = [];
-    let lastResultIdx = -1;
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      let ev: any;
-      try {
-        ev = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (ev.type === "message_end" && ev.message?.role === "assistant") {
-        const text = extractText(ev.message).trim();
-        if (text) {
-          if (parseResultPrefix(text)) lastResultIdx = items.length;
-          items.push({ kind: "assistant", text });
-        }
-      } else if (ev.type === "tool_execution_start") {
-        items.push({ kind: "tool", toolName: ev.toolName });
-      }
-    }
-    const entries = items.map((item, idx) => {
+    const tail = parsed.items.map((item, idx) => {
       if (item.kind === "tool") return `tool: ${item.toolName}`;
-      if (idx === lastResultIdx) return `assistant: ${item.text}`;
+      if (item.kind === "omitted") {
+        return `[omitted oversized log record (>${formatByteLimit(item.maxBytes)})]`;
+      }
+      if (idx === parsed.lastResultIdx) return `assistant: ${item.text}`;
       return `assistant: ${truncate(item.text.replace(/\s+/g, " "), 220)}`;
     });
-    const tail = entries.slice(-n);
     return tail.length ? tail.join("\n") : `(no activity logged for '${name}')`;
   }
 
@@ -927,7 +1196,18 @@ export class Fleet {
     for (const member of Object.values(man.members)) {
       if (!isActiveStatus(member.status)) continue;
       if (this.clients.has(member.name)) continue;
-      const alive = isPidAlive(member.pid) && existsSync(member.worktree);
+      let alive = false;
+      if (existsSync(member.worktree)) {
+        const identity = await this.verifyDetachedProcess(member);
+        alive = identity === "match" || identity === "unavailable";
+        if (identity === "not_running" || identity === "mismatch") {
+          member.pid = undefined;
+          member.pidStartedAt = undefined;
+        }
+      } else {
+        member.pid = undefined;
+        member.pidStartedAt = undefined;
+      }
       member.status = alive ? "detached" : "stale";
       member.updatedAt = Date.now();
       changed = true;
@@ -945,6 +1225,7 @@ export class Fleet {
   dispose(): void {
     const entries = Array.from(this.clients.entries());
     this.clients.clear();
+    this.completedTransient.clear();
     for (const [name, client] of entries) {
       client.detach();
       this.unwatchAsk(name);
@@ -963,14 +1244,17 @@ export class Fleet {
 
   private async onMemberEvent(name: string, ev: any): Promise<void> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) return;
 
     if (ev.type === "agent_start" && member.status !== "running") {
+      this.bumpStateGeneration(name);
       member.status = "running";
+      member.result = undefined;
       member.updatedAt = Date.now();
       await this.save();
-    } else if (ev.type === "agent_end" && member.status === "running") {
+    } else if ((ev.type === "agent_end" || ev.type === "agent_settled") && member.status === "running") {
+      this.bumpStateGeneration(name);
       member.status = "idle";
       member.updatedAt = Date.now();
       await this.save();
@@ -978,6 +1262,7 @@ export class Fleet {
       const text = extractText(ev.message);
       const prefix = parseResultPrefix(text);
       if (prefix === "done") {
+        this.bumpStateGeneration(name);
         if (member.transient) {
           const cleanPromise = this.completeAndCleanTransient(member, text.trim());
           this.ui.notify(`fleet member '${name}' reports DONE`, "info");
@@ -990,6 +1275,7 @@ export class Fleet {
           this.ui.notify(`fleet member '${name}' reports DONE`, "info");
         }
       } else if (prefix === "failed") {
+        this.bumpStateGeneration(name);
         member.status = "failed";
         member.result = text.trim();
         member.updatedAt = Date.now();
@@ -1001,19 +1287,28 @@ export class Fleet {
 
   private async onClientExit(name: string, client: RpcMember): Promise<void> {
     if (this.clients.get(name) !== client) return;
+    this.bumpStateGeneration(name);
     this.clients.delete(name);
     this.unwatchAsk(name);
     await this.spawning.get(name);
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) return;
     if (member.status === "done" && client.exitCode === 0 && member.transient) {
       await this.completeAndCleanTransient(member);
       return;
     }
+    let dirty = false;
     if (isActiveStatus(member.status)) {
       member.status = "failed";
+      dirty = true;
+    }
+    if (member.pid !== undefined || member.pidStartedAt !== undefined) {
       member.pid = undefined;
+      member.pidStartedAt = undefined;
+      dirty = true;
+    }
+    if (dirty) {
       member.updatedAt = Date.now();
       await this.save();
     }
@@ -1026,20 +1321,23 @@ export class Fleet {
     try {
       member.status = "done";
       member.pid = undefined;
+      member.pidStartedAt = undefined;
       if (result !== undefined) member.result = result;
       member.updatedAt = Date.now();
       await this.spawning.get(name);
       const man = await this.manifest();
-      const current = man.members[name];
+      const current = getMember(man, name);
       if (!current || current.status === "failed") return;
       const lines = await this.formatWaitMember(current);
-      this.completedTransient.set(current.name, { createdAt: current.createdAt, lines });
+      this.completedTransient.delete(current.name);
+      this.completedTransient.set(current.name, { createdAt: current.createdAt, lines, reported: false });
+      this.trimCompletedTransient();
       await this.killAttachedClient(name);
-      await rm(reviewContextPath(current.worktree), { force: true }).catch(() => undefined);
       try {
         await this.clean(name, false);
       } catch (err) {
         this.completedTransient.delete(name);
+        this.cleaningTransient.delete(name);
         await this.save();
         const msg = err instanceof Error ? err.message : String(err);
         this.ui.notify(
@@ -1060,12 +1358,17 @@ export class Fleet {
   private watchAsk(member: Member): void {
     this.unwatchAsk(member.name);
     try {
-      let timer: NodeJS.Timeout | undefined;
       const watcher = watch(member.worktree, (_event, filename) => {
         if (filename !== "FLEET_ASK.md") return;
-        clearTimeout(timer);
-        timer = setTimeout(() => void this.readAsk(member.name), 500);
+        const prev = this.askTimers.get(member.name);
+        if (prev) clearTimeout(prev);
+        const timer = setTimeout(() => {
+          this.askTimers.delete(member.name);
+          void this.readAsk(member.name).catch((err) => this.reportHandlerError(member.name, err));
+        }, 500);
+        this.askTimers.set(member.name, timer);
       });
+      watcher.on("error", () => this.unwatchAsk(member.name));
       this.askWatchers.set(member.name, watcher);
     } catch {
       // Watching is best-effort.
@@ -1073,13 +1376,18 @@ export class Fleet {
   }
 
   private unwatchAsk(name: string): void {
+    const timer = this.askTimers.get(name);
+    if (timer) {
+      clearTimeout(timer);
+      this.askTimers.delete(name);
+    }
     this.askWatchers.get(name)?.close();
     this.askWatchers.delete(name);
   }
 
   private async readAsk(name: string): Promise<void> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) return;
     try {
       const content = await readFile(path.join(member.worktree, "FLEET_ASK.md"), "utf8");
@@ -1101,10 +1409,229 @@ export class Fleet {
 
 // ── helpers & command parsers ────────────────────────────────────────────────
 
+export type OpenLaunchPlan =
+  | {
+      kind: "spawn";
+      command: string;
+      args: string[];
+      windowsVerbatimArguments?: boolean;
+      windowsHide?: boolean;
+    }
+  | {
+      kind: "manual";
+      command: string;
+    };
+
+function shellQuote(arg: string): string {
+  if (/^[A-Za-z0-9_\-./:@+=]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+export function planOpenLaunch(opts: {
+  platform: NodeJS.Platform;
+  piBin: string;
+  worktree: string;
+  sessionFile: string;
+  env?: NodeJS.ProcessEnv;
+}): OpenLaunchPlan {
+  if (opts.platform === "win32") {
+    const launchCmd = `${winQuote(opts.piBin)} --session ${winQuote(opts.sessionFile)}`;
+    return {
+      kind: "spawn",
+      command: opts.env?.ComSpec ?? "cmd.exe",
+      args: ["/d", "/c", "start", '""', "cmd.exe", "/s", "/k", `"${launchCmd}"`],
+      windowsVerbatimArguments: true,
+      windowsHide: true,
+    };
+  }
+  if (opts.env?.TMUX) {
+    return {
+      kind: "spawn",
+      command: "tmux",
+      args: ["new-window", "-c", opts.worktree, opts.piBin, "--session", opts.sessionFile],
+    };
+  }
+  return {
+    kind: "manual",
+    command: `cd ${shellQuote(opts.worktree)} && ${shellQuote(opts.piBin)} --session ${shellQuote(opts.sessionFile)}`,
+  };
+}
+
+export type LogEntry =
+  | { kind: "assistant"; text: string }
+  | { kind: "tool"; toolName: string }
+  | { kind: "omitted"; maxBytes: number };
+
+function formatByteLimit(bytes: number): string {
+  if (bytes >= 1024 && bytes % 1024 === 0) return `${bytes / 1024} KiB`;
+  return `${bytes} B`;
+}
+
+function stripTrailingCr(buf: Buffer): Buffer {
+  return buf.length > 0 && buf[buf.length - 1] === 0x0d ? buf.subarray(0, buf.length - 1) : buf;
+}
+
+function parseLogLine(line: string): LogEntry | undefined {
+  if (!line.trim()) return undefined;
+  let ev: any;
+  try {
+    ev = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (ev.type === "message_end" && ev.message?.role === "assistant") {
+    const text = extractText(ev.message).trim();
+    if (text) return { kind: "assistant", text };
+  } else if (ev.type === "tool_execution_start" && typeof ev.toolName === "string") {
+    return { kind: "tool", toolName: ev.toolName };
+  }
+  return undefined;
+}
+
+/**
+ * Scan a JSONL activity log backward in bounded chunks, retaining at most `n`
+ * entries in memory and at most `maxLineBytes` (excluding one trailing '\r')
+ * per single record. Splits raw bytes on 0x0A ('\n') before UTF-8 decoding so
+ * multi-byte characters straddling chunk boundaries are never corrupted.
+ * Oversized records are reported as `{ kind: "omitted", maxBytes }` entries.
+ */
+export async function readLogTailEntries(
+  logFile: string,
+  n: number,
+  chunkBytes = LOG_TAIL_CHUNK_BYTES,
+  maxLineBytes = MAX_LOG_LINE_BYTES,
+): Promise<{ items: LogEntry[]; lastResultIdx: number }> {
+  const fh = await openFile(logFile, "r");
+  try {
+    const fileSize = (await fh.stat()).size;
+    let offset = fileSize;
+    let carryParts: Buffer[] = [];
+    let carrySize = 0;
+    let carryHasEnd = false;
+    let carryOverflowed = false;
+    const revItems: LogEntry[] = [];
+    const readSize = Math.max(1, Math.floor(chunkBytes));
+    const lineLimit = Math.max(1, Math.floor(maxLineBytes));
+
+    // Unified line-finalization and byte-limit rule for single-chunk and cross-chunk lines.
+    const emitEffectiveLine = (effective: Buffer | null, overflowed: boolean): void => {
+      if (revItems.length >= n) return;
+      if (overflowed || (effective && effective.length > lineLimit)) {
+        revItems.push({ kind: "omitted", maxBytes: lineLimit });
+        return;
+      }
+      if (!effective || effective.length === 0) return;
+      const entry = parseLogLine(effective.toString("utf8"));
+      if (entry) revItems.push(entry);
+    };
+
+    const appendCarryPiece = (piece: Buffer): void => {
+      if (carryOverflowed || piece.length === 0) return;
+      let effective = piece;
+      if (!carryHasEnd) {
+        carryHasEnd = true;
+        effective = stripTrailingCr(piece);
+        if (effective.length === 0) return;
+      }
+      if (carrySize + effective.length > lineLimit) {
+        carryOverflowed = true;
+        carryParts = [];
+        carrySize = 0;
+        return;
+      }
+      carryParts.push(Buffer.from(effective));
+      carrySize += effective.length;
+    };
+
+    const flushCarry = (): void => {
+      if (carryOverflowed) {
+        emitEffectiveLine(null, true);
+      } else if (carryParts.length > 0) {
+        const joined = carryParts.length === 1 ? carryParts[0] : Buffer.concat(carryParts.reverse());
+        emitEffectiveLine(joined, false);
+      }
+      carryParts = [];
+      carrySize = 0;
+      carryHasEnd = false;
+      carryOverflowed = false;
+    };
+
+    const walkCompleteLinesBackward = (buf: Buffer): void => {
+      let end = buf.length;
+      while (end > 0 && revItems.length < n) {
+        const prevNl = buf.lastIndexOf(0x0a, end - 1);
+        const lineStart = prevNl + 1;
+        const effective = stripTrailingCr(buf.subarray(lineStart, end));
+        emitEffectiveLine(effective, false);
+        end = prevNl;
+      }
+    };
+
+    while (offset > 0 && revItems.length < n) {
+      const toRead = Math.min(readSize, offset);
+      const chunkStart = offset - toRead;
+      const chunkBuf = Buffer.alloc(toRead);
+      let filled = 0;
+      while (filled < toRead) {
+        const { bytesRead } = await fh.read(chunkBuf, filled, toRead - filled, chunkStart + filled);
+        if (bytesRead <= 0) break;
+        filled += bytesRead;
+      }
+      offset = chunkStart;
+
+      const slice = filled === toRead ? chunkBuf : chunkBuf.subarray(0, filled);
+      const lastNl = slice.lastIndexOf(0x0a);
+
+      if (lastNl === -1) {
+        appendCarryPiece(slice);
+        if (chunkStart === 0) flushCarry();
+        continue;
+      }
+
+      appendCarryPiece(slice.subarray(lastNl + 1));
+      flushCarry();
+
+      if (revItems.length >= n) break;
+
+      if (chunkStart === 0) {
+        walkCompleteLinesBackward(slice.subarray(0, lastNl));
+      } else {
+        const firstNl = slice.indexOf(0x0a);
+        if (lastNl > firstNl) {
+          walkCompleteLinesBackward(slice.subarray(firstNl + 1, lastNl));
+        }
+        if (revItems.length < n) {
+          appendCarryPiece(slice.subarray(0, firstNl));
+        }
+      }
+    }
+
+    const items = revItems.reverse();
+    let lastResultIdx = -1;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === "assistant" && parseResultPrefix(item.text)) {
+        lastResultIdx = i;
+      }
+    }
+    return { items, lastResultIdx };
+  } finally {
+    await fh.close();
+  }
+}
+
 function parseResultPrefix(text: string): "done" | "failed" | undefined {
   const match = /^\s*(DONE|FAILED):/i.exec(text.slice(0, 500));
   if (!match) return undefined;
   return match[1].toUpperCase() === "DONE" ? "done" : "failed";
+}
+
+function markdownFence(body: string): string {
+  let maxRun = 2;
+  for (const match of body.matchAll(/`+/g)) {
+    if (match[0].length > maxRun) maxRun = match[0].length;
+  }
+  return "`".repeat(maxRun + 1);
 }
 
 function reviewContextPath(worktree: string): string {
@@ -1133,7 +1660,7 @@ function unquote(text: string): string {
     ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
       (trimmed.startsWith("'") && trimmed.endsWith("'")))
   ) {
-    return trimmed.slice(1, -1);
+    return trimmed.slice(1, -1).trim();
   }
   return trimmed;
 }
@@ -1164,9 +1691,18 @@ function parseCleanTarget(raw: string): CleanTarget {
   return { kind: "member", name: raw };
 }
 
+const LOG_USAGE = "usage: /fleet log <name> [n]";
+
 function parseLogCount(raw: unknown): number {
-  const n = typeof raw === "number" ? raw : raw ? Number(raw) : 20;
-  return Number.isFinite(n) && n > 0 ? n : 20;
+  if (raw === undefined || raw === "") return 20;
+  if (typeof raw === "string" && !/^\d+$/.test(raw.trim())) {
+    throw new Error(LOG_USAGE);
+  }
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(LOG_USAGE);
+  }
+  return n;
 }
 
 const WAIT_USAGE = "usage: /fleet wait [name|--all] [--any] [--timeout <sec>]";
@@ -1179,21 +1715,34 @@ function parseWaitTimeout(raw: unknown): number {
 }
 
 function parseSpawnMemberInput(raw: any, missingMsg: string): SpawnMemberInput {
-  if (!raw || typeof raw !== "object" || !raw.name || !raw.task) {
+  if (
+    !raw ||
+    typeof raw !== "object" ||
+    typeof raw.name !== "string" ||
+    typeof raw.task !== "string" ||
+    !raw.name.trim() ||
+    !raw.task.trim()
+  ) {
     throw new Error(missingMsg);
   }
   if (raw.role !== undefined && !ROLE_NAMES.includes(raw.role)) {
     throw new Error(`invalid role '${raw.role}'`);
   }
+  if (raw.model !== undefined && typeof raw.model !== "string") {
+    throw new Error("model must be a string");
+  }
+  if (raw.over !== undefined && typeof raw.over !== "string") {
+    throw new Error("over must be a string");
+  }
   if (raw.transient !== undefined && typeof raw.transient !== "boolean") {
     throw new Error("transient must be a boolean");
   }
   return {
-    name: raw.name,
+    name: raw.name.trim(),
     task: raw.task,
     ...(raw.role ? { role: raw.role } : {}),
-    ...(raw.model ? { model: raw.model } : {}),
-    ...(raw.over ? { over: raw.over } : {}),
+    ...(raw.model?.trim() ? { model: raw.model.trim() } : {}),
+    ...(raw.over?.trim() ? { over: raw.over.trim() } : {}),
     ...(raw.transient !== undefined ? { transient: raw.transient } : {}),
   };
 }
@@ -1235,14 +1784,14 @@ export function parseFleetCommand(raw: string): FleetCommand {
           cursor = val.rest;
         } else if (next.token === "--model") {
           const val = shiftToken(next.rest);
-          if (!val.token) {
+          if (!val.token || val.token.startsWith("--")) {
             throw new Error(spawnUsage);
           }
           opts.model = val.token;
           cursor = val.rest;
         } else if (next.token === "--over") {
           const val = shiftToken(next.rest);
-          if (!val.token) {
+          if (!val.token || val.token.startsWith("--")) {
             throw new Error(spawnUsage);
           }
           opts.over = val.token;
@@ -1313,9 +1862,10 @@ export function parseFleetCommand(raw: string): FleetCommand {
 
     case "log": {
       const { token: name, rest: tail } = shiftToken(rest);
-      if (!name) throw new Error("usage: /fleet log <name> [n]");
-      const { token: nStr } = shiftToken(tail);
-      return { action: "log", name, n: parseLogCount(nStr) };
+      if (!name || name.startsWith("--")) throw new Error(LOG_USAGE);
+      const { token: nStr, rest: extra } = shiftToken(tail);
+      if (shiftToken(extra).token) throw new Error(LOG_USAGE);
+      return { action: "log", name, n: parseLogCount(nStr || undefined) };
     }
 
     case "merge": {
@@ -1380,6 +1930,7 @@ export function toolParamsToCommand(params: {
   mode?: WaitMode;
   timeout?: number;
 }): FleetCommand {
+  const trimString = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
   switch (params.action) {
     case "status":
       return { action: "status" };
@@ -1411,27 +1962,39 @@ export function toolParamsToCommand(params: {
       };
     }
     case "resume": {
-      if (!params.name) throw new Error("resume requires name");
-      const extra = params.message?.trim();
+      const name = trimString(params.name);
+      if (!name) throw new Error("resume requires name");
+      const extra = trimString(params.message);
       return {
         action: "resume",
-        name: params.name,
+        name,
         ...(extra ? { extra } : {}),
       };
     }
     case "send": {
-      if (!params.name || !params.message) throw new Error("send requires name and message");
-      return { action: "send", name: params.name, message: params.message };
+      const name = trimString(params.name);
+      const message = trimString(params.message);
+      if (!name || !message) throw new Error("send requires name and message");
+      return { action: "send", name, message };
     }
     case "wait": {
       const timeout = params.timeout !== undefined ? parseWaitTimeout(params.timeout) : undefined;
       if (params.mode !== undefined && params.mode !== "all" && params.mode !== "any") {
         throw new Error(WAIT_USAGE);
       }
+      if (params.name !== undefined && typeof params.name !== "string") {
+        throw new Error(WAIT_USAGE);
+      }
+      if (
+        params.names !== undefined &&
+        (!Array.isArray(params.names) || params.names.some((n) => typeof n !== "string"))
+      ) {
+        throw new Error(WAIT_USAGE);
+      }
       const targetTokens = [
         ...(params.name ? params.name.trim().split(/\s+/) : []),
-        ...(Array.isArray(params.names) ? params.names.map(String) : []),
-      ].filter((t) => t.trim().length > 0);
+        ...(params.names ? params.names.map((n) => n.trim()) : []),
+      ].filter((t) => t.length > 0);
       if ((params.name !== undefined || params.names !== undefined) && targetTokens.length === 0) {
         throw new Error(WAIT_USAGE);
       }
@@ -1443,22 +2006,26 @@ export function toolParamsToCommand(params: {
       };
     }
     case "log": {
-      if (!params.name) throw new Error("log requires name");
-      return { action: "log", name: params.name, n: parseLogCount(params.n) };
+      const name = trimString(params.name);
+      if (!name) throw new Error("log requires name");
+      return { action: "log", name, n: parseLogCount(params.n) };
     }
     case "merge": {
-      if (!params.name) throw new Error("merge requires name (or '--done')");
-      return { action: "merge", target: parseMergeTarget(params.name) };
+      const name = trimString(params.name);
+      if (!name) throw new Error("merge requires name (or '--done')");
+      return { action: "merge", target: parseMergeTarget(name) };
     }
     case "stop": {
-      if (!params.name) throw new Error("stop requires name (or '--all')");
-      return { action: "stop", target: parseStopTarget(params.name) };
+      const name = trimString(params.name);
+      if (!name) throw new Error("stop requires name (or '--all')");
+      return { action: "stop", target: parseStopTarget(name) };
     }
     case "clean": {
-      if (!params.name) throw new Error("clean requires name (or '--done' / '--all')");
+      const name = trimString(params.name);
+      if (!name) throw new Error("clean requires name (or '--done' / '--all')");
       return {
         action: "clean",
-        target: parseCleanTarget(params.name),
+        target: parseCleanTarget(name),
         ...(params.force ? { force: true } : {}),
       };
     }
