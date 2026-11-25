@@ -6,7 +6,14 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { loadFleetConfig, resolveRoleSpec } from "./config.ts";
-import { Fleet, parseFleetCommand, planOpenLaunch, readLogTailEntries, toolParamsToCommand } from "./fleet.ts";
+import {
+  Fleet,
+  MAX_LOG_LINE_BYTES,
+  parseFleetCommand,
+  planOpenLaunch,
+  readLogTailEntries,
+  toolParamsToCommand,
+} from "./fleet.ts";
 import { addWorktree, branchExists, diffForReview, git, headRev, mergeBranch } from "./gitw.ts";
 import registerFleet from "./index.ts";
 import { isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
@@ -586,7 +593,10 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
     try {
       const m = await h.seedMember("ghost", "detached");
       const man = await loadManifest(h.root);
+      const info = await getProcessInfo(sleeper.pid!);
+      assert.equal(info.status, "ok");
       man.members[m.name].pid = sleeper.pid;
+      man.members[m.name].pidStartedAt = info.info.startedAt;
       await saveManifest(man);
 
       await h.runCommand("stop ghost");
@@ -733,7 +743,10 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
         });
       }
       const manBefore = await loadManifest(h.root);
+      const sleeperInfo = await getProcessInfo(sleeper.pid!);
+      assert.equal(sleeperInfo.status, "ok");
       manBefore.members["fin-detached"].pid = sleeper.pid;
+      manBefore.members["fin-detached"].pidStartedAt = sleeperInfo.info.startedAt;
       await saveManifest(manBefore);
 
       for (const status of untouched) {
@@ -2147,8 +2160,15 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       await h.seedMember("det-a", "detached");
       await h.seedMember("det-b", "detached");
       const man1 = await loadManifest(h.root);
+      const [info0, info1, info2, info3] = await Promise.all(sleepers.map((s) => getProcessInfo(s.pid!)));
+      assert.equal(info0.status, "ok");
+      assert.equal(info1.status, "ok");
+      assert.equal(info2.status, "ok");
+      assert.equal(info3.status, "ok");
       man1.members["det-a"].pid = sleepers[0].pid;
+      man1.members["det-a"].pidStartedAt = info0.info.startedAt;
       man1.members["det-b"].pid = sleepers[1].pid;
+      man1.members["det-b"].pidStartedAt = info1.info.startedAt;
       await saveManifest(man1);
 
       await h.runCommand("stop --all");
@@ -2159,7 +2179,9 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       await h.seedMember("det-all", "detached");
       const man2 = await loadManifest(h.root);
       man2.members["det-direct"].pid = sleepers[2].pid;
+      man2.members["det-direct"].pidStartedAt = info2.info.startedAt;
       man2.members["det-all"].pid = sleepers[3].pid;
+      man2.members["det-all"].pidStartedAt = info3.info.startedAt;
       await saveManifest(man2);
 
       const cleanDirectRes = await h.runTool({ action: "clean", name: "det-direct" });
@@ -2830,7 +2852,10 @@ describe("Fleet execution through /fleet command and fleet tool adapters", () =>
       await h.seedMember("rec-dead", "running");
       await h.seedMember("rec-live", "idle");
       const man = await loadManifest(h.root);
+      const sleeperInfo = await getProcessInfo(sleeper.pid!);
+      assert.equal(sleeperInfo.status, "ok");
       man.members["rec-live"].pid = sleeper.pid;
+      man.members["rec-live"].pidStartedAt = sleeperInfo.info.startedAt;
       await saveManifest(man);
 
       await h.reconcileSession();
@@ -3420,6 +3445,7 @@ describe("Audit regression tests (F1-F10)", () => {
       const m1 = await h.seedMember("reused-pid", "running");
       const man1 = await loadManifest(h.root);
       man1.members[m1.name].pid = unrelated.pid;
+      man1.members[m1.name].pidStartedAt = "2025-01-01T00:00:00.0000000Z";
       await saveManifest(man1);
 
       await h.reconcileSession();
@@ -3432,6 +3458,7 @@ describe("Audit regression tests (F1-F10)", () => {
       const m2 = await h.seedMember("reused-det", "detached");
       const man2 = await loadManifest(h.root);
       man2.members[m2.name].pid = unrelated.pid;
+      man2.members[m2.name].pidStartedAt = "2025-01-01T00:00:00.0000000Z";
       await saveManifest(man2);
 
       const stopRes = await h.runTool({ action: "stop", name: "reused-det" });
@@ -3457,6 +3484,7 @@ describe("Audit regression tests (F1-F10)", () => {
       const stubborn = await h.seedMember("stubborn-det", "detached");
       const man4 = await loadManifest(h.root);
       man4.members[stubborn.name].pid = 424242;
+      man4.members[stubborn.name].pidStartedAt = "2026-01-01T00:00:00Z";
       await saveManifest(man4);
 
       const uiNotes: Array<{ text: string; level?: NotifyLevel }> = [];
@@ -3504,7 +3532,7 @@ describe("Audit regression tests (F1-F10)", () => {
       );
       await assert.rejects(
         () => uninspectableFleet.execute({ action: "clean", target: { kind: "member", name: "stubborn-det" } }),
-        /cannot verify process identity/i,
+        /cannot verify process start time and identity/i,
       );
       assert.equal(existsSync(stubborn.worktree), true);
 
@@ -3928,6 +3956,232 @@ process.stdin.once("data", () => {
       assert.ok(cfgWarnings.some((w) => /roles\.unknownRole is not a known role/i.test(w)));
     } finally {
       await h.cleanup();
+    }
+  });
+
+  it("P1: rejects reserved prototype member names before creating worktrees and uses own-key lookups", async () => {
+    const h = await createHarness();
+    try {
+      for (const badName of ["prototype", "constructor", "__proto__"]) {
+        const res = await h.runTool({ action: "spawn", name: badName, task: "DONE: bad" });
+        assert.equal(res.isError, true, `spawn '${badName}' must fail`);
+        assert.match(res.text, /invalid member name/i);
+        assert.equal(
+          existsSync(path.join(h.root, ".pi", "fleet", "wt", badName)),
+          false,
+          `worktree must not be created for '${badName}'`,
+        );
+      }
+
+      // Prototype property names must never resolve as existing members on lookup commands.
+      for (const action of ["stop", "clean", "resume", "send", "merge", "open"] as const) {
+        const params: Record<string, unknown> =
+          action === "send"
+            ? { action, name: "toString", message: "hi" }
+            : { action, name: "constructor" };
+        const res = await h.runTool(params);
+        assert.equal(res.isError, true, `${action} on prototype key must fail`);
+      }
+
+      // Valid spawn -> reload manifest round-trip preserves members cleanly with zero warnings.
+      const okSpawn = await h.runTool({ action: "spawn", name: "valid-one", task: "DONE: all good" });
+      assert.equal(okSpawn.isError, false);
+      await h.runTool({ action: "wait", name: "valid-one", timeout: 5 });
+      await h.runTool({ action: "stop", name: "valid-one" });
+
+      const reloadWarnings: string[] = [];
+      const reloaded = await loadManifest(h.root, (w) => reloadWarnings.push(w));
+      assert.deepEqual(reloadWarnings, []);
+      assert.ok(Object.hasOwn(reloaded.members, "valid-one"));
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("P2: detached stop and clean refuse termination when pidStartedAt is missing even if command line matches", async () => {
+    const h = await createHarness();
+    const sleeper = spawnChild(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)", "--", "--mode", "rpc", "--name", "fleet:missing-start"],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
+    try {
+      const m = await h.seedMember("missing-start", "detached");
+      const man = await loadManifest(h.root);
+      man.members[m.name].pid = sleeper.pid;
+      man.members[m.name].pidStartedAt = undefined;
+      await saveManifest(man);
+
+      const stopRes = await h.runTool({ action: "stop", name: "missing-start" });
+      assert.equal(stopRes.isError, true);
+      assert.match(stopRes.text, /start time/i);
+      assert.equal(isPidAlive(sleeper.pid), true, "process without pidStartedAt must NOT be killed");
+
+      const cleanRes = await h.runTool({ action: "clean", name: "missing-start" });
+      assert.equal(cleanRes.isError, true);
+      assert.match(cleanRes.text, /start time/i);
+      assert.equal(isPidAlive(sleeper.pid), true, "clean must NOT kill process without pidStartedAt");
+      assert.equal(existsSync(m.worktree), true, "worktree must remain intact when termination is refused");
+
+      const after = await loadManifest(h.root);
+      assert.equal(after.members["missing-start"]?.pid, sleeper.pid);
+      assert.equal(after.members["missing-start"]?.status, "detached");
+    } finally {
+      try {
+        sleeper.kill();
+      } catch {
+        // already exited
+      }
+      await h.cleanup();
+    }
+  });
+
+  it("P3: finalizes exited member after bounded drain even with inherited stdout/stderr and zero pending RPCs", async () => {
+    const h = await createHarness();
+    const tmpBin = await mkdtemp(path.join(tmpdir(), "pi-fleet-p3-"));
+    const grandchildPidFile = path.join(tmpBin, "grandchild.pid");
+    try {
+      const mjsPath = path.join(tmpBin, "gc-exit.mjs");
+      await writeFile(
+        mjsPath,
+        `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let idx;
+  while ((idx = buf.indexOf("\\n")) >= 0) {
+    const line = buf.slice(0, idx).replace(/\\r$/, "");
+    buf = buf.slice(idx + 1);
+    if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    if (msg.type === "get_state") {
+      process.stdout.write(JSON.stringify({
+        type: "response",
+        id: msg.id,
+        command: "get_state",
+        success: true,
+        data: { isStreaming: false },
+      }) + "\\n");
+    } else if (msg.type === "prompt") {
+      // Respond to prompt (so ZERO pending RPCs remain), spawn detached grandchild
+      // inheriting BOTH stdout and stderr, and exit immediately.
+      process.stdout.write(JSON.stringify({
+        type: "response",
+        id: msg.id,
+        command: "prompt",
+        success: true,
+        data: {},
+      }) + "\\n");
+      const gc = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
+        cwd: tmpdir(),
+        stdio: ["ignore", "inherit", "inherit"],
+        detached: true,
+        windowsHide: true,
+      });
+      writeFileSync(${JSON.stringify(grandchildPidFile)}, String(gc.pid), "utf8");
+      gc.unref();
+      setTimeout(() => process.exit(1), 40);
+    }
+  }
+});
+`,
+        "utf8",
+      );
+      await chmod(mjsPath, 0o755);
+      let piBin = mjsPath;
+      if (process.platform === "win32") {
+        const cmdPath = path.join(tmpBin, "gc-exit.cmd");
+        await writeFile(cmdPath, `@node "%~dp0gc-exit.mjs" %*\r\n`, "utf8");
+        piBin = cmdPath;
+      }
+
+      const cfgPath = path.join(h.root, ".pi", "fleet", "config.json");
+      const existingCfg = JSON.parse(await readFile(cfgPath, "utf8"));
+      await writeFile(cfgPath, JSON.stringify({ ...existingCfg, piBin }), "utf8");
+
+      const fleet = new Fleet(h.root, {
+        notify: () => undefined,
+        setWidget: () => undefined,
+      });
+      await fleet.execute({ action: "spawn", name: "gc-member", task: "trigger grandchild" });
+
+      const started = Date.now();
+      const waitRes = await fleet.execute({
+        action: "wait",
+        target: { kind: "members", names: ["gc-member"] },
+        mode: "all",
+        timeout: 5,
+      });
+      const elapsed = Date.now() - started;
+      const waitText = waitRes.messages.map((m) => m.text).join("\n");
+      assert.doesNotMatch(waitText, /timed out/i);
+      assert.match(waitText, /status=failed/);
+      assert.ok(elapsed < 4_000, `wait must resolve promptly via exit drain timer (took ${elapsed}ms)`);
+
+      const after = await loadManifest(h.root);
+      assert.equal(after.members["gc-member"]?.status, "failed");
+      assert.equal(after.members["gc-member"]?.pid, undefined);
+      assert.equal(after.members["gc-member"]?.pidStartedAt, undefined);
+
+      // Verify log stream was closed by removing the log file cleanly (Windows fails if open).
+      const logFile = path.join(h.root, ".pi", "fleet", "logs", "gc-member.jsonl");
+      if (existsSync(logFile)) {
+        await rm(logFile, { force: true, maxRetries: 5, retryDelay: 30 });
+        assert.equal(existsSync(logFile), false);
+      }
+    } finally {
+      if (existsSync(grandchildPidFile)) {
+        const gcPid = Number((await readFile(grandchildPidFile, "utf8")).trim());
+        if (gcPid > 0) {
+          try {
+            process.kill(gcPid);
+          } catch {
+            // already exited
+          }
+        }
+      }
+      await rm(tmpBin, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      await h.cleanup();
+    }
+  });
+
+  it("P4: readLogTailEntries bounds per-line retention on oversized and unfinished lines while preserving valid neighbors", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-p4-"));
+    try {
+      const logFile = path.join(tmpRoot, "oversized.jsonl");
+      const cap = 512;
+      assert.ok(MAX_LOG_LINE_BYTES >= 64 * 1024);
+      const hugeValid = JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: "HUGE_" + "A".repeat(cap * 4) },
+      });
+      const hugeUnfinished = '{"type":"message_end","pad":"' + "B".repeat(cap * 4);
+      const content = [
+        JSON.stringify({ type: "message_end", message: { role: "assistant", content: "BEFORE_HUGE ✓" } }),
+        hugeValid,
+        JSON.stringify({ type: "tool_execution_start", toolName: "bash" }),
+        JSON.stringify({ type: "message_end", message: { role: "assistant", content: "DONE: AFTER_HUGE ⚙" } }),
+        hugeUnfinished, // no trailing newline and exceeds cap
+      ].join("\n");
+      await writeFile(logFile, content, "utf8");
+
+      const res = await readLogTailEntries(logFile, 5, 97, cap);
+      assert.deepEqual(res.items, [
+        { kind: "assistant", text: "BEFORE_HUGE ✓" },
+        { kind: "tool", toolName: "bash" },
+        { kind: "assistant", text: "DONE: AFTER_HUGE ⚙" },
+      ]);
+      assert.equal(res.lastResultIdx, 2);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
     }
   });
 });

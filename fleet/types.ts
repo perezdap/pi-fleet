@@ -4,6 +4,18 @@ export type RoleName = "coder" | "tester" | "reviewer" | "integrator";
 
 export const ROLE_NAMES: RoleName[] = ["coder", "tester", "reviewer", "integrator"];
 
+export const MEMBER_NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
+
+export const RESERVED_MEMBER_NAMES = new Set(["__proto__", "constructor", "prototype"]);
+
+export function isValidMemberName(name: string): boolean {
+  return MEMBER_NAME_RE.test(name) && !RESERVED_MEMBER_NAMES.has(name);
+}
+
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];

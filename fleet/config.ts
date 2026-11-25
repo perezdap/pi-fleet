@@ -3,6 +3,7 @@
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import {
+  isPlainObject,
   ROLE_NAMES,
   THINKING_LEVELS,
   type FleetConfig,
@@ -22,10 +23,6 @@ const BUILTIN_ROLES: Record<RoleName, RoleSpec> = {
 
 function configPath(repoRoot: string): string {
   return path.join(repoRoot, ".pi", "fleet", "config.json");
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function sanitizeRoleSpec(

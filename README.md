@@ -29,7 +29,7 @@ fleet: 3 members (2 active)
 | Command | Description |
 |---|---|
 | `/fleet status` | Show all members (also shown as a status widget) |
-| `/fleet spawn [--role r] [--model m] [--over ref|a..b] [--transient\|--no-transient] <name> <task…>` | Start a member |
+| `/fleet spawn [--role r] [--model m] [--over ref\|a..b] [--transient\|--no-transient] <name> <task…>` | Start a member |
 | `/fleet resume <name> [extra…]` | Continue a stale/stopped/failed/done member on its existing worktree |
 | `/fleet send <name> <message…>` | Steer a busy member, or prompt an idle one |
 | `/fleet wait [name…\|--all] [--any] [--timeout <sec>]` | Wait for member(s) to settle or raise a question |

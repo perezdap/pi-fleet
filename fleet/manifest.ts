@@ -3,6 +3,8 @@
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import {
+  isPlainObject,
+  isValidMemberName,
   MEMBER_STATUSES,
   ROLE_NAMES,
   type Manifest,
@@ -21,19 +23,12 @@ function manifestPath(repoRoot: string): string {
 
 let tmpSeq = 0;
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function isOptString(value: unknown): boolean {
   return value === undefined || typeof value === "string";
 }
 
-const FORBIDDEN_MEMBER_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-const MEMBER_NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
-
 function isValidMember(key: string, value: unknown): value is Member {
-  if (FORBIDDEN_MEMBER_KEYS.has(key) || !MEMBER_NAME_RE.test(key)) return false;
+  if (!isValidMemberName(key)) return false;
   if (!isPlainObject(value)) return false;
   if (typeof value.name !== "string" || !value.name || value.name !== key) return false;
   if (typeof value.role !== "string" || !ROLE_NAMES.includes(value.role as RoleName)) return false;

@@ -37,7 +37,9 @@ import {
   type ProcessInfoResult,
 } from "./rpc.ts";
 import {
+  isValidMemberName,
   ROLE_NAMES,
+  THINKING_LEVELS,
   type CleanTarget,
   type FleetCommand,
   type FleetConfig,
@@ -110,13 +112,26 @@ const USAGE = [
   "Roles: coder, tester, reviewer (read-only), integrator — see README.",
 ].join("\n");
 
-const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
-const THINKING_SUFFIX_RE = /:(off|minimal|low|medium|high|xhigh|max)$/;
+const THINKING_SUFFIX_RE = new RegExp(`:(${THINKING_LEVELS.join("|")})$`);
 const RESUMABLE = new Set<MemberStatus>(["stale", "stopped", "failed", "done"]);
 const CLEANABLE_DONE = new Set<MemberStatus>(["done", "merged", "failed", "stopped", "stale", "detached"]);
 const SETTLED_STATUSES = new Set<MemberStatus>(["done", "failed", "stopped", "stale", "merged", "detached"]);
 const MAX_COMPLETED_TRANSIENT = 64;
 const LOG_TAIL_CHUNK_BYTES = 2 * 1024 * 1024;
+export const MAX_LOG_LINE_BYTES = 256 * 1024;
+
+function getMember(man: Manifest, name: string): Member | undefined {
+  return Object.hasOwn(man.members, name) ? man.members[name] : undefined;
+}
+
+function setMember(man: Manifest, name: string, member: Member): void {
+  Object.defineProperty(man.members, name, {
+    value: member,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
 
 function isMemberSettled(member: Member): boolean {
   return SETTLED_STATUSES.has(member.status) || Boolean(member.needsAttention);
@@ -150,7 +165,7 @@ export class Fleet {
   private cleaningTransient = new Set<string>();
   private completedTransient = new Map<string, { createdAt: number; lines: string[]; reported: boolean }>();
   private activeWaitTargets = new Map<string, number>();
-  private sendGen = new Map<string, number>();
+  private stateGeneration = new Map<string, number>();
   private procOps: FleetProcessOps;
   private saveChain: Promise<void> = Promise.resolve();
   private prepareChain: Promise<void> = Promise.resolve();
@@ -168,9 +183,9 @@ export class Fleet {
     };
   }
 
-  private bumpSendGen(name: string): number {
-    const next = (this.sendGen.get(name) ?? 0) + 1;
-    this.sendGen.set(name, next);
+  private bumpStateGeneration(name: string): number {
+    const next = (this.stateGeneration.get(name) ?? 0) + 1;
+    this.stateGeneration.set(name, next);
     return next;
   }
 
@@ -325,7 +340,7 @@ export class Fleet {
 
       case "stop": {
         const man = await this.manifest();
-        if (cmd.target.kind === "member" && !man.members[cmd.target.name]) {
+        if (cmd.target.kind === "member" && !getMember(man, cmd.target.name)) {
           throw new Error(`no such member '${cmd.target.name}'`);
         }
         const names =
@@ -396,15 +411,17 @@ export class Fleet {
 
       const seenNames = new Set<string>();
       const candidates = batch.map((input) => {
-        if (!NAME_RE.test(input.name)) {
-          throw new Error(`invalid member name '${input.name}' (use lowercase letters, digits, dashes)`);
+        if (!isValidMemberName(input.name)) {
+          throw new Error(
+            `invalid member name '${input.name}' (use lowercase letters, digits, dashes; reserved names are not allowed)`,
+          );
         }
         if (seenNames.has(input.name)) {
           throw new Error(`duplicate member name '${input.name}' in spawn batch`);
         }
         seenNames.add(input.name);
 
-        const existing = man.members[input.name];
+        const existing = getMember(man, input.name);
         const resume = !!existing && RESUMABLE.has(existing.status);
         if (existing && !resume) {
           throw new Error(`member '${input.name}' already exists with status '${existing.status}'`);
@@ -522,8 +539,8 @@ export class Fleet {
           member.needsAttention = undefined;
           member.result = undefined;
           member.updatedAt = now;
-          this.bumpSendGen(input.name);
-          man.members[input.name] = member;
+          this.bumpStateGeneration(input.name);
+          setMember(man, input.name, member);
           prepared.push({ input, member, resume, role, spec, model, branch, wt, effectiveOver, range });
         }
         await this.save();
@@ -536,7 +553,7 @@ export class Fleet {
           await removeWorktree(this.root, wt).catch(() => undefined);
         }
         for (const [name, snap] of prevSnapshots) {
-          if (snap) man.members[name] = snap;
+          if (snap) setMember(man, name, snap);
           else delete man.members[name];
         }
         await this.save().catch(() => undefined);
@@ -607,7 +624,7 @@ export class Fleet {
           member.sessionFile = state?.sessionFile ?? member.sessionFile;
           member.status = "running";
           member.updatedAt = Date.now();
-          this.bumpSendGen(input.name);
+          this.bumpStateGeneration(input.name);
           await this.save();
 
           const firstMessage = resume ? resumePreamble(member, input.extra) : member.task;
@@ -655,7 +672,7 @@ export class Fleet {
 
   private async resume(name: string, extra?: string): Promise<void> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) throw new Error(`no such member '${name}'`);
     await this.spawnBatch([
       {
@@ -717,7 +734,7 @@ export class Fleet {
   private async send(name: string, message: string): Promise<"steer" | "prompt"> {
     const client = this.mustClient(name);
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     let prev: { status: MemberStatus; result: string | undefined; updatedAt: number } | undefined;
     let gen: number | undefined;
     if (member) {
@@ -737,7 +754,7 @@ export class Fleet {
         member.result = undefined;
         dirty = true;
       }
-      gen = this.bumpSendGen(name);
+      gen = this.bumpStateGeneration(name);
       if (dirty) {
         member.updatedAt = Date.now();
         await this.save();
@@ -756,10 +773,10 @@ export class Fleet {
     } catch (err) {
       if (
         member &&
-        man.members[name] === member &&
+        getMember(man, name) === member &&
         prev &&
         gen !== undefined &&
-        this.sendGen.get(name) === gen &&
+        this.stateGeneration.get(name) === gen &&
         this.clients.get(name) === client &&
         !client.exited
       ) {
@@ -795,7 +812,7 @@ export class Fleet {
       }
     } else {
       for (const name of target.names) {
-        if (!man.members[name] && !this.completedTransient.has(name)) {
+        if (!getMember(man, name) && !this.completedTransient.has(name)) {
           throw new Error(`no such member '${name}'`);
         }
       }
@@ -803,7 +820,7 @@ export class Fleet {
     }
 
     const isSettled = (n: string): boolean => {
-      const m = man.members[n];
+      const m = getMember(man, n);
       if (!m) return true;
       if (this.cleaningTransient.has(n)) return false;
       return isMemberSettled(m);
@@ -815,7 +832,7 @@ export class Fleet {
     const askMtimes = new Map<string, number>();
     const syncAsks = async (): Promise<void> => {
       for (const name of names) {
-        const member = man.members[name];
+        const member = getMember(man, name);
         if (!member) continue;
         const askFile = path.join(member.worktree, "FLEET_ASK.md");
         try {
@@ -907,7 +924,7 @@ export class Fleet {
             snap.reported = true;
             return snap.lines;
           }
-          const member = man.members[name];
+          const member = getMember(man, name);
           return member ? this.formatWaitMember(member) : [];
         }),
       );
@@ -954,13 +971,14 @@ export class Fleet {
     if (!member.pid || !this.procOps.isAlive(member.pid)) {
       return "not_running";
     }
+    if (!member.pidStartedAt) {
+      return "unavailable";
+    }
     const inspected = await this.procOps.inspectProcess(member.pid);
     if (inspected.status === "not_found") return "not_running";
     if (inspected.status === "unavailable") return "unavailable";
-    if (member.pidStartedAt) {
-      if (!inspected.info.startedAt) return "unavailable";
-      if (inspected.info.startedAt !== member.pidStartedAt) return "mismatch";
-    }
+    if (!inspected.info.startedAt) return "unavailable";
+    if (inspected.info.startedAt !== member.pidStartedAt) return "mismatch";
     if (!hasFleetCommandIdentity(inspected.info.commandLine, member.name)) {
       return "mismatch";
     }
@@ -968,17 +986,17 @@ export class Fleet {
   }
 
   private async stop(name: string, save = true): Promise<boolean> {
-    this.bumpSendGen(name);
+    this.bumpStateGeneration(name);
     const hadClient = await this.killAttachedClient(name);
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     const canKillDetached =
       !!member && (isActiveStatus(member.status) || member.status === "detached");
     if (!hadClient && canKillDetached && member.pid) {
       const identity = await this.verifyDetachedProcess(member);
       if (identity === "unavailable") {
         throw new Error(
-          `cannot verify process identity for detached member '${name}' (pid ${member.pid}); refusing to terminate`,
+          `cannot verify process start time and identity for detached member '${name}' (pid ${member.pid}); refusing to terminate`,
         );
       }
       if (identity === "mismatch") {
@@ -1006,7 +1024,7 @@ export class Fleet {
 
   private async clean(name: string, force = false, save = true): Promise<string> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) throw new Error(`no such member '${name}'`);
     let stoppedMutated = false;
     if (this.clients.has(name)) {
@@ -1049,7 +1067,7 @@ export class Fleet {
 
   private async merge(name: string, save = true): Promise<MergeResult> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) throw new Error(`no such member '${name}'`);
     const result = await mergeBranch(this.root, member.branch, `fleet(${name}): ${member.task.split("\n")[0]}`);
     if (result.ok) {
@@ -1062,7 +1080,7 @@ export class Fleet {
 
   private async open(name: string): Promise<string> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member?.sessionFile || !existsSync(member.sessionFile)) {
       throw new Error(`no resumable session recorded for '${name}'`);
     }
@@ -1158,7 +1176,7 @@ export class Fleet {
   }
 
   private async logTail(name: string, n = 20): Promise<string> {
-    if (!NAME_RE.test(name)) {
+    if (!isValidMemberName(name)) {
       throw new Error(`invalid member name '${name}'`);
     }
     const cfg = await this.config();
@@ -1232,17 +1250,17 @@ export class Fleet {
 
   private async onMemberEvent(name: string, ev: any): Promise<void> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) return;
 
     if (ev.type === "agent_start" && member.status !== "running") {
-      this.bumpSendGen(name);
+      this.bumpStateGeneration(name);
       member.status = "running";
       member.result = undefined;
       member.updatedAt = Date.now();
       await this.save();
     } else if ((ev.type === "agent_end" || ev.type === "agent_settled") && member.status === "running") {
-      this.bumpSendGen(name);
+      this.bumpStateGeneration(name);
       member.status = "idle";
       member.updatedAt = Date.now();
       await this.save();
@@ -1250,7 +1268,7 @@ export class Fleet {
       const text = extractText(ev.message);
       const prefix = parseResultPrefix(text);
       if (prefix === "done") {
-        this.bumpSendGen(name);
+        this.bumpStateGeneration(name);
         if (member.transient) {
           const cleanPromise = this.completeAndCleanTransient(member, text.trim());
           this.ui.notify(`fleet member '${name}' reports DONE`, "info");
@@ -1263,7 +1281,7 @@ export class Fleet {
           this.ui.notify(`fleet member '${name}' reports DONE`, "info");
         }
       } else if (prefix === "failed") {
-        this.bumpSendGen(name);
+        this.bumpStateGeneration(name);
         member.status = "failed";
         member.result = text.trim();
         member.updatedAt = Date.now();
@@ -1275,12 +1293,12 @@ export class Fleet {
 
   private async onClientExit(name: string, client: RpcMember): Promise<void> {
     if (this.clients.get(name) !== client) return;
-    this.bumpSendGen(name);
+    this.bumpStateGeneration(name);
     this.clients.delete(name);
     this.unwatchAsk(name);
     await this.spawning.get(name);
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) return;
     if (member.status === "done" && client.exitCode === 0 && member.transient) {
       await this.completeAndCleanTransient(member);
@@ -1314,7 +1332,7 @@ export class Fleet {
       member.updatedAt = Date.now();
       await this.spawning.get(name);
       const man = await this.manifest();
-      const current = man.members[name];
+      const current = getMember(man, name);
       if (!current || current.status === "failed") return;
       const lines = await this.formatWaitMember(current);
       this.completedTransient.delete(current.name);
@@ -1375,7 +1393,7 @@ export class Fleet {
 
   private async readAsk(name: string): Promise<void> {
     const man = await this.manifest();
-    const member = man.members[name];
+    const member = getMember(man, name);
     if (!member) return;
     try {
       const content = await readFile(path.join(member.worktree, "FLEET_ASK.md"), "utf8");
@@ -1468,21 +1486,52 @@ function parseLogLine(line: string): LogEntry | undefined {
 
 /**
  * Scan a JSONL activity log backward in bounded chunks, retaining at most `n`
- * entries in memory. Splits raw bytes on 0x0A ('\n') before UTF-8 decoding so
- * multi-byte characters straddling chunk boundaries are never corrupted.
+ * entries in memory and at most `maxLineBytes` per single record. Splits raw
+ * bytes on 0x0A ('\n') before UTF-8 decoding so multi-byte characters
+ * straddling chunk boundaries are never corrupted.
  */
 export async function readLogTailEntries(
   logFile: string,
   n: number,
   chunkBytes = LOG_TAIL_CHUNK_BYTES,
+  maxLineBytes = MAX_LOG_LINE_BYTES,
 ): Promise<{ items: LogEntry[]; lastResultIdx: number }> {
   const fh = await openFile(logFile, "r");
   try {
     const fileSize = (await fh.stat()).size;
     let offset = fileSize;
-    let carryBytes: Buffer = Buffer.alloc(0);
+    let carryParts: Buffer[] = [];
+    let carrySize = 0;
+    let carryOverflowed = false;
     const revItems: LogEntry[] = [];
     const readSize = Math.max(1, Math.floor(chunkBytes));
+    const lineLimit = Math.max(1, Math.floor(maxLineBytes));
+
+    const emitLineBuffer = (buf: Buffer): void => {
+      let lineEnd = buf.length;
+      if (lineEnd > 0 && buf[lineEnd - 1] === 0x0d) lineEnd -= 1;
+      if (lineEnd <= 0 || lineEnd > lineLimit) return;
+      const entry = parseLogLine(buf.subarray(0, lineEnd).toString("utf8"));
+      if (entry) revItems.push(entry);
+    };
+
+    const walkCompleteLinesBackward = (buf: Buffer): void => {
+      let end = buf.length;
+      while (end > 0 && revItems.length < n) {
+        const prevNl = buf.lastIndexOf(0x0a, end - 1);
+        const lineStart = prevNl + 1;
+        let lineEnd = end;
+        if (lineEnd > lineStart && buf[lineEnd - 1] === 0x0d) {
+          lineEnd -= 1;
+        }
+        const lineLen = lineEnd - lineStart;
+        if (lineLen > 0 && lineLen <= lineLimit) {
+          const entry = parseLogLine(buf.subarray(lineStart, lineEnd).toString("utf8"));
+          if (entry) revItems.push(entry);
+        }
+        end = prevNl;
+      }
+    };
 
     while (offset > 0 && revItems.length < n) {
       const toRead = Math.min(readSize, offset);
@@ -1497,36 +1546,62 @@ export async function readLogTailEntries(
       offset = chunkStart;
 
       const slice = filled === toRead ? chunkBuf : chunkBuf.subarray(0, filled);
-      const combined = carryBytes.length > 0 ? Buffer.concat([slice, carryBytes]) : slice;
+      const lastNl = slice.lastIndexOf(0x0a);
 
-      let completeBytes: Buffer;
-      if (chunkStart > 0) {
-        const firstNl = combined.indexOf(0x0a);
-        if (firstNl === -1) {
-          carryBytes = combined;
-          continue;
+      if (lastNl === -1) {
+        // No newline in this chunk: accumulate into carryParts up to lineLimit.
+        if (!carryOverflowed) {
+          if (carrySize + slice.length > lineLimit) {
+            carryOverflowed = true;
+            carryParts = [];
+            carrySize = 0;
+          } else if (slice.length > 0) {
+            carryParts.push(slice);
+            carrySize += slice.length;
+          }
         }
-        carryBytes = Buffer.from(combined.subarray(0, firstNl));
-        completeBytes = combined.subarray(firstNl + 1);
-      } else {
-        carryBytes = Buffer.alloc(0);
-        completeBytes = combined;
+        if (chunkStart === 0 && !carryOverflowed && carryParts.length > 0) {
+          emitLineBuffer(carryParts.length === 1 ? carryParts[0] : Buffer.concat(carryParts.reverse()));
+          carryParts = [];
+          carrySize = 0;
+        }
+        continue;
       }
 
-      // Walk completeBytes backward by 0x0A line separators.
-      let end = completeBytes.length;
-      while (end > 0 && revItems.length < n) {
-        const prevNl = completeBytes.lastIndexOf(0x0a, end - 1);
-        const lineStart = prevNl + 1;
-        let lineEnd = end;
-        if (lineEnd > lineStart && completeBytes[lineEnd - 1] === 0x0d) {
-          lineEnd -= 1;
+      // Finalize the line starting after lastNl + carried suffix from later chunks.
+      const tailAfterLastNl = slice.subarray(lastNl + 1);
+      if (!carryOverflowed) {
+        const totalLen = tailAfterLastNl.length + carrySize;
+        if (totalLen > 0 && totalLen <= lineLimit) {
+          const joined =
+            carryParts.length > 0
+              ? Buffer.concat([tailAfterLastNl, ...carryParts.reverse()])
+              : tailAfterLastNl;
+          emitLineBuffer(joined);
         }
-        if (lineEnd > lineStart) {
-          const entry = parseLogLine(completeBytes.subarray(lineStart, lineEnd).toString("utf8"));
-          if (entry) revItems.push(entry);
+      }
+      carryParts = [];
+      carrySize = 0;
+      carryOverflowed = false;
+
+      if (revItems.length >= n) break;
+
+      if (chunkStart === 0) {
+        walkCompleteLinesBackward(slice.subarray(0, lastNl));
+      } else {
+        const firstNl = slice.indexOf(0x0a);
+        if (lastNl > firstNl) {
+          walkCompleteLinesBackward(slice.subarray(firstNl + 1, lastNl));
         }
-        end = prevNl;
+        if (revItems.length < n) {
+          const prefix = slice.subarray(0, firstNl);
+          if (prefix.length > lineLimit) {
+            carryOverflowed = true;
+          } else if (prefix.length > 0) {
+            carryParts = [Buffer.from(prefix)];
+            carrySize = prefix.length;
+          }
+        }
       }
     }
 

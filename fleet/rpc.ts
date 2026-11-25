@@ -238,7 +238,11 @@ export class RpcMember {
   private spawnError?: Error;
   private exitNotified = false;
   private stdoutFlushed = false;
+  private finalized = false;
   private exitDrainTimer?: NodeJS.Timeout;
+  private readonly onStdoutDataBound: (c: Buffer) => void;
+  private readonly onStdoutEndBound: () => void;
+  private readonly onStderrDataBound: (c: Buffer) => void;
 
   private constructor(opts: RpcSpawnOptions) {
     const isWin = process.platform === "win32";
@@ -273,13 +277,19 @@ export class RpcMember {
       // Handled via write callback and process exit.
     });
 
-    this.proc.stdout?.on("data", (c: Buffer) => this.onData(c));
-    this.proc.stdout?.on("end", () => this.onStdoutEnd());
-    this.proc.stderr?.on("data", (c: Buffer) => this.writeLog(c));
+    this.onStdoutDataBound = (c: Buffer) => this.onData(c);
+    this.onStdoutEndBound = () => this.onStdoutEnd();
+    this.onStderrDataBound = (c: Buffer) => this.writeLog(c);
+
+    this.proc.stdout?.on("data", this.onStdoutDataBound);
+    this.proc.stdout?.on("end", this.onStdoutEndBound);
+    this.proc.stderr?.on("data", this.onStderrDataBound);
     this.proc.on("error", (err) => {
       this.clearExitDrainTimer();
       this.spawnError = err;
       this.exited = true;
+      this.finalized = true;
+      this.detachStreams();
       this.writeLog(`[fleet] spawn error: ${err.message}\n`);
       this.failPending(new Error(`member spawn error: ${err.message}`));
       this.closeLog();
@@ -288,28 +298,22 @@ export class RpcMember {
     this.proc.on("exit", (code) => {
       this.exited = true;
       this.exitCode = code;
-      // Do not fail pending requests yet: stdout may still have a buffered final
-      // response (especially without a trailing newline) that arrives before 'end'/'close'.
+      // Do not fail pending requests immediately on 'exit': stdout may still have
+      // a buffered final response (especially without a trailing newline). Always
+      // schedule a bounded drain timer so a grandchild inheriting stdout/stderr
+      // cannot delay finalization, log closure, or Fleet exit handling.
       if (this.stdoutFlushed) {
-        this.failPending(new Error("member process exited"));
-      } else if (this.pending.size > 0 && !this.exitDrainTimer) {
-        // Bound the wait if an inherited grandchild keeps stdout open after exit.
+        this.finalizeExit(code);
+      } else if (!this.finalized && !this.exitDrainTimer) {
         this.exitDrainTimer = setTimeout(() => {
           this.exitDrainTimer = undefined;
-          this.onStdoutEnd();
-          this.failPending(new Error("member process exited"));
+          this.finalizeExit(code);
         }, 250);
         this.exitDrainTimer.unref();
       }
     });
     this.proc.on("close", (code) => {
-      this.clearExitDrainTimer();
-      this.exited = true;
-      if (this.exitCode === null) this.exitCode = code;
-      this.onStdoutEnd();
-      this.failPending(new Error("member process exited"));
-      this.closeLog();
-      this.emitExit(code);
+      this.finalizeExit(code);
     });
   }
 
@@ -364,6 +368,31 @@ export class RpcMember {
     if (start > 0) this.buffer = this.buffer.slice(start);
   }
 
+  private detachStreams(): void {
+    this.proc.stdout?.off("data", this.onStdoutDataBound);
+    this.proc.stdout?.off("end", this.onStdoutEndBound);
+    this.proc.stderr?.off("data", this.onStderrDataBound);
+    if (this.proc.stdout && !this.proc.stdout.destroyed) {
+      this.proc.stdout.destroy();
+    }
+    if (this.proc.stderr && !this.proc.stderr.destroyed) {
+      this.proc.stderr.destroy();
+    }
+  }
+
+  private finalizeExit(code: number | null): void {
+    if (this.finalized) return;
+    this.finalized = true;
+    this.clearExitDrainTimer();
+    this.exited = true;
+    if (this.exitCode === null) this.exitCode = code;
+    this.onStdoutEnd();
+    this.detachStreams();
+    this.failPending(new Error("member process exited"));
+    this.closeLog();
+    this.emitExit(this.exitCode);
+  }
+
   private clearExitDrainTimer(): void {
     if (this.exitDrainTimer) {
       clearTimeout(this.exitDrainTimer);
@@ -372,7 +401,6 @@ export class RpcMember {
   }
 
   private onStdoutEnd(): void {
-    this.clearExitDrainTimer();
     if (this.stdoutFlushed) return;
     this.stdoutFlushed = true;
     this.buffer += this.decoder.end();
@@ -490,6 +518,9 @@ export class RpcMember {
   /** Stop receiving events and close the log (does not kill the process). */
   detach(): void {
     this.clearExitDrainTimer();
+    this.proc.stdout?.off("data", this.onStdoutDataBound);
+    this.proc.stdout?.off("end", this.onStdoutEndBound);
+    this.proc.stderr?.off("data", this.onStderrDataBound);
     this.handlers.clear();
     this.exitHandlers.clear();
     this.closeLog();
