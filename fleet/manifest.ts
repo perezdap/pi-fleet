@@ -58,18 +58,46 @@ function isValidMember(key: string, value: unknown): value is Member {
   return true;
 }
 
-function validateMembers(rawMembers: Record<string, unknown>): Record<string, Member> | undefined {
+export function setOwnMember(members: Record<string, Member>, name: string, member: Member): void {
+  Object.defineProperty(members, name, {
+    value: member,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+function partitionMembers(rawMembers: Record<string, unknown>): {
+  members: Record<string, Member>;
+  invalidKeys: string[];
+} {
   const members: Record<string, Member> = {};
-  for (const [key, value] of Object.entries(rawMembers)) {
-    if (!isValidMember(key, value)) return undefined;
-    Object.defineProperty(members, key, {
-      value,
-      enumerable: true,
-      writable: true,
-      configurable: true,
-    });
+  const invalidKeys: string[] = [];
+  for (const key of Object.getOwnPropertyNames(rawMembers)) {
+    const value = rawMembers[key];
+    if (!isValidMember(key, value)) {
+      invalidKeys.push(key);
+      continue;
+    }
+    setOwnMember(members, key, value);
   }
-  return members;
+  return { members, invalidKeys };
+}
+
+async function backupCorruptManifest(
+  file: string,
+  doCopy: (src: string, dest: string) => Promise<void>,
+): Promise<string> {
+  const backup = `${file}.corrupt.${Date.now()}.${++tmpSeq}`;
+  try {
+    await doCopy(file, backup);
+  } catch (err: any) {
+    throw new Error(
+      `fleet: invalid manifest.json and backup to ${path.basename(backup)} failed: ${err?.message ?? err}`,
+      { cause: err },
+    );
+  }
+  return backup;
 }
 
 export async function loadManifest(
@@ -88,28 +116,29 @@ export async function loadManifest(
     throw err;
   }
 
+  const doCopy = opts?.copyBackup ?? copyFile;
+  let parsed: unknown;
+  let parsedOk = false;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (isPlainObject(parsed) && parsed.version === 1 && isPlainObject(parsed.members)) {
-      const members = validateMembers(parsed.members);
-      if (members) {
-        return { version: 1, repoRoot, members };
-      }
-    }
+    parsed = JSON.parse(raw);
+    parsedOk = true;
   } catch {
     // Invalid JSON falls through to backup and fresh manifest.
   }
 
-  const backup = `${file}.corrupt.${Date.now()}.${++tmpSeq}`;
-  const doCopy = opts?.copyBackup ?? copyFile;
-  try {
-    await doCopy(file, backup);
-  } catch (err: any) {
-    throw new Error(
-      `fleet: invalid manifest.json and backup to ${path.basename(backup)} failed: ${err?.message ?? err}`,
-      { cause: err },
+  if (parsedOk && isPlainObject(parsed) && parsed.version === 1 && isPlainObject(parsed.members)) {
+    const { members, invalidKeys } = partitionMembers(parsed.members);
+    if (invalidKeys.length === 0) {
+      return { version: 1, repoRoot, members };
+    }
+    const backup = await backupCorruptManifest(file, doCopy);
+    onWarn?.(
+      `fleet: skipped invalid manifest member(s) (${invalidKeys.join(", ")}); backed up to ${path.basename(backup)}`,
     );
+    return { version: 1, repoRoot, members };
   }
+
+  const backup = await backupCorruptManifest(file, doCopy);
   onWarn?.(`fleet: invalid manifest.json; backed up to ${path.basename(backup)} and starting fresh`);
   return { version: 1, repoRoot, members: {} };
 }

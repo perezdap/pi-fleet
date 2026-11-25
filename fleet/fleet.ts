@@ -26,7 +26,7 @@ import {
   type CommitRange,
   type MergeResult,
 } from "./gitw.ts";
-import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest } from "./manifest.ts";
+import { fleetDir, isActiveStatus, isPidAlive, loadManifest, saveManifest, setOwnMember } from "./manifest.ts";
 import { buildSystemAppend, resumePreamble } from "./roles.ts";
 import {
   getProcessInfo,
@@ -122,15 +122,6 @@ export const MAX_LOG_LINE_BYTES = 256 * 1024;
 
 function getMember(man: Manifest, name: string): Member | undefined {
   return Object.hasOwn(man.members, name) ? man.members[name] : undefined;
-}
-
-function setMember(man: Manifest, name: string, member: Member): void {
-  Object.defineProperty(man.members, name, {
-    value: member,
-    enumerable: true,
-    writable: true,
-    configurable: true,
-  });
 }
 
 function isMemberSettled(member: Member): boolean {
@@ -540,7 +531,7 @@ export class Fleet {
           member.result = undefined;
           member.updatedAt = now;
           this.bumpStateGeneration(input.name);
-          setMember(man, input.name, member);
+          setOwnMember(man.members, input.name, member);
           prepared.push({ input, member, resume, role, spec, model, branch, wt, effectiveOver, range });
         }
         await this.save();
@@ -553,7 +544,7 @@ export class Fleet {
           await removeWorktree(this.root, wt).catch(() => undefined);
         }
         for (const [name, snap] of prevSnapshots) {
-          if (snap) setMember(man, name, snap);
+          if (snap) setOwnMember(man.members, name, snap);
           else delete man.members[name];
         }
         await this.save().catch(() => undefined);
@@ -1189,6 +1180,9 @@ export class Fleet {
     }
     const tail = parsed.items.map((item, idx) => {
       if (item.kind === "tool") return `tool: ${item.toolName}`;
+      if (item.kind === "omitted") {
+        return `[omitted oversized log record (>${formatByteLimit(item.maxBytes)})]`;
+      }
       if (idx === parsed.lastResultIdx) return `assistant: ${item.text}`;
       return `assistant: ${truncate(item.text.replace(/\s+/g, " "), 220)}`;
     });
@@ -1465,7 +1459,17 @@ export function planOpenLaunch(opts: {
 
 export type LogEntry =
   | { kind: "assistant"; text: string }
-  | { kind: "tool"; toolName: string };
+  | { kind: "tool"; toolName: string }
+  | { kind: "omitted"; maxBytes: number };
+
+function formatByteLimit(bytes: number): string {
+  if (bytes >= 1024 && bytes % 1024 === 0) return `${bytes / 1024} KiB`;
+  return `${bytes} B`;
+}
+
+function stripTrailingCr(buf: Buffer): Buffer {
+  return buf.length > 0 && buf[buf.length - 1] === 0x0d ? buf.subarray(0, buf.length - 1) : buf;
+}
 
 function parseLogLine(line: string): LogEntry | undefined {
   if (!line.trim()) return undefined;
@@ -1486,9 +1490,10 @@ function parseLogLine(line: string): LogEntry | undefined {
 
 /**
  * Scan a JSONL activity log backward in bounded chunks, retaining at most `n`
- * entries in memory and at most `maxLineBytes` per single record. Splits raw
- * bytes on 0x0A ('\n') before UTF-8 decoding so multi-byte characters
- * straddling chunk boundaries are never corrupted.
+ * entries in memory and at most `maxLineBytes` (excluding one trailing '\r')
+ * per single record. Splits raw bytes on 0x0A ('\n') before UTF-8 decoding so
+ * multi-byte characters straddling chunk boundaries are never corrupted.
+ * Oversized records are reported as `{ kind: "omitted", maxBytes }` entries.
  */
 export async function readLogTailEntries(
   logFile: string,
@@ -1502,17 +1507,53 @@ export async function readLogTailEntries(
     let offset = fileSize;
     let carryParts: Buffer[] = [];
     let carrySize = 0;
+    let carryHasEnd = false;
     let carryOverflowed = false;
     const revItems: LogEntry[] = [];
     const readSize = Math.max(1, Math.floor(chunkBytes));
     const lineLimit = Math.max(1, Math.floor(maxLineBytes));
 
-    const emitLineBuffer = (buf: Buffer): void => {
-      let lineEnd = buf.length;
-      if (lineEnd > 0 && buf[lineEnd - 1] === 0x0d) lineEnd -= 1;
-      if (lineEnd <= 0 || lineEnd > lineLimit) return;
-      const entry = parseLogLine(buf.subarray(0, lineEnd).toString("utf8"));
+    // Unified line-finalization and byte-limit rule for single-chunk and cross-chunk lines.
+    const emitEffectiveLine = (effective: Buffer | null, overflowed: boolean): void => {
+      if (revItems.length >= n) return;
+      if (overflowed || (effective && effective.length > lineLimit)) {
+        revItems.push({ kind: "omitted", maxBytes: lineLimit });
+        return;
+      }
+      if (!effective || effective.length === 0) return;
+      const entry = parseLogLine(effective.toString("utf8"));
       if (entry) revItems.push(entry);
+    };
+
+    const appendCarryPiece = (piece: Buffer): void => {
+      if (carryOverflowed || piece.length === 0) return;
+      let effective = piece;
+      if (!carryHasEnd) {
+        carryHasEnd = true;
+        effective = stripTrailingCr(piece);
+        if (effective.length === 0) return;
+      }
+      if (carrySize + effective.length > lineLimit) {
+        carryOverflowed = true;
+        carryParts = [];
+        carrySize = 0;
+        return;
+      }
+      carryParts.push(Buffer.from(effective));
+      carrySize += effective.length;
+    };
+
+    const flushCarry = (): void => {
+      if (carryOverflowed) {
+        emitEffectiveLine(null, true);
+      } else if (carryParts.length > 0) {
+        const joined = carryParts.length === 1 ? carryParts[0] : Buffer.concat(carryParts.reverse());
+        emitEffectiveLine(joined, false);
+      }
+      carryParts = [];
+      carrySize = 0;
+      carryHasEnd = false;
+      carryOverflowed = false;
     };
 
     const walkCompleteLinesBackward = (buf: Buffer): void => {
@@ -1520,15 +1561,8 @@ export async function readLogTailEntries(
       while (end > 0 && revItems.length < n) {
         const prevNl = buf.lastIndexOf(0x0a, end - 1);
         const lineStart = prevNl + 1;
-        let lineEnd = end;
-        if (lineEnd > lineStart && buf[lineEnd - 1] === 0x0d) {
-          lineEnd -= 1;
-        }
-        const lineLen = lineEnd - lineStart;
-        if (lineLen > 0 && lineLen <= lineLimit) {
-          const entry = parseLogLine(buf.subarray(lineStart, lineEnd).toString("utf8"));
-          if (entry) revItems.push(entry);
-        }
+        const effective = stripTrailingCr(buf.subarray(lineStart, end));
+        emitEffectiveLine(effective, false);
         end = prevNl;
       }
     };
@@ -1549,40 +1583,13 @@ export async function readLogTailEntries(
       const lastNl = slice.lastIndexOf(0x0a);
 
       if (lastNl === -1) {
-        // No newline in this chunk: accumulate into carryParts up to lineLimit.
-        if (!carryOverflowed) {
-          if (carrySize + slice.length > lineLimit) {
-            carryOverflowed = true;
-            carryParts = [];
-            carrySize = 0;
-          } else if (slice.length > 0) {
-            carryParts.push(slice);
-            carrySize += slice.length;
-          }
-        }
-        if (chunkStart === 0 && !carryOverflowed && carryParts.length > 0) {
-          emitLineBuffer(carryParts.length === 1 ? carryParts[0] : Buffer.concat(carryParts.reverse()));
-          carryParts = [];
-          carrySize = 0;
-        }
+        appendCarryPiece(slice);
+        if (chunkStart === 0) flushCarry();
         continue;
       }
 
-      // Finalize the line starting after lastNl + carried suffix from later chunks.
-      const tailAfterLastNl = slice.subarray(lastNl + 1);
-      if (!carryOverflowed) {
-        const totalLen = tailAfterLastNl.length + carrySize;
-        if (totalLen > 0 && totalLen <= lineLimit) {
-          const joined =
-            carryParts.length > 0
-              ? Buffer.concat([tailAfterLastNl, ...carryParts.reverse()])
-              : tailAfterLastNl;
-          emitLineBuffer(joined);
-        }
-      }
-      carryParts = [];
-      carrySize = 0;
-      carryOverflowed = false;
+      appendCarryPiece(slice.subarray(lastNl + 1));
+      flushCarry();
 
       if (revItems.length >= n) break;
 
@@ -1594,13 +1601,7 @@ export async function readLogTailEntries(
           walkCompleteLinesBackward(slice.subarray(firstNl + 1, lastNl));
         }
         if (revItems.length < n) {
-          const prefix = slice.subarray(0, firstNl);
-          if (prefix.length > lineLimit) {
-            carryOverflowed = true;
-          } else if (prefix.length > 0) {
-            carryParts = [Buffer.from(prefix)];
-            carrySize = prefix.length;
-          }
+          appendCarryPiece(slice.subarray(0, firstNl));
         }
       }
     }

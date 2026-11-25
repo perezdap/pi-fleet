@@ -239,6 +239,7 @@ export class RpcMember {
   private exitNotified = false;
   private stdoutFlushed = false;
   private finalized = false;
+  private detached = false;
   private exitDrainTimer?: NodeJS.Timeout;
   private readonly onStdoutDataBound: (c: Buffer) => void;
   private readonly onStdoutEndBound: () => void;
@@ -285,15 +286,17 @@ export class RpcMember {
     this.proc.stdout?.on("end", this.onStdoutEndBound);
     this.proc.stderr?.on("data", this.onStderrDataBound);
     this.proc.on("error", (err) => {
-      this.clearExitDrainTimer();
       this.spawnError = err;
       this.exited = true;
       this.finalized = true;
-      this.detachStreams();
       this.writeLog(`[fleet] spawn error: ${err.message}\n`);
-      this.failPending(new Error(`member spawn error: ${err.message}`));
-      this.closeLog();
-      this.emitExit(null);
+      this.teardown({
+        err: new Error(`member spawn error: ${err.message}`),
+        destroyStreams: true,
+        flushStdout: false,
+        notifyExit: true,
+        exitCode: null,
+      });
     });
     this.proc.on("exit", (code) => {
       this.exited = true;
@@ -368,29 +371,50 @@ export class RpcMember {
     if (start > 0) this.buffer = this.buffer.slice(start);
   }
 
-  private detachStreams(): void {
+  private teardown(opts: {
+    err: Error;
+    destroyStreams: boolean;
+    flushStdout: boolean;
+    notifyExit: boolean;
+    exitCode?: number | null;
+  }): void {
+    this.clearExitDrainTimer();
+    if (opts.flushStdout) {
+      this.onStdoutEnd();
+    }
     this.proc.stdout?.off("data", this.onStdoutDataBound);
     this.proc.stdout?.off("end", this.onStdoutEndBound);
     this.proc.stderr?.off("data", this.onStderrDataBound);
-    if (this.proc.stdout && !this.proc.stdout.destroyed) {
-      this.proc.stdout.destroy();
+    if (opts.destroyStreams) {
+      if (this.proc.stdout && !this.proc.stdout.destroyed) {
+        this.proc.stdout.destroy();
+      }
+      if (this.proc.stderr && !this.proc.stderr.destroyed) {
+        this.proc.stderr.destroy();
+      }
     }
-    if (this.proc.stderr && !this.proc.stderr.destroyed) {
-      this.proc.stderr.destroy();
+    this.failPending(opts.err);
+    this.closeLog();
+    if (opts.notifyExit) {
+      this.emitExit(opts.exitCode ?? this.exitCode);
+    } else {
+      this.handlers.clear();
+      this.exitHandlers.clear();
     }
   }
 
   private finalizeExit(code: number | null): void {
     if (this.finalized) return;
     this.finalized = true;
-    this.clearExitDrainTimer();
     this.exited = true;
     if (this.exitCode === null) this.exitCode = code;
-    this.onStdoutEnd();
-    this.detachStreams();
-    this.failPending(new Error("member process exited"));
-    this.closeLog();
-    this.emitExit(this.exitCode);
+    this.teardown({
+      err: new Error("member process exited"),
+      destroyStreams: true,
+      flushStdout: true,
+      notifyExit: true,
+      exitCode: this.exitCode,
+    });
   }
 
   private clearExitDrainTimer(): void {
@@ -457,6 +481,7 @@ export class RpcMember {
   /** Send one command, await its correlated response. */
   send(command: Record<string, unknown>, timeoutMs = 30_000): Promise<any> {
     if (this.exited) return Promise.reject(new Error("member process exited"));
+    if (this.detached) return Promise.reject(new Error("member detached"));
     const stdin = this.proc.stdin;
     if (!stdin || stdin.destroyed || stdin.writableEnded) {
       return Promise.reject(new Error("member stdin is closed"));
@@ -517,13 +542,19 @@ export class RpcMember {
 
   /** Stop receiving events and close the log (does not kill the process). */
   detach(): void {
-    this.clearExitDrainTimer();
-    this.proc.stdout?.off("data", this.onStdoutDataBound);
-    this.proc.stdout?.off("end", this.onStdoutEndBound);
-    this.proc.stderr?.off("data", this.onStderrDataBound);
-    this.handlers.clear();
-    this.exitHandlers.clear();
-    this.closeLog();
+    this.detached = true;
+    if (this.exited || this.exitDrainTimer) {
+      this.finalizeExit(this.exitCode);
+      this.handlers.clear();
+      this.exitHandlers.clear();
+      return;
+    }
+    this.teardown({
+      err: new Error("member detached"),
+      destroyStreams: false,
+      flushStdout: false,
+      notifyExit: false,
+    });
   }
 
   /** Kill the member process tree. */

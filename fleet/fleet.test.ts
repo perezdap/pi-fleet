@@ -4176,12 +4176,289 @@ process.stdin.on("data", (chunk) => {
       const res = await readLogTailEntries(logFile, 5, 97, cap);
       assert.deepEqual(res.items, [
         { kind: "assistant", text: "BEFORE_HUGE ✓" },
+        { kind: "omitted", maxBytes: cap },
         { kind: "tool", toolName: "bash" },
         { kind: "assistant", text: "DONE: AFTER_HUGE ⚙" },
+        { kind: "omitted", maxBytes: cap },
       ]);
-      assert.equal(res.lastResultIdx, 2);
+      assert.equal(res.lastResultIdx, 3);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("P6: loadManifest preserves valid members when dropping legacy reserved, null, or __proto__ entries after backup", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-p6-"));
+    try {
+      const fDir = path.join(tmpRoot, ".pi", "fleet");
+      const manPath = path.join(fDir, "manifest.json");
+      await mkdir(fDir, { recursive: true });
+
+      const makeMember = (name: string) => ({
+        name,
+        role: "coder",
+        task: `task for ${name}`,
+        branch: `fleet/${name}`,
+        worktree: path.join(tmpRoot, ".pi", "fleet", "wt", name),
+        baseRef: "HEAD",
+        status: "done",
+        createdAt: 1,
+        updatedAt: 2,
+      });
+
+      // 1. Legacy 'prototype' member alongside valid 'coder-a' -> backs up, warns, preserves 'coder-a'.
+      await writeFile(
+        manPath,
+        JSON.stringify({
+          version: 1,
+          repoRoot: tmpRoot,
+          members: { prototype: makeMember("prototype"), "coder-a": makeMember("coder-a") },
+        }),
+        "utf8",
+      );
+      const legacyWarnings: string[] = [];
+      const legacyLoaded = await loadManifest(tmpRoot, (w) => legacyWarnings.push(w));
+      assert.deepEqual(Object.keys(legacyLoaded.members), ["coder-a"]);
+      assert.equal(legacyLoaded.members["coder-a"]?.task, "task for coder-a");
+      assert.equal(legacyWarnings.length, 1);
+      assert.match(legacyWarnings[0], /prototype/);
+      assert.match(legacyWarnings[0], /manifest\.json\.corrupt\./);
+
+      // 2. Null member alongside valid 'coder-b' -> preserves 'coder-b', and fails if backup fails (F4).
+      await writeFile(
+        manPath,
+        JSON.stringify({
+          version: 1,
+          repoRoot: tmpRoot,
+          members: { broken: null, "coder-b": makeMember("coder-b") },
+        }),
+        "utf8",
+      );
+      const nullBackupWarnings: string[] = [];
+      await assert.rejects(
+        () =>
+          loadManifest(tmpRoot, (w) => nullBackupWarnings.push(w), {
+            copyBackup: async () => {
+              throw new Error("EACCES: backup denied");
+            },
+          }),
+        /backup.*failed.*EACCES/i,
+      );
+      assert.deepEqual(nullBackupWarnings, []);
+
+      const nullWarnings: string[] = [];
+      const nullLoaded = await loadManifest(tmpRoot, (w) => nullWarnings.push(w));
+      assert.deepEqual(Object.keys(nullLoaded.members), ["coder-b"]);
+      assert.equal(nullWarnings.length, 1);
+      assert.match(nullWarnings[0], /broken/);
+
+      // 3. Raw JSON '__proto__' own property alongside valid 'coder-c' -> no prototype pollution, preserves 'coder-c'.
+      const rawProtoJson = `{"version":1,"repoRoot":${JSON.stringify(tmpRoot)},"members":{"__proto__":${JSON.stringify(makeMember("__proto__"))},"coder-c":${JSON.stringify(makeMember("coder-c"))}}}`;
+      await writeFile(manPath, rawProtoJson, "utf8");
+      const protoWarnings: string[] = [];
+      const protoLoaded = await loadManifest(tmpRoot, (w) => protoWarnings.push(w));
+      assert.equal(Object.getPrototypeOf(protoLoaded.members), Object.prototype);
+      assert.deepEqual(Object.keys(protoLoaded.members), ["coder-c"]);
+      assert.equal(protoWarnings.length, 1);
+      assert.match(protoWarnings[0], /__proto__/);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("P7: detach rejects in-flight RPC calls promptly and still finalizes exit when exit already began", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-p7-"));
+    const grandchildPidFile = path.join(tmpRoot, "grandchild.pid");
+    try {
+      // Fixture 1: answers get_state, hangs on prompt so detach() runs mid-flight.
+      const hangMjs = path.join(tmpRoot, "hang-prompt.mjs");
+      await writeFile(
+        hangMjs,
+        `#!/usr/bin/env node
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let idx;
+  while ((idx = buf.indexOf("\\n")) >= 0) {
+    const line = buf.slice(0, idx).replace(/\\r$/, "");
+    buf = buf.slice(idx + 1);
+    if (!line.trim()) continue;
+    const req = JSON.parse(line);
+    if (req.type === "get_state") {
+      process.stdout.write(JSON.stringify({
+        type: "response",
+        id: req.id,
+        command: "get_state",
+        success: true,
+        data: { ok: true },
+      }) + "\\n");
+    }
+    // Intentionally never respond to 'prompt' while staying alive.
+  }
+});
+setInterval(() => {}, 1000);
+`,
+        "utf8",
+      );
+      await chmod(hangMjs, 0o755);
+      let hangBin = hangMjs;
+      if (process.platform === "win32") {
+        const cmdPath = path.join(tmpRoot, "hang-prompt.cmd");
+        await writeFile(cmdPath, `@node "%~dp0hang-prompt.mjs" %*\r\n`, "utf8");
+        hangBin = cmdPath;
+      }
+
+      const client = await RpcMember.create({
+        piBin: hangBin,
+        cwd: tmpRoot,
+        args: [],
+        logFile: path.join(tmpRoot, "hang.jsonl"),
+      });
+      try {
+        // Attached RPC call resolves normally.
+        assert.deepEqual(await client.getState(), { ok: true });
+
+        // Start an in-flight prompt (60s timeout) and detach immediately -> must reject promptly.
+        const started = Date.now();
+        const inFlight = client.prompt("never answered");
+        await new Promise((r) => setTimeout(r, 20));
+        client.detach();
+        await assert.rejects(() => inFlight, /member detached/i);
+        assert.ok(Date.now() - started < 2_000, "detach must reject in-flight RPC promptly");
+        await assert.rejects(() => client.getState(), /member detached/i);
+      } finally {
+        await client.kill();
+      }
+
+      // Fixture 2: spawns detached grandchild inheriting stdout and exits; calling detach()
+      // while exit drain timer is pending must still complete bounded exit finalization.
+      const exitGcMjs = path.join(tmpRoot, "exit-gc.mjs");
+      await writeFile(
+        exitGcMjs,
+        `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+process.stdin.once("data", () => {
+  const gc = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
+    cwd: tmpdir(),
+    stdio: ["ignore", "inherit", "inherit"],
+    detached: true,
+    windowsHide: true,
+  });
+  writeFileSync(${JSON.stringify(grandchildPidFile)}, String(gc.pid), "utf8");
+  gc.unref();
+  process.exit(0);
+});
+`,
+        "utf8",
+      );
+      await chmod(exitGcMjs, 0o755);
+      let exitGcBin = exitGcMjs;
+      if (process.platform === "win32") {
+        const cmdPath = path.join(tmpRoot, "exit-gc.cmd");
+        await writeFile(cmdPath, `@node "%~dp0exit-gc.mjs" %*\r\n`, "utf8");
+        exitGcBin = cmdPath;
+      }
+
+      const exitLogFile = path.join(tmpRoot, "exit-gc.jsonl");
+      const gcClient = await RpcMember.create({
+        piBin: exitGcBin,
+        cwd: tmpRoot,
+        args: [],
+        logFile: exitLogFile,
+      });
+      let exitCalls = 0;
+      gcClient.onExit(() => {
+        exitCalls += 1;
+      });
+      const pendingCall = gcClient.getState();
+      // Wait for child 'exit' event to fire (before the 250ms drain timer completes).
+      const waitDeadline = Date.now() + 3_000;
+      while (!gcClient.exited && Date.now() < waitDeadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(gcClient.exited, true);
+      gcClient.detach();
+      await assert.rejects(() => pendingCall, /member process exited/i);
+      assert.equal(exitCalls, 1, "detach after exit must complete exit finalization once");
+    } finally {
+      if (existsSync(grandchildPidFile)) {
+        const gcPid = Number((await readFile(grandchildPidFile, "utf8")).trim());
+        if (gcPid > 0) {
+          try {
+            process.kill(gcPid);
+          } catch {
+            // already exited
+          }
+        }
+      }
+      await rm(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  it("P8: exact maxLineBytes CRLF record produces identical results across 17-byte and 4096-byte chunks", async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), "pi-fleet-p8-"));
+    try {
+      const logFile = path.join(tmpRoot, "exact-crlf.jsonl");
+      const cap = 256;
+      const prefix = '{"type":"message_end","message":{"role":"assistant","content":"';
+      const suffix = '"}}';
+      const padLen = cap - Buffer.byteLength(prefix, "utf8") - Buffer.byteLength(suffix, "utf8");
+      const exactLine = `${prefix}${"Z".repeat(padLen)}${suffix}`;
+      assert.equal(Buffer.byteLength(exactLine, "utf8"), cap);
+
+      const overLine = `${prefix}${"Y".repeat(padLen + 1)}${suffix}`;
+      assert.equal(Buffer.byteLength(overLine, "utf8"), cap + 1);
+
+      // Write both exact-cap and cap+1 records with CRLF endings.
+      const raw = `${exactLine}\r\n${overLine}\r\n${exactLine}\r\n`;
+      await writeFile(logFile, raw, "utf8");
+
+      const largeChunk = await readLogTailEntries(logFile, 5, 4096, cap);
+      const tinyChunk = await readLogTailEntries(logFile, 5, 17, cap);
+
+      assert.deepEqual(tinyChunk, largeChunk);
+      assert.deepEqual(largeChunk.items, [
+        { kind: "assistant", text: "Z".repeat(padLen) },
+        { kind: "omitted", maxBytes: cap },
+        { kind: "assistant", text: "Z".repeat(padLen) },
+      ]);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("P9: production defaults (2 MiB chunk, 256 KiB cap) visibly report an omitted oversized final log record in /fleet log", async () => {
+    const h = await createHarness();
+    try {
+      const logDir = path.join(h.root, ".pi", "fleet", "logs");
+      await mkdir(logDir, { recursive: true });
+      const logFile = path.join(logDir, "big-done.jsonl");
+
+      const earlier = JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: "Working on task" },
+      });
+      const oversizedDone = JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: "DONE: " + "X".repeat(MAX_LOG_LINE_BYTES + 1024) },
+      });
+      await writeFile(logFile, `${earlier}\n${oversizedDone}\n`, "utf8");
+
+      const parsed = await readLogTailEntries(logFile, 5);
+      assert.deepEqual(parsed.items, [
+        { kind: "assistant", text: "Working on task" },
+        { kind: "omitted", maxBytes: MAX_LOG_LINE_BYTES },
+      ]);
+
+      const logRes = await h.runTool({ action: "log", name: "big-done", n: 5 });
+      assert.equal(logRes.isError, false);
+      assert.match(logRes.text, /assistant: Working on task/);
+      assert.match(logRes.text, /\[omitted oversized log record \(>256 KiB\)\]/);
+    } finally {
+      await h.cleanup();
     }
   });
 });
